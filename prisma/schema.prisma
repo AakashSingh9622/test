@@ -1,0 +1,327 @@
+// Warehouse Management -- Supabase Postgres schema (pehle MongoDB/Mongoose tha).
+// Actor/location snapshots jaise chhote embedded objects Json columns me hain (display-only
+// snapshots, kabhi query nahi hote); jinpe filter/join hota hai wo proper columns/relations hain.
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Prisma 7: connection URL schema me nahi, prisma.config.js me hai (CLI ke liye) aur runtime
+// me driver adapter (src/config/prisma.js) se aata hai. Generator "prisma-client-js" (plain JS/CJS)
+// jaan-boojhkar -- naya "prisma-client" generator sirf TypeScript files banata hai, aur ye backend
+// poora JavaScript hai.
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  staff_admin
+  staff_operator
+  client_admin
+  client_user
+}
+
+enum SlotStatus {
+  available
+  full
+  blocked
+}
+
+enum BoxSize {
+  standard
+  large
+}
+
+enum BoxStatus {
+  unallocated
+  stored
+  reserved
+  picked
+  out
+  pending_destruction
+  destroyed
+  missing
+  digitized // scanned/digitised: still in its slot, flagged (see Box.digitizedAt)
+}
+
+enum OrderType {
+  collection
+  dispatch
+  destruction
+  digitize
+}
+
+enum OrderStatus {
+  requested
+  approved
+  scheduled
+  in_progress
+  completed
+  cancelled
+  rejected
+}
+
+enum RequestedVia {
+  staff
+  portal
+}
+
+enum OrderLineStatus {
+  pending
+  picked
+  dispatched
+  received
+  destroyed
+  digitized
+  missing
+  removed
+}
+
+enum AuditEventType {
+  registered
+  label_printed
+  allocated
+  moved
+  details_edited
+  added_to_order
+  removed_from_order
+  picked
+  dispatched
+  collected
+  received
+  refiled
+  marked_missing
+  destruction_authorised
+  destroyed
+  digitization_authorised
+  digitized
+  hold_placed
+  hold_released
+  status_changed
+}
+
+// Small key/value settings kept in the DATABASE (so they can be changed without touching the code).
+//   defaultDatabase = the DocuSoft agreement number (agrno) this system is built for, e.g. "0003".
+//   Only users whose DocuSoft agreement is that number can log in (staff login AND the client portal).
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+  updatedBy Json?
+
+  @@map("app_setting")
+}
+
+// Login identity cache -- password yahan kabhi store nahi hota (DocuSoft verify karta hai).
+model WHUser {
+  id             String   @id @default(uuid())
+  email          String   @unique
+  name           String
+  docusoftUserId Int
+  agreementNo    String
+  isAdmin        Boolean  @default(false)
+  role           Role     @default(staff_admin)
+  lastLoginAt    DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@map("wh_user")
+}
+
+model Warehouse {
+  id        String   @id @default(uuid())
+  code      String   @unique
+  name      String // unique (case-insensitive) is enforced in locationService.createWarehouse
+  address   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  racks     Rack[]
+  slots     Slot[]
+
+  @@map("warehouse")
+}
+
+model Rack {
+  id          String    @id @default(uuid())
+  warehouseId String
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  code        String
+  label       String
+  rows        Int
+  columns     Int
+  // Har cell (row x column) ek hi storage location hai; iski length centimetre me store hoti hai
+  // (user feet de to convert hoke). Slot.capacity isi ka copy hai, cell ke hisaab se edit ho sakta hai.
+  cellLengthCm Int       @default(400)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  slots       Slot[]
+
+  @@unique([warehouseId, code])
+  @@map("rack")
+}
+
+model Slot {
+  id          String     @id @default(uuid())
+  rackId      String
+  rack        Rack       @relation(fields: [rackId], references: [id], onDelete: Cascade)
+  warehouseId String
+  warehouse   Warehouse  @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  code        String
+  barcode     String     @unique
+  row         Int
+  column      Int
+  capacity    Int        @default(400) // cell ki length, centimetre me
+  used        Int        @default(0) // boxes ki total length (cm) jo is cell me hain
+  status      SlotStatus @default(available)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  boxes       Box[]
+
+  @@index([rackId])
+  @@index([warehouseId])
+  @@map("slot")
+}
+
+model Box {
+  id             String    @id @default(uuid())
+  boxNumber      String    @unique
+  barcode        String    @unique
+  clientId       String // DocuSoft ClientID reference -- local Client table kabhi nahi
+  clientName     String
+  description    String
+  department     String?
+  reference      String?
+  filingDateFrom DateTime  @db.Date
+  filingDateTo   DateTime? @db.Date
+  destroyAfter   DateTime? @db.Date
+  size           BoxSize
+  lengthCm       Int? // cm this box takes in a cell, copied from box_size_config when registered (so later setting changes don't corrupt slot.used)
+  status         BoxStatus @default(unallocated)
+  onHold         Boolean   @default(false)
+  holdReason     String?
+  missingReason  String? // why it was marked missing (status = missing)
+  missingAt      DateTime?
+  digitizedAt    DateTime? // set when a digitize order completes; keeps the box "digitized" again after a later order is cancelled
+  labelPrinted   Boolean   @default(false)
+  slotId         String?
+  slot           Slot?     @relation(fields: [slotId], references: [id], onDelete: SetNull)
+  locationPath   Json? // { warehouse, rack, slot } snapshot
+  openOrderId    String? // open order ka id (filter ke liye)
+  openOrder      Json? // { id, orderNumber, type, status } snapshot
+  createdBy      Json // Actor
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  orderLines  OrderLine[]
+  auditEvents AuditEvent[]
+
+  // Portal lists a client's boxes (optionally by status), newest first -> composites cover filter + sort.
+  @@index([clientId, status])
+  @@index([clientId, createdAt])
+  @@index([status])
+  @@index([slotId])
+  @@index([openOrderId])
+  @@index([createdAt])
+  @@map("box")
+}
+
+// Admin-editable length (cm) a box of each size takes in a rack cell. One row per BoxSize.
+model BoxSizeConfig {
+  size      BoxSize  @id
+  lengthCm  Int
+  updatedAt DateTime @updatedAt
+  updatedBy Json?
+
+  @@map("box_size_config")
+}
+
+model Order {
+  id             String       @id @default(uuid())
+  orderNumber    String       @unique
+  type           OrderType
+  status         OrderStatus  @default(requested)
+  clientId       String
+  clientName     String
+  requestedBy    Json // Actor
+  requestedVia   RequestedVia
+  scheduledFor   DateTime?    @db.Date
+  completedAt    DateTime?
+  address        String?
+  contactName    String?
+  // Email of the client contact this order is for (lower-case). With clientId it is how an order is tied to a
+  // person: a client-side login (clientId + contact email) only sees its own orders -- see searchOrders.
+  contactEmail   String?
+  contactPhone   String?
+  notes          String?
+  boxCount       Int          @default(0)
+  lineSummary    Json         @default("{}") // { <OrderLineStatus>: count }
+  destruction    Json? // { method, authorisedBy, authorisedAt, witness? }
+  digitization   Json? // { name, note?, authorisedBy, authorisedAt } -- the client's sign-off for a digitize order
+  collectionInfo Json? // { expectedNewBoxes } -- API me "collection" naam se aata hai
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  lines       OrderLine[]
+  auditEvents AuditEvent[]
+
+  // A contact's orders (clientId + contactEmail) and a client's orders (main contact), newest first.
+  @@index([clientId, createdAt])
+  @@index([clientId, contactEmail, createdAt])
+  @@index([type, status])
+  @@index([createdAt])
+  @@map("order")
+}
+
+model OrderLine {
+  id           String          @id @default(uuid())
+  orderId      String
+  order        Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  boxId        String?
+  box          Box?            @relation(fields: [boxId], references: [id], onDelete: SetNull)
+  boxNumber    String?
+  status       OrderLineStatus @default(pending)
+  fromLocation Json?
+  scannedAt    DateTime?
+  scannedBy    Json?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@index([orderId])
+  @@index([boxId])
+  @@map("order_line")
+}
+
+// Append-only -- kabhi update/delete nahi hota.
+model AuditEvent {
+  id              String         @id @default(uuid())
+  boxId           String
+  box             Box            @relation(fields: [boxId], references: [id], onDelete: Cascade)
+  boxNumber       String
+  clientId        String
+  type            AuditEventType
+  at              DateTime       @default(now())
+  actor           Json
+  orderId         String?
+  order           Order?         @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  orderNumber     String?
+  fromLocation    Json?
+  toLocation      Json?
+  changes         Json? // [{ field, from?, to? }]
+  note            String?
+  visibleToClient Boolean
+  createdAt       DateTime       @default(now())
+
+  @@index([at])
+  @@index([boxId, at])
+  @@index([boxId, visibleToClient, at]) // portal history of one box (client-visible events only)
+  @@index([clientId])
+  @@index([orderId])
+  @@map("audit_event")
+}
+
+// Atomic auto-increment (box numbers, per-type order numbers).
+model Counter {
+  id  String @id // "boxSeq" ya "orderSeq:dispatch"
+  seq Int    @default(0)
+
+  @@map("counter")
+}
