@@ -18,6 +18,7 @@ const digitizeRoutes = require("./routes/digitizeRoutes");
 const portalRoutes = require("./routes/portalRoutes");
 const userRoutes = require("./routes/userRoutes");
 const adminAuditRoutes = require("./routes/adminAuditRoutes");
+const invoiceRoutes = require("./routes/invoiceRoutes");
 const { notFound, errorHandler } = require("./middleware/errorMiddleware");
 
 const app = express();
@@ -64,6 +65,7 @@ app.use("/api/clients", clientRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/admin-audit", adminAuditRoutes);
+app.use("/api/invoices", invoiceRoutes);
 // External scan-app API (email + base64 password + agrno in the body).
 app.use("/api/digitize", digitizeRoutes);
 // Client-side (portal) API: alag token (Bearer), har response us client/contact tak limited.

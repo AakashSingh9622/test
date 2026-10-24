@@ -56,7 +56,7 @@ database only keeps the DocuSoft `clientId` (plus a copy of the name / contact e
 
 ## 3. Database
 
-### 3.1 Tables (12, all in the `public` schema)
+### 3.1 Tables (16, all in the `public` schema)
 
 The Supabase project also contains `auth.*`, `storage.*`, `realtime.*` tables. Those are Supabase internals and are
 **not used** by this application.
@@ -75,6 +75,10 @@ The Supabase project also contains `auth.*`, `storage.*`, `realtime.*` tables. T
 | 10 | `box_size_config` | Admin-editable length (cm) a `standard` / `large` box takes in a rack cell |
 | 11 | `app_setting` | Key/value settings kept in the database. `defaultDatabase` = the one DocuSoft agreement number (e.g. `0003`) this system is for |
 | 12 | `movement` | Append-only custody/location ledger: one row per physical change of a box's location, with real slot and warehouse ids (source for storage billing) |
+| 13 | `user_role` | Locally assigned staff roles, keyed by e-mail (only `staff_admin` comes from DocuSoft) |
+| 14 | `admin_audit_event` | Append-only history of role, layout, settings and invoice changes (things that aren't a box) |
+| 15 | `invoice` | A warehouse invoice for one client: draft → sending → issued, with the Sage invoice id/number/link once created |
+| 16 | `invoice_line` | One line of an invoice (qty, price, Sage VAT id, optional source order) |
 
 ### 3.2 Relationship diagram
 
@@ -345,6 +349,9 @@ concurrent requests never receive the same number.
 | `OrderType` | `collection`, `dispatch`, `destruction`, `digitize` |
 | `OrderStatus` | `requested`, `approved`, `scheduled`, `in_progress`, `completed`, `cancelled`, `rejected` |
 | `RequestedVia` | `staff`, `portal` |
+| `Role` (staff, added) | `warehouse_admin`, `operations_manager`, `records_manager`, `finance_manager`, `auditor` (see API.md → roles) |
+| `AdminAction` | `role_assigned`, `role_removed`, `warehouse_created`, `rack_created`, `rack_updated`, `slot_updated`, `box_sizes_updated`, `sage_settings_updated`, `invoice_created`, `invoice_deleted`, `invoice_issued` |
+| `InvoiceStatus` | `draft` · `sending` (a browser is creating it in Sage; lock expires after 2 min) · `issued` (in Sage, frozen) |
 | `MovementType` | `put_away` (into a slot from nowhere: new box, or back from the client) · `transfer` (slot → slot) · `found` (missing box placed again) · `dispatched` · `destroyed` · `marked_missing` |
 | `OrderLineStatus` | `pending`, `picked`, `dispatched`, `received`, `destroyed`, `digitized`, `missing`, `removed` |
 | `AuditEventType` | `registered`, `label_printed`, `allocated`, `moved`, `details_edited`, `added_to_order`, `removed_from_order`, `picked`, `dispatched`, `collected`, `received`, `refiled`, `marked_missing`, `destruction_authorised`, `destroyed`, `hold_placed`, `hold_released`, `status_changed` |

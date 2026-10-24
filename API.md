@@ -387,6 +387,80 @@ curl -X POST /api/orders/<id>/dispatch -d '{ "recipientName": "M. Jones" }'
 
 (Portal orders are supported through the client-portal API below, and every list endpoint is paginated.)
 
+## Staff roles and permissions (`/api/users`)
+
+Staff log in with DocuSoft. Only DocuSoft's admin flag (`strIsAdmin`) is taken from DocuSoft (→ `staff_admin`); every other
+staff role is assigned here and stored in `user_role` (keyed by e-mail, so a role can be given before someone's first
+login). No role and not an admin → `staff_operator`. Every change-making route checks the person's **current** roles
+from the database (`requirePermission`, 30 s cache cleared on change) — the 7-day session token's roles are not trusted.
+Role → permission map: `src/auth/permissions.js` (the staff frontend has a copy for its buttons).
+
+| Permission | Roles |
+|---|---|
+| `layout.manage`, `settings.manage` | staff_admin, warehouse_admin |
+| `users.manage` | staff_admin |
+| `audit.read` | staff_admin, warehouse_admin, operations_manager, records_manager, finance_manager, auditor |
+| `boxes.operate`, `orders.operate` | staff_admin, warehouse_admin, operations_manager, staff_operator |
+| `boxes.hold` | staff_admin, warehouse_admin, records_manager |
+| `orders.approve` | staff_admin, warehouse_admin, operations_manager |
+| `orders.authorise` (record a client's destruction/digitizing sign-off) | staff_admin, operations_manager, records_manager |
+| `billing.view` | staff_admin, finance_manager, auditor |
+| `billing.manage` | staff_admin, finance_manager |
+
+Reading boxes, orders, warehouses and box history needs only a staff login.
+
+```text
+GET /api/users                              -> { items: StaffUser[], total }            (users.manage)
+PUT /api/users/:email/roles  { roles }      -> StaffUser   replaces the local roles     (users.manage)
+GET /api/admin-audit?entityType=&entityId=&action=&page=&pageSize=
+                                            -> { items: AdminAuditEvent[], total }      (audit.read)
+```
+
+```ts
+interface StaffUser { email: string; name?: string; hasLoggedIn: boolean; lastLoginAt?: string;
+  docusoftAdmin: boolean; roles: Role[] /* assigned here */; effectiveRoles: Role[] /* what they can do */ }
+interface AdminAuditEvent { id: string; action: string; entityType: "user" | "warehouse" | "rack" | "slot" | "settings" | "invoice";
+  entityId?: string; summary: string; changes?: { field: string; from?: unknown; to?: unknown }[]; actor: Actor; at: string }
+```
+
+Role, warehouse/rack/slot, box-size, Sage-settings and invoice changes are written to the admin audit log.
+
+## Invoices and Sage One (`/api/invoices`, `/api/settings/sage`)
+
+Warehouse invoices are prepared here and **created in Sage One by the browser** — the Sage sign-in (tokens) lives in the
+browser, as in DocuSoft Practice, and every Sage call goes to DocuSoft's proxy (`https://digitalpractice.net/sageone/*`).
+This API never sees Sage tokens or the Sage app secret; it stores the invoice and records the hand-over:
+
+`draft` → `POST /:id/sending` (lock, 2 min) → browser creates it in Sage → `POST /:id/issued` → `issued` (frozen).
+On failure `POST /:id/send-failed` puts it back to `draft` with `lastError`. The invoice number is the Sage reference, and
+the browser looks for it in Sage before creating — so a retry never makes a second Sage invoice.
+
+```text
+GET    /api/invoices?clientId=&status=&q=&page=&pageSize=   -> { items: Invoice[], total }          (billing.view)
+GET    /api/invoices/suggest?clientId=&from=&to=            -> { lines, alreadyInvoicedOrders }      (billing.manage)
+POST   /api/invoices            InvoiceInput                 -> Invoice (draft, "WMS-INV-000001") 201 (billing.manage)
+GET    /api/invoices/:id                                     -> Invoice with lines                   (billing.view)
+PUT    /api/invoices/:id        InvoiceInput                 -> Invoice   draft only                 (billing.manage)
+DELETE /api/invoices/:id                                     -> { ok }    draft only                 (billing.manage)
+POST   /api/invoices/:id/sending                             -> Invoice   409 if being sent now      (billing.manage)
+POST   /api/invoices/:id/issued { sageInvoiceId, sageInvoiceNumber?, sageLink?, sageContactId?, sageBusinessId? }
+POST   /api/invoices/:id/send-failed { message }
+GET    /api/settings/sage                                    -> SageSettings                         (billing.view)
+PUT    /api/settings/sage  { defaultLedgerAccountId?, defaultLedgerAccountName?, defaultTaxRateId?, paymentTermsDays? }
+```
+
+```ts
+interface InvoiceLine { kind: "storage" | "intake" | "collection" | "dispatch" | "destruction" | "digitize" | "other";
+  description: string; quantity: number; unitPrice: number /* GBP, 2 dp */; taxRateId: string /* Sage id, e.g. GB_STANDARD */;
+  ledgerAccountId?: string; sourceType?: "order"; sourceId?: string /* the order — never suggested twice */ }
+interface InvoiceInput { clientId: string; clientName: string; periodFrom?: string; periodTo?: string;
+  invoiceDate: string; dueDate: string; notes?: string; lines: InvoiceLine[] }
+```
+
+Suggested lines (for a client and period): boxes in storage, boxes registered in the period, and every order completed in
+the period that isn't on an invoice yet; price = the last price used for that kind of line. `netTotal` = sum of qty x price
+(VAT is worked out by Sage). Sage defaults: `defaultTaxRateId` `GB_NO_TAX` (as Practice) and 30 days unless changed.
+
 ## Pagination (all list endpoints)
 
 `GET /api/boxes`, `/api/orders`, `/api/audit`, `/api/clients/:id/boxes` and `/api/clients/:id/orders` are paginated:
