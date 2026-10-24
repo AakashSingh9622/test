@@ -602,7 +602,11 @@ GET  /api/exports/audit.csv?from=&to=&clientId=                  audit.read
 GET  /api/exports/charges.csv?from=&to=&clientId=&status=        billing.view
 
 GET  /api/boxes/:id/contents · POST { description, reference?, dateFrom?, dateTo?, docusoftDocumentId? } · DELETE /api/boxes/:id/contents/:contentId
-GET  /api/notifications?page=&pageSize=                          staff in-app updates (new portal requests, client approvals)
+GET  /api/notifications?page=&pageSize=&unread=true   staff in-app updates (every client action) -> { items: [... read], total, unread }
+GET  /api/notifications/unread-count -> { unread }      POST /api/notifications/:id/read      POST /api/notifications/read-all
+GET / PUT / DELETE /api/me/signature   the signed-in staff member's signature { kind: drawn|typed|uploaded, image: data URL,
+     text?, font? } -- goes on the certificates of destruction they sign; POST /orders/:id/destroy without one -> 409
+     { code: "SIGNATURE_REQUIRED" }
 ```
 
 - **Storage** is charged by the day: days the box was in our custody in the period (from the movement ledger) / 30 ×

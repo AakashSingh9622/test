@@ -479,6 +479,18 @@ today's layout instead of replacing it (decision 24 Oct):
   otherwise the zxing library (loaded only when the camera opens). The camera needs https (or localhost).
   `GET /api/boxes/lookup?code=` (current barcode or box number).
 
+**Staff notifications and signed certificates ✅ built (24 Oct)**
+- **Notifications:** every client action in the portal reaches staff — new request, cancellation, client approval,
+  destruction / digitising sign-off, card payment, acknowledged invoice. A bell in the staff top bar shows the unread
+  count (per staff member, `notification_read`; items from before someone's first login count as read), the latest
+  items (open one = read + go to its order), "mark all as read", and a toast when a new one arrives (polls every 30 s).
+  The dashboard's Updates list uses the same read state.
+- **Signatures:** each staff member keeps one signature (`wh_user.signature`) — drawn, typed in a handwriting font, or an
+  uploaded picture; always stored as an image (My signature, from the user menu). Marking boxes destroyed needs one
+  (409 `SIGNATURE_REQUIRED` otherwise; the Mark destroyed dialog lets you add it there) and it is **copied into the
+  certificate** (`content.destroyedBySignature`), so later changes never alter an issued certificate. The client's copy
+  shows the signature without the staff name. Changes are in the admin log (`signature_updated`).
+
 **Later — customer operations (spec P1)**
 - Customer-admin approval of contacts' requests, email notifications, dispatch jobs with courier and proof of delivery.
   Built: main-contact approval of destruction requests, in-app notifications, courier/tracking + proof of delivery,

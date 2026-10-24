@@ -361,6 +361,7 @@ via, by, at}`, `waived {reason, by, at}`). `invoice.orderId` (indexed), `invoice
 | `charge_event` | one chargeable fact | unique `(sourceType, sourceKey, chargeType, periodStart, periodEnd)` — re-running never charges twice; `status` open/invoiced/voided |
 | `billing_run` | a period's charges → invoices | `runNumber` (`BR-000001`); `status` draft/approved; `totals` JSON frozen on approval |
 | `notification` | in-app updates | `audience` client/staff; client rows carry `clientId` + `contactEmail` (null = the client's main contacts) |
+| `notification_read` | which staff member read which staff notification | PK (`notificationId`, `userId` = `wh_user.id`); the bell's unread count is per person. `wh_user.signature` (JSON: kind, image data URL, text?, font?) is the signature copied onto certificates (`destruction_certificate.content.destroyedBySignature`) |
 
 #### `box_size_config` — box sizes (settings, Sprint 11)
 | Column | Type | Key | Notes |

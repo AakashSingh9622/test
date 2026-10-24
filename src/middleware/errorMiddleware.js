@@ -34,6 +34,7 @@ function errorHandler(err, _req, res, _next) {
 
   res.status(err.status || 500).json({
     status: false,
+    ...(err.errorCode && { code: err.errorCode }),
     message: err.message || "Internal server error",
   });
 }
