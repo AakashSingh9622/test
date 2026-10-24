@@ -9,6 +9,7 @@
 const { Prisma } = require("../config/prisma");
 const prisma = require("../config/prisma");
 const orderService = require("./orderService");
+const { getBoxSizeNames } = require("./boxSizeService");
 const { visibleToContactWhere } = orderService;
 const { parsePagination } = require("../utils/pagination");
 const { toDate } = require("../utils/serialize");
@@ -139,8 +140,11 @@ async function listBoxes(ctx, q = {}) {
     prisma.box.findMany({ where, include: BOX_INCLUDE, orderBy: [{ createdAt: "desc" }, { id: "asc" }], skip, take }),
     prisma.box.count({ where }),
   ]);
-  const visible = await visibleOrderIds(ctx, items.map((b) => b.openOrderId));
-  return { items: items.map((b) => portalBox(b, { showOrder: visible.has(b.openOrderId) })), total };
+  const [visible, sizeNames] = await Promise.all([visibleOrderIds(ctx, items.map((b) => b.openOrderId)), getBoxSizeNames()]);
+  return {
+    items: items.map((b) => portalBox({ ...b, sizeName: sizeNames[b.size] }, { showOrder: visible.has(b.openOrderId) })),
+    total,
+  };
 }
 
 async function findOwnBox(ctx, boxId) {
@@ -159,7 +163,8 @@ async function getBox(ctx, boxId) {
     dateTo,
     docusoftDocumentId,
   }));
-  return { ...portalBox(box, { showOrder: visible.has(box.openOrderId) }), contents };
+  const sizeNames = await getBoxSizeNames();
+  return { ...portalBox({ ...box, sizeName: sizeNames[box.size] }, { showOrder: visible.has(box.openOrderId) }), contents };
 }
 
 // Client-facing history: sirf visibleToClient events, bina staff ke naam / rack / slot ke. Normal contact ko doosre

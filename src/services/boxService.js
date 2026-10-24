@@ -4,7 +4,7 @@ const { Prisma } = prisma;
 const { nextSequence } = require("./counterService");
 const { appendAuditEvent } = require("./auditService");
 const { appendMovement } = require("./movementService");
-const { getBoxSizes } = require("./boxSizeService");
+const { getBoxSizes, assertUsableSize } = require("./boxSizeService");
 const { TX_OPTIONS, releaseBoxSlot, RELEASED_BOX_FIELDS, allocateBoxes, isActiveSlot } = require("./boxAllocationService");
 const { recomputeLineSummary, goodsInPath, findBoxByCode } = require("./orderService");
 const { recordException, refuseAndRecord } = require("./exceptionService");
@@ -60,6 +60,21 @@ async function getBoxById(id) {
   return serializeBox(await prisma.box.findUnique({ where: { id } }));
 }
 
+// Scan to see a box (Sprint 11): its current barcode or its box number, any case. (The box number is also the code of
+// the box's first label, so an old label still finds the box here -- only for looking; scan operations use the current
+// barcode only, see findBoxByCode.)
+async function lookupBox(rawCode) {
+  const code = String(rawCode || "").trim();
+  if (!code) throw httpError(400, "Scan or type a box barcode");
+  const box =
+    (await findBoxByCode(code)) ??
+    (await prisma.box.findFirst({
+      where: { OR: [{ barcode: { equals: code, mode: "insensitive" } }, { boxNumber: { equals: code, mode: "insensitive" } }] },
+    }));
+  if (!box) throw httpError(404, `No box has the barcode ${code}`);
+  return serializeBox(box);
+}
+
 // Jin orders me ye box kabhi shamil hua hai, unki list (box detail ka "Orders" tab).
 async function getOrdersForBox(boxId) {
   const orders = await prisma.order.findMany({
@@ -81,6 +96,8 @@ async function checkRetentionCategory(value) {
 // Naye boxes ek saath register karta hai (Register Boxes wizard, step 1) -- ek transaction me.
 async function createBoxesBatch(input, actor) {
   const retentionCategory = await checkRetentionCategory(input.retentionCategory);
+  const sizeCode = input.size || "standard";
+  await assertUsableSize(sizeCode); // a size from Settings → Box sizes that isn't retired
   return prisma.$transaction(async (tx) => {
     // Collection order ke liye register ho rahe hain to order pehle hi validate karo (galat/band
     // order par boxes bana kar fail hone se behtar hai ki shuru me hi 4xx mile).
@@ -112,8 +129,8 @@ async function createBoxesBatch(input, actor) {
           filingDateTo: toDate(input.filingDateTo) || undefined,
           destroyAfter: toDate(input.destroyAfter) || undefined,
           retentionCategory: retentionCategory ?? undefined,
-          size: input.size,
-          lengthCm: sizes[input.size] ?? sizes.standard,
+          size: sizeCode,
+          lengthCm: sizes[sizeCode] ?? sizes.standard,
           status: "unallocated",
           onHold: false,
           labelPrinted: false,
@@ -158,6 +175,67 @@ const FIELD_LABELS = {
   retentionCategory: "retention category",
 };
 const DATE_FIELDS = new Set(["filingDateFrom", "filingDateTo", "destroyAfter"]);
+
+// Register wizard, back on step 1 after registering: the same correction applied to every box of the batch, in one
+// transaction (one "details_edited" history event per box that changed). Client and size can only change while a box is
+// not on a shelf and not tied to an order (its order line / slot space would be wrong otherwise).
+const CORRECTION_NOTE = "Corrected during registration";
+async function correctRegisteredBoxes({ boxIds, patch }, actor) {
+  if (!Array.isArray(boxIds) || boxIds.length === 0) throw httpError(400, "boxIds is required");
+  if (boxIds.length > 200) throw httpError(400, "At most 200 boxes at a time");
+  if (patch.retentionCategory !== undefined) {
+    patch = { ...patch, retentionCategory: (await checkRetentionCategory(patch.retentionCategory)) ?? undefined };
+  }
+  if (patch.size !== undefined) await assertUsableSize(patch.size);
+  if (patch.clientId !== undefined && !String(patch.clientId).trim()) throw httpError(400, "clientId can't be empty");
+  if (patch.description !== undefined && !String(patch.description).trim()) throw httpError(400, "description can't be empty");
+  if (patch.filingDateFrom !== undefined && !patch.filingDateFrom) throw httpError(400, "filing date from is required");
+  const sizes = patch.size !== undefined ? await getBoxSizes() : null;
+
+  return prisma.$transaction(async (tx) => {
+    const boxes = await tx.box.findMany({ where: { id: { in: boxIds } }, include: { _count: { select: { orderLines: true } } } });
+    if (boxes.length !== new Set(boxIds).size) throw httpError(404, "Some of these boxes don't exist");
+    const out = [];
+    for (const box of boxes) {
+      const changes = [];
+      const data = {};
+      for (const key of Object.keys(FIELD_LABELS)) {
+        const nextValue = patch[key];
+        if (nextValue === undefined) continue;
+        const currentValue = (DATE_FIELDS.has(key) ? dateOnly(box[key]) : box[key]) ?? "";
+        if ((nextValue ?? "") === currentValue) continue;
+        changes.push({ field: FIELD_LABELS[key], from: currentValue || undefined, to: nextValue || undefined });
+        data[key] = DATE_FIELDS.has(key) ? toDate(nextValue) : nextValue || null;
+      }
+      const movesClient = patch.clientId !== undefined && patch.clientId !== box.clientId;
+      const resizes = patch.size !== undefined && patch.size !== box.size;
+      if (movesClient || resizes) {
+        if (box.slotId || box.openOrderId || box._count.orderLines > 0 || !["unallocated", "received"].includes(box.status)) {
+          throw httpError(409, `${box.boxNumber} is already filed or on an order — its ${movesClient ? "client" : "size"} can't change now`);
+        }
+      }
+      if (movesClient) {
+        changes.push({ field: "client", from: box.clientName, to: patch.clientName || patch.clientId });
+        data.clientId = patch.clientId;
+        data.clientName = patch.clientName || patch.clientId;
+      }
+      if (resizes) {
+        changes.push({ field: "size", from: box.size, to: patch.size });
+        data.size = patch.size;
+        data.lengthCm = sizes[patch.size] ?? sizes.standard;
+      }
+      if (!changes.length) {
+        out.push(serializeBox(box));
+        continue;
+      }
+      const updated = await tx.box.update({ where: { id: box.id }, data });
+      await appendAuditEvent(updated, "details_edited", actor, { changes, note: CORRECTION_NOTE }, tx);
+      out.push(serializeBox(updated));
+    }
+    const order = new Map(boxIds.map((id, i) => [id, i]));
+    return out.sort((a, b) => order.get(a.id) - order.get(b.id));
+  }, TX_OPTIONS);
+}
 
 async function updateBoxDetails(boxId, patch, reason, actor) {
   const box = await prisma.box.findUnique({ where: { id: boxId } });
@@ -383,11 +461,13 @@ async function relabelBox(boxId, rawReason, actor) {
 module.exports = {
   receiveAtGoodsIn,
   putAwayByBarcode,
+  correctRegisteredBoxes,
   quarantineBox,
   releaseQuarantine,
   relabelBox,
   searchBoxes,
   getBoxById,
+  lookupBox,
   getOrdersForBox,
   createBoxesBatch,
   markLabelsPrinted,

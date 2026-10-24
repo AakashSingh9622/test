@@ -4,6 +4,7 @@ const prisma = require("../config/prisma");
 const httpError = require("../utils/httpError");
 const { dateOnly, toDate } = require("../utils/serialize");
 const { locationText } = require("../utils/locationPath");
+const { getBoxSizeNames } = require("./boxSizeService");
 
 const PAGE = 1000;
 
@@ -45,14 +46,18 @@ async function stream(res, filename, header, fetchPage, toRow) {
 
 const SPECS = {
   inventory: (params) => {
+    let sizeNames = null; // { code: name }, loaded with the first page
     const where = {};
     if (params.clientId) where.clientId = params.clientId;
     if (params.status) where.status = params.status;
     else where.status = { not: "destroyed" };
     return {
       header: ["Box number", "Barcode", "Client id", "Client", "Description", "Department", "Reference", "Filing from", "Filing to", "Destroy after", "Retention category", "Size", "Status", "On hold", "Location", "Registered"],
-      fetch: (skip, take) => prisma.box.findMany({ where, orderBy: [{ clientName: "asc" }, { boxNumber: "asc" }], skip, take }),
-      row: (b) => [b.boxNumber, b.barcode, b.clientId, b.clientName, b.description, b.department, b.reference, dateOnly(b.filingDateFrom), dateOnly(b.filingDateTo), dateOnly(b.destroyAfter), b.retentionCategory, b.size, b.status, b.onHold ? "yes" : "no", locationText(b.locationPath), dateOnly(b.createdAt)],
+      fetch: async (skip, take) => {
+        sizeNames = sizeNames ?? (await getBoxSizeNames());
+        return prisma.box.findMany({ where, orderBy: [{ clientName: "asc" }, { boxNumber: "asc" }], skip, take });
+      },
+      row: (b) => [b.boxNumber, b.barcode, b.clientId, b.clientName, b.description, b.department, b.reference, dateOnly(b.filingDateFrom), dateOnly(b.filingDateTo), dateOnly(b.destroyAfter), b.retentionCategory, sizeNames?.[b.size] ?? b.size, b.status, b.onHold ? "yes" : "no", locationText(b.locationPath), dateOnly(b.createdAt)],
     };
   },
   movements: (params) => {

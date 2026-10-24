@@ -21,7 +21,8 @@ async function main() {
     LEFT JOIN (
       SELECT "slotId",
              SUM(COALESCE("lengthCm",
-               CASE WHEN "size" = 'large'::"BoxSize" THEN ${BOX_LENGTH_CM.large}::int ELSE ${BOX_LENGTH_CM.standard}::int END))::int AS "total"
+               (SELECT c."lengthCm" FROM "box_size_config" c WHERE c."size" = "box"."size"),
+               ${BOX_LENGTH_CM.standard}::int))::int AS "total"
       FROM "box" WHERE "slotId" IS NOT NULL GROUP BY "slotId"
     ) t ON t."slotId" = s."id"
     WHERE s."used" <> COALESCE(t."total", 0)

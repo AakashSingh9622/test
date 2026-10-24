@@ -12,6 +12,7 @@ const { dateOnly, toDate } = require("../utils/serialize");
 const { parsePagination } = require("../utils/pagination");
 const { appendAdminEvent } = require("./adminAuditService");
 const { pickCard } = require("./rateCardService");
+const { getBoxSizeNames } = require("./boxSizeService");
 
 const DAY = 24 * 60 * 60 * 1000;
 const MONTH_DAYS = 30; // storage proration: monthly rate x days / 30
@@ -209,6 +210,7 @@ async function generateCharges({ from, to, clientId }, actor) {
     }
 
     // --- storage: box-days per client and size, priced from the card in force at the end of the period
+    const sizeNames = await getBoxSizeNames();
     const totals = new Map(); // `${clientId}:${size}` -> { clientId, clientName, size, days }
     for (const b of boxes) {
       const days = custodyDays(b, movesByBox.get(b.id) || [], start, endExclusive);
@@ -236,7 +238,7 @@ async function generateCharges({ from, to, clientId }, actor) {
           sourceKey: key,
           periodStart: start,
           periodEnd: end,
-          description: `Storage — ${Math.round(t.days * 10) / 10} box-days (${t.size}), ${dateOnly(start)} to ${dateOnly(end)}`,
+          description: `Storage — ${Math.round(t.days * 10) / 10} box-days (${sizeNames[t.size] ?? t.size}), ${dateOnly(start)} to ${dateOnly(end)}`,
           quantity: dec(boxMonths),
           unitPrice: dec(monthly),
           amount: dec(boxMonths).mul(monthly).toDecimalPlaces(2),

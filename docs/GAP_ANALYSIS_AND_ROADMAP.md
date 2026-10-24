@@ -455,6 +455,29 @@ today's layout instead of replacing it (decision 24 Oct):
   grouped racks on the warehouse page, zone / aisle in Add / Edit rack, rows shown as shelves with their code, one
   "type a code or browse" picker for registration and Move box, shelf / position label printing
   (`/print/location-labels`). A numbers-only rack code is refused (`12-3` would read as a shelf).
+- Follow-ups after testing (24 Oct): the location finder also takes the rack's **name** ("Rack A-01 3", separators
+  "-", space, "/" or "."), with search-as-you-type (`GET /locations/racks?q=`) and a choice when a name / code matches
+  several racks; the register wizard lets you fix step 1 after registering (`POST /boxes/correct-batch`: the whole batch
+  at once, quantity can go up, client / size lock once a box is filed); filing the last box goes straight to the summary;
+  "Print labels" opens the print dialog by itself.
+
+**Sprint 11 — custom box sizes and scan-to-see a box ✅ built** — backend, staff frontend, client portal (size name).
+- **Box sizes are a list, not two fixed values.** Standard and Large stay as built-in sizes (rename, resize or retire,
+  never remove); admins add their own in Settings → Box sizes — a **name and the shelf length** one box takes (cm or
+  feet; the length is what rack capacity uses, decision 24 Oct). Each size gets a stable code from its first name
+  (`archive-xl`), so renaming never touches boxes. A size used by boxes can't be removed, only **retired** (kept on old
+  boxes, not offered for new ones); an unused one can be removed. Boxes keep the length they were registered with, so a
+  new length only affects boxes registered afterwards. Every change is in the admin log.
+- `box.size` and `box_size_config.size` changed from the `BoxSize` enum to text. **Database step: `npm run
+  sizes:convert` once BEFORE `npx prisma db push`** — db push alone refuses (it would drop the columns); the script
+  converts them in place and keeps every value (rehearsed on a copy). Same SQL in `prisma/sql/sprint11-box-sizes.sql`.
+- Rate cards price storage **per size** (any size code); the rate card screen lists every size and warns about a size in
+  use without a price (charged 0). Charge descriptions, the CSV export and the portal show the size's name.
+- **Scan to see a box:** a Scan button in the staff top bar, and any handheld-scanner scan made while no text field has
+  focus, opens the box's details (status, location, holds, open order; Open / History / Move). It also takes a typed
+  barcode or box number, and the **camera** on phones / tablets — the browser's built-in barcode reader where it has one,
+  otherwise the zxing library (loaded only when the camera opens). The camera needs https (or localhost).
+  `GET /api/boxes/lookup?code=` (current barcode or box number).
 
 **Later — customer operations (spec P1)**
 - Customer-admin approval of contacts' requests, email notifications, dispatch jobs with courier and proof of delivery.

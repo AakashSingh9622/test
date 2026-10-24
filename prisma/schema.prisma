@@ -37,10 +37,6 @@ enum SlotStatus {
   inactive // not in use (e.g. rack being decommissioned)
 }
 
-enum BoxSize {
-  standard
-  large
-}
 
 enum BoxStatus {
   unallocated
@@ -180,6 +176,8 @@ enum AdminAction {
   aisle_updated
   aisle_deleted
   box_sizes_updated
+  box_size_created
+  box_size_deleted
   sage_settings_updated
   invoice_created
   invoice_deleted
@@ -330,7 +328,7 @@ model Box {
   filingDateFrom DateTime  @db.Date
   filingDateTo   DateTime? @db.Date
   destroyAfter   DateTime? @db.Date
-  size           BoxSize
+  size           String // box_size_config.size code ("standard", "large" or one an admin added) -- Sprint 11
   lengthCm       Int? // cm this box takes in a cell, copied from box_size_config when registered (so later setting changes don't corrupt slot.used)
   status         BoxStatus @default(unallocated)
   onHold         Boolean   @default(false)
@@ -367,10 +365,16 @@ model Box {
   @@map("box")
 }
 
-// Admin-editable length (cm) a box of each size takes in a rack cell. One row per BoxSize.
+// Box sizes (Sprint 11): the two built-in ones (standard, large) plus any an admin adds -- a name and the length (cm)
+// one box takes along a rack cell. `size` is a stable code made from the first name, so renaming never touches boxes.
+// A size in use can only be retired (no new boxes), not deleted -- boxSizeService.
 model BoxSizeConfig {
-  size      BoxSize  @id
+  size      String   @id // code, e.g. "standard", "archive-xl"
+  name      String? // shown everywhere; null on the old built-in rows -> "Standard" / "Large"
   lengthCm  Int
+  active    Boolean  @default(true) // false = retired: kept for existing boxes, not offered for new ones
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   updatedBy Json?
 

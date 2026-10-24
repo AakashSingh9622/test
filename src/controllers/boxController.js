@@ -28,6 +28,11 @@ async function listBoxes(req, res) {
   res.json(result);
 }
 
+// GET /api/boxes/lookup?code=BX00000123 -- scan a label to see the box
+async function lookupBox(req, res) {
+  res.json(await boxService.lookupBox(req.query.code));
+}
+
 async function getBox(req, res) {
   const box = await boxService.getBoxById(req.params.boxId);
   if (!box) return res.status(404).json({ message: "Box not found" });
@@ -82,6 +87,13 @@ async function allocateBatch(req, res) {
     return res.status(400).json({ message: "allocations (non-empty array) is required" });
   }
   res.json(await allocateBoxes(req.body, actorFromReq(req)));
+}
+
+// POST /api/boxes/correct-batch { boxIds, clientId?, clientName?, size?, description?, department?, reference?,
+// filingDateFrom?, filingDateTo?, destroyAfter?, retentionCategory? } -- register wizard, fixing step 1 for the batch
+async function correctRegisteredBoxes(req, res) {
+  const { boxIds, ...patch } = req.body || {};
+  res.json(await boxService.correctRegisteredBoxes({ boxIds, patch }, actorFromReq(req)));
 }
 
 async function updateBoxDetails(req, res) {
@@ -149,6 +161,8 @@ module.exports = {
   suggestSlots,
   allocateBatch,
   updateBoxDetails,
+  correctRegisteredBoxes,
+  lookupBox,
   placeBoxHold,
   releaseBoxHold,
   markBoxMissing,

@@ -15,9 +15,17 @@ function money(v, name) {
   return Math.round(n * 100) / 100;
 }
 
+// Storage is priced per box size (Sprint 11: any size from Settings → Box sizes, keyed by its code). A size with no
+// price on a card is charged 0 -- the rate card screen lists every size so none is forgotten.
 function cleanRates(r = {}) {
   const storage = r.storagePerBoxMonth || {};
-  const rates = { storagePerBoxMonth: { standard: money(storage.standard ?? 0, "storage (standard)"), large: money(storage.large ?? 0, "storage (large)") } };
+  const perSize = { standard: 0, large: 0, ...storage };
+  const storagePerBoxMonth = {};
+  for (const [code, price] of Object.entries(perSize)) {
+    if (!/^[a-z0-9-]{1,40}$/.test(code)) throw httpError(400, `Unknown box size "${code}" in the storage prices`);
+    storagePerBoxMonth[code] = money(price ?? 0, `storage (${code})`);
+  }
+  const rates = { storagePerBoxMonth };
   for (const k of PRICE_KEYS) rates[k] = money(r[k] ?? 0, k);
   return rates;
 }

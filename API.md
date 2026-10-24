@@ -161,7 +161,7 @@ POST   /api/boxes/:id/missing { note: string }           -> Box
 ```ts
 type BoxStatus = "unallocated" | "stored" | "reserved" | "picked" | "out"
                | "pending_destruction" | "destroyed" | "missing" | "digitized"
-type BoxSize = "standard" | "large" // capacity is in centimetres: "large" takes 80 cm of a cell, "standard" 40 cm (src/utils/dimensions.js)
+type BoxSize = string // a size code from GET /api/settings/box-sizes: "standard", "large" or one an admin added ("archive-xl")
 
 interface Box {
   id: string; boxNumber: string; barcode: string;
@@ -496,6 +496,12 @@ POST   /api/invoices/:id/sending                             -> Invoice   409 if
 POST   /api/invoices/:id/issued { sageInvoiceId, sageInvoiceNumber?, sageLink?, sageContactId?, sageBusinessId? }
 POST   /api/invoices/:id/send-failed { message }
 GET    /api/settings/sage                                    -> SageSettings                         (billing.view)
+GET    /api/settings/box-sizes   -> { items: [{ code, name, lengthCm, active, builtIn, boxCount }], updatedAt, updatedBy }
+POST   /api/settings/box-sizes   { name, lengthCm }                  -> BoxSizeType (201)  (settings.manage)
+PATCH  /api/settings/box-sizes/:code { name?, lengthCm?, active? }   -> BoxSizeType  rename / new length / retire (false)
+DELETE /api/settings/box-sizes/:code                                 -> 204 (409 if a box uses it or it's standard / large)
+GET    /api/boxes/lookup?code=   current barcode or box number, any case -> Box (404 if none) -- "scan to see a box"
+       Rate cards: rates.storagePerBoxMonth is { <size code>: price }.
 PUT    /api/settings/sage  { defaultLedgerAccountId?, defaultLedgerAccountName?, defaultTaxRateId?, paymentTermsDays? }
 ```
 
