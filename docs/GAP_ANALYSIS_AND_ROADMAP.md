@@ -314,9 +314,16 @@ operational core, Sprints 4–6 add the features requested in the review.
 - Billing runs: generate, review, approve, freeze.
 - Invoice ledger per client/period. FE: finance screens.
 
-**Sprint 7 — Sage/Stripe connections**
-- Connection settings; keys from the DocuSoft Practice API (to be agreed with the product owner first).
-- Invoice push and payment flow, using the existing practice-management integration.
+**Sprint 7 — Sage/Stripe connections ✅ built (brought forward; prototype)** — per `SAGE_ONE_INTEGRATION_REPORT.md` and the
+24 Oct decisions: Sage calls and tokens in the browser like Practice; manual invoices prefilled from warehouse activity
+(until Sprints 5–6 exist); client ⇄ Sage contact through DocuSoft's `CCode`; Sage first, Stripe read-only.
+- Backend: `invoice` / `invoice_line`, suggested lines, sending lock + issued/send-failed hand-over, Sage defaults
+  (`/api/settings/sage`), `billing.view` / `billing.manage` permissions. 52 backend checks pass.
+- Staff frontend: one Sage module (`src/api/sage.ts`; fixes report findings 3, 4, 6, 8), Invoices list / new / detail,
+  Send to Sage (contact by CCode → Sage reference → created; an existing Sage invoice with our number is reused, never
+  duplicated), Settings → Sage One, Stripe payments of the client (read-only, via Practice's proxy). 12 unit tests.
+- Open: verify the VAT ids (`GB_LOWER` etc.) and the whole flow against a real Sage test business; Stripe checkout needs
+  a "create checkout" endpoint on DocuSoft's Stripe proxy (it can only read payments today).
 
 **Later — customer operations (spec P1)**
 - Customer-admin approval of contacts' requests, email notifications, dispatch jobs with courier and proof of delivery.

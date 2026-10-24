@@ -155,6 +155,10 @@ enum AdminAction {
   rack_updated
   slot_updated
   box_sizes_updated
+  sage_settings_updated
+  invoice_created
+  invoice_deleted
+  invoice_issued
 }
 
 // Append-only history of admin / configuration changes (roles, warehouse layout, settings) -- audit_event sirf
@@ -401,6 +405,67 @@ model Movement {
   @@index([clientId, at])
   @@index([at])
   @@map("movement")
+}
+
+enum InvoiceStatus {
+  draft // being prepared in the WMS
+  sending // a browser is creating it in Sage right now (see Invoice.sendingSince)
+  issued // created in Sage -- frozen from here on
+}
+
+// A warehouse invoice for one client. Prepared here (lines suggested from warehouse activity), then created in
+// Sage One BY THE BROWSER (Sage tokens live in the browser, same as DocuSoft Practice). The backend only records
+// what happened: "sending" lock before the Sage call, Sage ids/link after it.
+// Real billing (contracts, charge events, billing runs -- roadmap Sprints 5-6) will feed these lines later.
+model Invoice {
+  id            String        @id @default(uuid())
+  invoiceNumber String        @unique // "WMS-INV-000001" -- also the Sage invoice reference (used to find it again)
+  clientId      String // DocuSoft ClientID
+  clientName    String
+  periodFrom    DateTime?     @db.Date
+  periodTo      DateTime?     @db.Date
+  invoiceDate   DateTime      @db.Date
+  dueDate       DateTime      @db.Date
+  notes         String?
+  status        InvoiceStatus @default(draft)
+  netTotal      Decimal       @default(0) @db.Decimal(19, 4) // sum of qty x unit price; VAT is worked out by Sage
+  sendingSince  DateTime? // when the current "sending" attempt started
+  lastError     String? // why the last attempt to create it in Sage failed
+  sageContactId String?
+  sageBusinessId String?
+  sageInvoiceId String?
+  sageInvoiceNumber String?
+  sageLink      String?
+  issuedAt      DateTime?
+  issuedBy      Json?
+  createdBy     Json
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  lines         InvoiceLine[]
+
+  @@index([clientId, createdAt])
+  @@index([status, createdAt])
+  @@index([createdAt])
+  @@map("invoice")
+}
+
+model InvoiceLine {
+  id              String  @id @default(uuid())
+  invoiceId       String
+  invoice         Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  position        Int
+  kind            String // storage | intake | collection | dispatch | destruction | digitize | other
+  description     String
+  quantity        Decimal @db.Decimal(19, 4)
+  unitPrice       Decimal @db.Decimal(19, 4)
+  taxRateId       String // Sage tax rate id, e.g. GB_STANDARD, GB_ZERO, GB_NO_TAX
+  ledgerAccountId String? // Sage ledger account; empty = the invoice-wide one chosen when sending
+  sourceType      String? // "order" when the line came from a completed order
+  sourceId        String? // the order id -- so the same order is not suggested again
+
+  @@index([invoiceId])
+  @@index([sourceType, sourceId])
+  @@map("invoice_line")
 }
 
 // Atomic auto-increment (box numbers, per-type order numbers).

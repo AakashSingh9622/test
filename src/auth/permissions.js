@@ -14,6 +14,8 @@ const PERMISSIONS = [
   "orders.operate", // create, schedule, start, cancel, dispatch, confirm destruction, digitize, complete
   "orders.approve", // approve / reject requested orders
   "orders.authorise", // record a client's destruction / digitizing authorisation
+  "billing.view", // see invoices and the Sage settings
+  "billing.manage", // prepare invoices, send them to Sage, change the Sage settings
 ];
 
 const ROLE_PERMISSIONS = {
@@ -22,8 +24,8 @@ const ROLE_PERMISSIONS = {
   operations_manager: ["audit.read", "boxes.operate", "orders.operate", "orders.approve", "orders.authorise"],
   staff_operator: ["boxes.operate", "orders.operate"],
   records_manager: ["audit.read", "boxes.hold", "orders.authorise"],
-  finance_manager: ["audit.read"],
-  auditor: ["audit.read"],
+  finance_manager: ["audit.read", "billing.view", "billing.manage"],
+  auditor: ["audit.read", "billing.view"],
 };
 
 // Roles an admin may hand out. staff_admin is NOT one of them: it only comes from DocuSoft's admin flag.
