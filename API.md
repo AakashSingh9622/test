@@ -461,6 +461,101 @@ Suggested lines (for a client and period): boxes in storage, boxes registered in
 the period that isn't on an invoice yet; price = the last price used for that kind of line. `netTotal` = sum of qty x price
 (VAT is worked out by Sage). Sage defaults: `defaultTaxRateId` `GB_NO_TAX` (as Practice) and 30 days unless changed.
 
+## Scanning, returns, exceptions (Sprint 3)
+
+Scanners are keyboard-wedge: they type the barcode and press Enter, so every scan endpoint takes a plain `barcode`
+(the box's **current** barcode — after a re-label the old one no longer scans). A scan that doesn't match is refused
+**and** recorded in the supervisor queue (`/api/exceptions`); scanning the same box twice is harmless.
+
+```text
+POST /api/boxes/receive        { barcode, warehouseId }        -> { box, alreadyReceived }   registered box -> "received" at that Goods-In
+POST /api/boxes/put-away       { boxBarcode, slotBarcode, reason? } -> { box, slot }          onto a shelf (any box with us)
+POST /api/boxes/:id/quarantine { reason }                      -> Box   (boxes.hold) stays put, can't go on any order
+DELETE /api/boxes/:id/quarantine                               -> Box   (boxes.hold) back to stored / received / registered
+POST /api/boxes/:id/relabel    { reason }                      -> Box   new barcode, same box (old label stops scanning)
+
+GET  /api/orders/:id/pick-list                                 -> { order, lines }  walking order: warehouse, rack, row, column
+POST /api/orders/:id/pick      { barcode }                     -> { order, boxNumber, remaining, alreadyPicked }
+POST /api/orders/:id/receive   { barcode, warehouseId? }       -> { order, boxNumber, remaining, alreadyReceived }  (collection)
+POST /api/orders/:id/complete  { warehouseId? }                collection: unscanned returning boxes are received now
+POST /api/orders/:id/hold      { reason }                      -> Order (orders.approve)
+POST /api/orders/:id/resume                                    -> Order (orders.approve) back to heldFromStatus
+
+GET  /api/exceptions?status=open|resolved&orderId=&page=&pageSize= -> { items, total, open }  (orders.approve)
+POST /api/exceptions/:id/resolve { resolution }                -> OperationException          (orders.approve)
+```
+
+Rules:
+
+- **Pick** works on dispatch / destruction orders that are `in_progress` (or `ready`). The last pick makes the order
+  `ready`. Dispatch / destroy then needs **all** boxes picked — or none (the one-click way still works).
+- **Collection returns:** boxes on a collection become `return_pending` when it is created, `received` (at the chosen
+  warehouse's Goods-In) when scanned or when the collection is completed, then `stored` once put away. Cancelling the
+  collection makes them `out` again. (Fixes B7.)
+- **Permanent withdrawal:** `POST /api/orders` with `permanentWithdrawal: true` (dispatch only) — the boxes end as
+  `permanently_withdrawn` and can't come back on a collection.
+- **Slots:** `PATCH /api/slots/:id` takes `status` `blocked` | `quarantined` | `inactive` (locked: no new boxes, the ones
+  inside stay) or `available` / `full` (= active again).
+- New statuses — box: `received`, `return_pending`, `quarantined`, `permanently_withdrawn`; order: `ready`, `on_hold`;
+  slot: `quarantined`, `inactive`. New history events: `goods_in` (staff only), `quarantined`, `quarantine_released`,
+  `relabelled`; movement type `received` (into a warehouse's Goods-In).
+
+## Records: retention, legal holds, destruction, certificates (Sprint 4)
+
+```text
+GET  /api/records/retention-rules?history=true                  -> RetentionRule[]   (any staff; current only unless history)
+POST /api/records/retention-rules { code, name, retentionYears, trigger, notes? } -> new version  (records.manage)
+     trigger: filing_date_to | filing_date_from | registered. Saving an existing code makes version n+1 the current one.
+GET  /api/records/due?before=&clientId=&page=&pageSize=          -> { items: [{ box, destructionDate, basis, heldBy, onHold }], total }  (records.manage)
+GET  /api/records/legal-holds?status=&clientId=&boxId=&page=     -> { items, total }  (any staff)
+GET  /api/records/legal-holds?coversBox=<boxId>                  -> the active holds covering that box (own / client / category)
+POST /api/records/legal-holds { scope: box|client|category, boxId | clientId+clientName | category, authority, reason, startsAt?, endsAt? }  (records.manage)
+POST /api/records/legal-holds/:id/release { note }               (records.manage; note required)
+GET  /api/records/certificates?clientId=&page=                   -> { items, total }  (any staff)
+
+POST /api/orders/:id/approve-destruction                         -> Order  (records.approve; not the person who requested it)
+POST /api/orders/:id/destroy  { witness?, place? }                needs the approval; issues the certificate
+GET  /api/orders/:id/certificate                                 -> DestructionCertificate (404 until destroyed)
+```
+
+- Boxes: `retentionCategory` on register / `PATCH /api/boxes/:id` must be the code of a current rule. The destruction
+  date is the box's own `destroyAfter` if set, otherwise trigger date + years of its category's rule.
+- A legal hold that covers a box blocks putting it on a destruction order **and** destroying it (409 naming the boxes).
+- Destruction = client authorises → records manager approves (`approvedBy` ≠ requester) → operator destroys. The
+  certificate (`COD-000001`, …) is frozen at that moment; the portal copy leaves out staff names.
+
+## Pricing, charges, billing runs, exports (Sprints 5–6)
+
+```text
+GET  /api/billing/rate-cards                                     -> RateCard[]   (billing.view)
+POST /api/billing/rate-cards { clientId?, clientName?, effectiveFrom, rates, taxRateId, notes? }  (billing.manage)
+     rates: { storagePerBoxMonth: { standard, large }, intakePerBox, retrievalPerBox, deliveryPerOrder,
+              collectionPerOrder, destructionPerBox, digitizePerBox }. No clientId = the default card.
+GET  /api/billing/charges?from=&to=&clientId=&status=&billingRunId=&page= -> { items, total, amount }
+POST /api/billing/charges/generate { from, to, clientId? }       -> { created, amount, clientsWithoutRateCard }  (idempotent)
+POST /api/billing/charges { clientId, clientName, description, quantity, unitPrice, taxRateId, date? }  manual charge
+POST /api/billing/charges/:id/void { reason }                    (not while it is in a draft run)
+GET  /api/billing/runs · GET /api/billing/runs/:id               (detail has charges, per-client totals, invoices)
+POST /api/billing/runs { from, to }                              -> draft run (one draft at a time)
+POST /api/billing/runs/:id/approve                               -> one draft invoice per client; charges -> invoiced
+DELETE /api/billing/runs/:id                                     discard a draft; its charges are open again
+
+GET  /api/exports/inventory.csv?clientId=                        any staff
+GET  /api/exports/movements.csv?from=&to=&clientId=              any staff
+GET  /api/exports/audit.csv?from=&to=&clientId=                  audit.read
+GET  /api/exports/charges.csv?from=&to=&clientId=&status=        billing.view
+
+GET  /api/boxes/:id/contents · POST { description, reference?, dateFrom?, dateTo?, docusoftDocumentId? } · DELETE /api/boxes/:id/contents/:contentId
+GET  /api/notifications?page=&pageSize=                          staff in-app updates (new portal requests, client approvals)
+```
+
+- **Storage** is charged by the day: days the box was in our custody in the period (from the movement ledger) / 30 ×
+  the monthly rate for its size. Services: intake per box on its registration day; retrieval/delivery/collection/
+  destruction/digitize from orders completed in the period. Every charge has a unique business key, so generating
+  again never charges twice. A client's own rate card beats the default one.
+- Dispatch takes `{ recipientName, courier?, trackingRef? }`; `POST /api/orders/:id/delivered { receivedBy,
+  proofReference?, deliveredAt? }` records proof of delivery (`order.delivery`).
+
 ## Pagination (all list endpoints)
 
 `GET /api/boxes`, `/api/orders`, `/api/audit`, `/api/clients/:id/boxes` and `/api/clients/:id/orders` are paginated:
@@ -514,6 +609,12 @@ Token lifetime: `PORTAL_TOKEN_TTL_MINUTES` (default 60) — call login again whe
 | `POST /orders` | request an order (always status `requested`, for this client + this contact). Body: `type`, `boxIds`, `address`, `expectedNewBoxes`, `scheduledFor`, `contactPhone`, `notes`; destruction also needs `destructionAuthorisation: { name, method }` |
 | `POST /orders/:id/cancel` | only while `requested` |
 | `POST /orders/:id/authorise-destruction` | `{ name, method }` for a staff-created destruction order waiting for the client |
+| `POST /orders/:id/client-approve` | main contact only: approve a destruction asked for by another contact (it waits for this before the warehouse can approve). `GET /orders?needsMyApproval=true` lists them; `/summary` has `orders.needsMyApproval` |
+| `GET /orders/:id/certificate` · `GET /certificates` | certificate of destruction (client copy, no staff names) |
+| `GET /notifications?page&pageSize` | in-app updates on this contact's orders (main contact: all of the client's) |
+
+`GET /boxes/:id` also returns `contents` (file-level index). Orders carry `clientApprovalRequired`, `clientApprovedBy/At`
+and `delivery` (courier, tracking, received by, delivered at).
 
 Another client's (or another contact's) data answers **404**, never 403. Lists are paginated (max 100 per page).
 

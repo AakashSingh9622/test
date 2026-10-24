@@ -27,10 +27,14 @@ enum Role {
   client_user
 }
 
+// available / full = an ACTIVE cell (full = no room left). blocked / quarantined / inactive = no new boxes go in;
+// boxes already inside stay there and keep counting in `used`.
 enum SlotStatus {
   available
   full
   blocked
+  quarantined // something is wrong with the location (damage, pests, ...) -- under investigation
+  inactive // not in use (e.g. rack being decommissioned)
 }
 
 enum BoxSize {
@@ -48,6 +52,10 @@ enum BoxStatus {
   destroyed
   missing
   digitized // scanned/digitised: still in its slot, flagged (see Box.digitizedAt)
+  received // at the warehouse's Goods-In (Box.goodsInWarehouseId), not on a shelf yet
+  return_pending // with the client, on an open collection order that brings it back
+  quarantined // damaged / under investigation: stays where it is, can't go on any order (Box.quarantineReason)
+  permanently_withdrawn // given back to the client for good (dispatch order with permanentWithdrawal)
 }
 
 enum OrderType {
@@ -62,6 +70,8 @@ enum OrderStatus {
   approved
   scheduled
   in_progress
+  ready // every box picked -- waiting to be dispatched / destroyed
+  on_hold // paused by a supervisor; resume goes back to Order.heldFromStatus
   completed
   cancelled
   rejected
@@ -104,6 +114,14 @@ enum AuditEventType {
   hold_placed
   hold_released
   status_changed
+  quarantined
+  quarantine_released
+  relabelled
+  goods_in // a newly registered box arrived at a warehouse's Goods-In (staff only; a box back from the client is "received")
+  legal_hold_placed
+  legal_hold_released
+  destruction_approved // the second person signed off a destruction order
+  contents_changed
 }
 
 // Small key/value settings kept in the DATABASE (so they can be changed without touching the code).
@@ -159,6 +177,15 @@ enum AdminAction {
   invoice_created
   invoice_deleted
   invoice_issued
+  retention_rule_saved
+  legal_hold_placed
+  legal_hold_released
+  rate_card_saved
+  charge_voided
+  charge_added
+  billing_run_created
+  billing_run_approved
+  billing_run_discarded
 }
 
 // Append-only history of admin / configuration changes (roles, warehouse layout, settings) -- audit_event sirf
@@ -252,6 +279,10 @@ model Box {
   missingReason  String? // why it was marked missing (status = missing)
   missingAt      DateTime?
   digitizedAt    DateTime? // set when a digitize order completes; keeps the box "digitized" again after a later order is cancelled
+  goodsInWarehouseId String? // status "received": which warehouse's Goods-In it is waiting in
+  quarantineReason String? // status "quarantined": why
+  quarantinedAt  DateTime?
+  retentionCategory String? // RetentionRule.code -- how long the box must be kept (spec §4.4)
   labelPrinted   Boolean   @default(false)
   slotId         String?
   slot           Slot?     @relation(fields: [slotId], references: [id], onDelete: SetNull)
@@ -265,6 +296,7 @@ model Box {
   orderLines  OrderLine[]
   auditEvents AuditEvent[]
   movements   Movement[]
+  contents    BoxContent[]
 
   // Portal lists a client's boxes (optionally by status), newest first -> composites cover filter + sort.
   @@index([clientId, status])
@@ -309,6 +341,15 @@ model Order {
   destruction    Json? // { method, authorisedBy, authorisedAt, witness? }
   digitization   Json? // { name, note?, authorisedBy, authorisedAt } -- the client's sign-off for a digitize order
   collectionInfo Json? // { expectedNewBoxes } -- API me "collection" naam se aata hai
+  permanentWithdrawal Boolean @default(false) // dispatch only: the boxes go back to the client for good
+  heldFromStatus OrderStatus? // status "on_hold": the status to go back to on resume
+  holdReason     String?
+  // Destruction asked for by an ordinary client contact waits for the client's main contact (portal) before the
+  // warehouse can approve it.
+  clientApprovalRequired Boolean @default(false)
+  clientApprovedBy String?
+  clientApprovedAt DateTime?
+  delivery       Json? // dispatch: { courier?, trackingRef?, receivedBy?, proofReference?, deliveredAt? }
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
@@ -377,6 +418,7 @@ enum MovementType {
   dispatched // slot -> out with the client
   destroyed // slot -> destroyed
   marked_missing // slot -> unknown
+  received // into a warehouse's Goods-In (no slot yet): a new box arriving, or a box back from the client
 }
 
 // Custody / location ledger (spec §4.1) -- append-only, kabhi update/delete nahi hota. Har physical location change
@@ -431,6 +473,7 @@ model Invoice {
   netTotal      Decimal       @default(0) @db.Decimal(19, 4) // sum of qty x unit price; VAT is worked out by Sage
   sendingSince  DateTime? // when the current "sending" attempt started
   lastError     String? // why the last attempt to create it in Sage failed
+  billingRunId  String? // made by this billing run (Sprint 6); null = prepared by hand
   sageContactId String?
   sageBusinessId String?
   sageInvoiceId String?
@@ -466,6 +509,250 @@ model InvoiceLine {
   @@index([invoiceId])
   @@index([sourceType, sourceId])
   @@map("invoice_line")
+}
+
+enum ExceptionType {
+  box_not_found // a scanned box barcode isn't known
+  slot_not_found // a scanned slot barcode isn't known
+  wrong_box // picked / received a box that isn't on the order
+  slot_unavailable // put-away into a blocked / quarantined / inactive slot
+  slot_full // put-away into a slot without room
+  box_unavailable // the box can't be used for this (quarantined, destroyed, ...)
+}
+
+enum ExceptionStatus {
+  open
+  resolved
+}
+
+// Supervisor queue (spec §6.3): scans that didn't match are recorded here instead of being silently corrected.
+// Written OUTSIDE the failing request's transaction, so the record survives even though the scan was refused.
+model OperationException {
+  id          String          @id @default(uuid())
+  type        ExceptionType
+  status      ExceptionStatus @default(open)
+  message     String
+  orderId     String?
+  orderNumber String?
+  boxId       String?
+  boxBarcode  String? // what was scanned (may not match any box)
+  slotId      String?
+  slotBarcode String?
+  createdBy   Json
+  createdAt   DateTime        @default(now())
+  resolution  String?
+  resolvedBy  Json?
+  resolvedAt  DateTime?
+
+  @@index([status, createdAt])
+  @@index([orderId])
+  @@map("operation_exception")
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Sprint 4 -- retention, legal holds, destruction certificates (spec §4.4)
+
+enum RetentionTrigger {
+  filing_date_to // years after the latest document in the box
+  filing_date_from
+  registered // years after the box was registered with us
+}
+
+// Versioned: changing a rule adds a new version (isCurrent moves); old versions stay for the record.
+model RetentionRule {
+  id             String           @id @default(uuid())
+  code           String // what boxes carry in retentionCategory, e.g. "TAX"
+  name           String
+  retentionYears Int
+  trigger        RetentionTrigger
+  version        Int
+  isCurrent      Boolean          @default(true)
+  notes          String?
+  createdBy      Json
+  createdAt      DateTime         @default(now())
+
+  @@unique([code, version])
+  @@index([code, isCurrent])
+  @@map("retention_rule")
+}
+
+enum LegalHoldScope {
+  box
+  client
+  category
+}
+
+enum LegalHoldStatus {
+  active
+  released
+}
+
+// A legal hold always beats a destruction date: no box it covers can be destroyed while it is active.
+model LegalHold {
+  id          String          @id @default(uuid())
+  scope       LegalHoldScope
+  boxId       String?
+  boxNumber   String?
+  clientId    String?
+  clientName  String?
+  category    String? // retention category code
+  authority   String // who asked for it (court, regulator, client's solicitor, ...)
+  reason      String
+  startsAt    DateTime        @db.Date
+  endsAt      DateTime?       @db.Date
+  status      LegalHoldStatus @default(active)
+  createdBy   Json
+  createdAt   DateTime        @default(now())
+  releasedBy  Json?
+  releasedAt  DateTime?
+  releaseNote String?
+
+  @@index([status, scope])
+  @@index([boxId])
+  @@index([clientId])
+  @@map("legal_hold")
+}
+
+// Issued when a destruction order is completed. Content is frozen at issue and kept for good (audit / compliance proof).
+model DestructionCertificate {
+  id                String   @id @default(uuid())
+  certificateNumber String   @unique // "COD-000001"
+  orderId           String   @unique
+  clientId          String
+  clientName        String
+  content           Json // { orderNumber, boxes[], method, authorisedBy, authorisedAt, approvedBy, approvedAt, destroyedBy, destroyedAt, witness?, place? }
+  issuedBy          Json
+  issuedAt          DateTime @default(now())
+
+  @@index([clientId, issuedAt])
+  @@map("destruction_certificate")
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Sprint 5 -- rate cards, charge events, box contents (spec §7)
+
+// Effective-dated prices. clientId null = the default card for every client without its own.
+model RateCard {
+  id            String    @id @default(uuid())
+  clientId      String?
+  clientName    String?
+  effectiveFrom DateTime  @db.Date
+  effectiveTo   DateTime? @db.Date
+  rates         Json // { storagePerBoxMonth: { standard, large }, intakePerBox, retrievalPerBox, deliveryPerOrder, collectionPerOrder, destructionPerBox, digitizePerBox }
+  taxRateId     String // Sage tax rate id for the charges
+  notes         String?
+  createdBy     Json
+  createdAt     DateTime  @default(now())
+
+  @@index([clientId, effectiveFrom])
+  @@map("rate_card")
+}
+
+enum ChargeType {
+  intake
+  storage
+  retrieval
+  delivery
+  collection
+  destruction
+  digitize
+  other
+}
+
+enum ChargeStatus {
+  open // priced, not on an invoice yet
+  invoiced
+  voided
+}
+
+// One priced, chargeable fact. The unique key makes generating the same period again a no-op (spec §7.2).
+model ChargeEvent {
+  id           String       @id @default(uuid())
+  clientId     String
+  clientName   String
+  chargeType   ChargeType
+  sourceType   String // "order" | "box" | "storage" | "manual"
+  sourceKey    String // order id, box id, "<clientId>:<size>" for storage, uuid for manual
+  periodStart  DateTime     @db.Date
+  periodEnd    DateTime     @db.Date
+  description  String
+  quantity     Decimal      @db.Decimal(19, 4)
+  unitPrice    Decimal      @db.Decimal(19, 4)
+  amount       Decimal      @db.Decimal(19, 4)
+  taxRateId    String
+  rateCardId   String?
+  status       ChargeStatus @default(open)
+  billingRunId String?
+  invoiceId    String?
+  voidReason   String?
+  createdBy    Json
+  createdAt    DateTime     @default(now())
+
+  @@unique([sourceType, sourceKey, chargeType, periodStart, periodEnd])
+  @@index([clientId, periodStart])
+  @@index([status, periodEnd])
+  @@index([billingRunId])
+  @@map("charge_event")
+}
+
+// What is in a box (file-level index), optionally pointing at the DocuSoft document.
+model BoxContent {
+  id                 String    @id @default(uuid())
+  boxId              String
+  box                Box       @relation(fields: [boxId], references: [id], onDelete: Cascade)
+  description        String
+  reference          String?
+  dateFrom           DateTime? @db.Date
+  dateTo             DateTime? @db.Date
+  docusoftDocumentId String?
+  createdBy          Json
+  createdAt          DateTime  @default(now())
+
+  @@index([boxId])
+  @@map("box_content")
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Sprint 6 -- billing runs
+
+enum BillingRunStatus {
+  draft // charges reserved, being reviewed
+  approved // frozen; one invoice per client was made
+}
+
+model BillingRun {
+  id          String           @id @default(uuid())
+  runNumber   String           @unique // "BR-000001"
+  periodStart DateTime         @db.Date
+  periodEnd   DateTime         @db.Date
+  status      BillingRunStatus @default(draft)
+  totals      Json? // { clients: [{ clientId, clientName, charges, amount }], amount } -- frozen on approval
+  createdBy   Json
+  createdAt   DateTime         @default(now())
+  approvedBy  Json?
+  approvedAt  DateTime?
+
+  @@index([createdAt])
+  @@map("billing_run")
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// "Later" -- in-app notifications (email can be added behind the same rows)
+
+model Notification {
+  id           String   @id @default(uuid())
+  audience     String // "client" | "staff"
+  clientId     String? // client audience: whose
+  contactEmail String? // client audience: only this contact (null = the client's main contacts and the order's contact)
+  orderId      String?
+  kind         String // e.g. order_approved, order_dispatched, needs_authorisation, needs_client_approval, certificate_issued
+  title        String
+  body         String?
+  createdAt    DateTime @default(now())
+
+  @@index([audience, clientId, createdAt])
+  @@index([createdAt])
+  @@map("notification")
 }
 
 // Atomic auto-increment (box numbers, per-type order numbers).

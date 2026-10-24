@@ -56,7 +56,7 @@ database only keeps the DocuSoft `clientId` (plus a copy of the name / contact e
 
 ## 3. Database
 
-### 3.1 Tables (16, all in the `public` schema)
+### 3.1 Tables (17, all in the `public` schema)
 
 The Supabase project also contains `auth.*`, `storage.*`, `realtime.*` tables. Those are Supabase internals and are
 **not used** by this application.
@@ -79,6 +79,7 @@ The Supabase project also contains `auth.*`, `storage.*`, `realtime.*` tables. T
 | 14 | `admin_audit_event` | Append-only history of role, layout, settings and invoice changes (things that aren't a box) |
 | 15 | `invoice` | A warehouse invoice for one client: draft → sending → issued, with the Sage invoice id/number/link once created |
 | 16 | `invoice_line` | One line of an invoice (qty, price, Sage VAT id, optional source order) |
+| 17 | `operation_exception` | Supervisor queue: scans that didn't match (unknown barcode, wrong box, full / locked slot), open → resolved |
 
 ### 3.2 Relationship diagram
 
@@ -307,6 +308,23 @@ readable history, this table is the machine-readable one: real ids, so storage t
 
 Indexes: `(boxId, at)`, `(clientId, at)`, `(at)`.
 
+#### Records, billing and notifications (Sprints 4–6)
+New columns: `box.retentionCategory` (code of a current retention rule); `order.clientApprovalRequired`,
+`clientApprovedBy`, `clientApprovedAt` (destruction asked for by an ordinary client contact), `order.delivery` (JSON:
+recipientName, courier, trackingRef, dispatchedAt, receivedBy, proofReference, deliveredAt); `invoice.billingRunId`.
+`order.destruction` (JSON) gains `approvedBy {id, name}` and `approvedAt` — the second signature.
+
+| Table | What | Key points |
+|---|---|---|
+| `retention_rule` | how long a category is kept | `(code, version)` unique; one `isCurrent` per code; `trigger` = filing_date_to / filing_date_from / registered |
+| `legal_hold` | hold on a box, a client or a category | `status` active/released; `startsAt`/`endsAt`; release note required |
+| `destruction_certificate` | frozen certificate | `certificateNumber` unique (`COD-000001`, counter `certificateSeq`); `orderId` unique; `content` JSON snapshot |
+| `box_content` | file-level index of a box | FK → box; optional `docusoftDocumentId` |
+| `rate_card` | prices, dated | `clientId` null = default card; `rates` JSON; `effectiveFrom`/`effectiveTo`; `taxRateId` |
+| `charge_event` | one chargeable fact | unique `(sourceType, sourceKey, chargeType, periodStart, periodEnd)` — re-running never charges twice; `status` open/invoiced/voided |
+| `billing_run` | a period's charges → invoices | `runNumber` (`BR-000001`); `status` draft/approved; `totals` JSON frozen on approval |
+| `notification` | in-app updates | `audience` client/staff; client rows carry `clientId` + `contactEmail` (null = the client's main contacts) |
+
 #### `box_size_config` — box lengths (settings)
 | Column | Type | Key | Notes |
 |---|---|---|---|
@@ -351,6 +369,7 @@ concurrent requests never receive the same number.
 | `RequestedVia` | `staff`, `portal` |
 | `Role` (staff, added) | `warehouse_admin`, `operations_manager`, `records_manager`, `finance_manager`, `auditor` (see API.md → roles) |
 | `AdminAction` | `role_assigned`, `role_removed`, `warehouse_created`, `rack_created`, `rack_updated`, `slot_updated`, `box_sizes_updated`, `sage_settings_updated`, `invoice_created`, `invoice_deleted`, `invoice_issued` |
+| Sprint 3 additions | `SlotStatus` + `quarantined`, `inactive` · `BoxStatus` + `received`, `return_pending`, `quarantined`, `permanently_withdrawn` · `OrderStatus` + `ready`, `on_hold` · `AuditEventType` + `quarantined`, `quarantine_released`, `relabelled`, `goods_in` · `MovementType` + `received` · new columns `box.goodsInWarehouseId`, `box.quarantineReason`, `box.quarantinedAt`, `order.permanentWithdrawal`, `order.heldFromStatus`, `order.holdReason` |
 | `InvoiceStatus` | `draft` · `sending` (a browser is creating it in Sage; lock expires after 2 min) · `issued` (in Sage, frozen) |
 | `MovementType` | `put_away` (into a slot from nowhere: new box, or back from the client) · `transfer` (slot → slot) · `found` (missing box placed again) · `dispatched` · `destroyed` · `marked_missing` |
 | `OrderLineStatus` | `pending`, `picked`, `dispatched`, `received`, `destroyed`, `digitized`, `missing`, `removed` |

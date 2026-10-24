@@ -2,6 +2,7 @@
 const orderService = require("../services/orderService");
 const { actorFromReq } = require("../utils/actor");
 const { can } = require("../auth/permissions");
+const certificates = require("../services/certificateService");
 
 function parseStatusArray(q) {
   if (!q.status) return undefined;
@@ -76,7 +77,8 @@ async function cancelOrder(req, res) {
 async function dispatchOrder(req, res) {
   const { recipientName } = req.body || {};
   if (!recipientName) return res.status(400).json({ message: "recipientName is required" });
-  res.json(await orderService.dispatchOrder(req.params.orderId, recipientName, actorFromReq(req)));
+  const { courier, trackingRef } = req.body;
+  res.json(await orderService.dispatchOrder(req.params.orderId, recipientName, actorFromReq(req), { courier, trackingRef }));
 }
 
 async function authoriseDestruction(req, res) {
@@ -97,11 +99,44 @@ async function digitizeOrder(req, res) {
 
 async function destroyOrder(req, res) {
   const { witness } = req.body || {};
-  res.json(await orderService.destroyOrder(req.params.orderId, witness, actorFromReq(req)));
+  res.json(await orderService.destroyOrder(req.params.orderId, witness, actorFromReq(req), { place: (req.body || {}).place }));
 }
 
 async function completeOrder(req, res) {
-  res.json(await orderService.completeOrder(req.params.orderId));
+  res.json(await orderService.completeOrder(req.params.orderId, actorFromReq(req), { warehouseId: (req.body || {}).warehouseId }));
+}
+
+async function approveDestruction(req, res) {
+  res.json(await orderService.approveDestruction(req.params.orderId, actorFromReq(req)));
+}
+
+async function recordDelivery(req, res) {
+  res.json(await orderService.recordDelivery(req.params.orderId, req.body || {}, actorFromReq(req)));
+}
+
+async function getCertificate(req, res) {
+  res.json(await certificates.getForOrder(req.params.orderId));
+}
+
+async function holdOrder(req, res) {
+  res.json(await orderService.holdOrder(req.params.orderId, (req.body || {}).reason, actorFromReq(req)));
+}
+
+async function resumeOrder(req, res) {
+  res.json(await orderService.resumeOrder(req.params.orderId));
+}
+
+async function getPickList(req, res) {
+  res.json(await orderService.getPickList(req.params.orderId));
+}
+
+async function pickBox(req, res) {
+  res.json(await orderService.pickBox(req.params.orderId, (req.body || {}).barcode, actorFromReq(req)));
+}
+
+async function receiveReturnBox(req, res) {
+  const { barcode, warehouseId } = req.body || {};
+  res.json(await orderService.receiveReturnBox(req.params.orderId, barcode, warehouseId, actorFromReq(req)));
 }
 
 module.exports = {
@@ -120,4 +155,12 @@ module.exports = {
   authoriseDigitization,
   digitizeOrder,
   completeOrder,
+  holdOrder,
+  resumeOrder,
+  approveDestruction,
+  recordDelivery,
+  getCertificate,
+  getPickList,
+  pickBox,
+  receiveReturnBox,
 };

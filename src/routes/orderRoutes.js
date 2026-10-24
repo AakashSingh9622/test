@@ -16,6 +16,14 @@ const {
   authoriseDigitization,
   digitizeOrder,
   completeOrder,
+  holdOrder,
+  resumeOrder,
+  approveDestruction,
+  recordDelivery,
+  getCertificate,
+  getPickList,
+  pickBox,
+  receiveReturnBox,
 } = require("../controllers/orderController");
 const { requireAuth } = require("../middleware/authMiddleware");
 const { requirePermission } = require("../middleware/requirePermission");
@@ -45,5 +53,17 @@ router.post("/:orderId/destroy", operate, asyncHandler(destroyOrder));
 router.post("/:orderId/authorise-digitization", authorise, asyncHandler(authoriseDigitization));
 router.post("/:orderId/digitize", operate, asyncHandler(digitizeOrder));
 router.post("/:orderId/complete", operate, asyncHandler(completeOrder));
+// Scanning: the pick list in walking order, one pick scan / one receive scan at a time.
+router.get("/:orderId/pick-list", asyncHandler(getPickList));
+router.post("/:orderId/pick", operate, asyncHandler(pickBox));
+router.post("/:orderId/receive", operate, asyncHandler(receiveReturnBox));
+// Supervisor pause / resume.
+router.post("/:orderId/hold", approve, asyncHandler(holdOrder));
+// Destruction: second signature by a records manager who didn't prepare it; certificate once destroyed.
+router.post("/:orderId/approve-destruction", requirePermission("records.approve"), asyncHandler(approveDestruction));
+router.get("/:orderId/certificate", asyncHandler(getCertificate));
+// Proof of delivery for a dispatched order.
+router.post("/:orderId/delivered", operate, asyncHandler(recordDelivery));
+router.post("/:orderId/resume", approve, asyncHandler(resumeOrder));
 
 module.exports = router;

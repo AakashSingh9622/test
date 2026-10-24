@@ -43,7 +43,7 @@ async function main() {
       UPDATE "slot"
       SET "used" = ${r.actualUsed}::int,
           "status" = CASE
-            WHEN "status" = 'blocked'::"SlotStatus" THEN "status"
+            WHEN "status"::text IN ('blocked', 'quarantined', 'inactive') THEN "status"
             WHEN ${r.actualUsed}::int >= "capacity" THEN 'full'::"SlotStatus"
             ELSE 'available'::"SlotStatus" END,
           "updatedAt" = NOW()

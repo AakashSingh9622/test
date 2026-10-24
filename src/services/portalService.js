@@ -14,10 +14,16 @@ const { parsePagination } = require("../utils/pagination");
 const { toDate } = require("../utils/serialize");
 const { portalBox, portalOrder, portalOrderLine, portalAuditEvent } = require("../utils/portalSerialize");
 const httpError = require("../utils/httpError");
+const certificates = require("./certificateService");
+const notifications = require("./notificationService");
+const { listContents } = require("./boxContentService");
 
-const OPEN_ORDER_STATUSES = ["requested", "approved", "scheduled", "in_progress"];
-const BOX_STATUSES = ["unallocated", "stored", "reserved", "picked", "out", "pending_destruction", "destroyed", "missing", "digitized"];
-const ORDER_STATUSES = ["requested", "approved", "scheduled", "in_progress", "completed", "cancelled", "rejected"];
+const OPEN_ORDER_STATUSES = ["requested", "approved", "scheduled", "in_progress", "ready", "on_hold"];
+const BOX_STATUSES = [
+  "unallocated", "stored", "reserved", "picked", "out", "pending_destruction", "destroyed", "missing", "digitized",
+  "received", "return_pending", "quarantined", "permanently_withdrawn",
+];
+const ORDER_STATUSES = ["requested", "approved", "scheduled", "in_progress", "ready", "on_hold", "completed", "cancelled", "rejected"];
 const ORDER_TYPES = ["collection", "dispatch", "destruction", "digitize"];
 const MAX_BOXES_PER_ORDER = 500;
 const DESTRUCTION_METHODS = ["shred", "pulp", "incinerate"];
@@ -67,8 +73,11 @@ async function summary(ctx) {
       total: Object.values(byStatus).reduce((a, b) => a + b, 0),
       byStatus,
       // Plain-language groups for the dashboard cards.
-      inStorage: byStatus.stored + byStatus.reserved + byStatus.picked + byStatus.unallocated + byStatus.digitized,
-      outWithYou: byStatus.out,
+      inStorage:
+        byStatus.stored + byStatus.reserved + byStatus.picked + byStatus.unallocated + byStatus.digitized +
+        byStatus.received + byStatus.quarantined,
+      outWithYou: byStatus.out + byStatus.return_pending, // still with the client until we receive it back
+      permanentlyWithdrawn: byStatus.permanently_withdrawn,
       pendingDestruction: byStatus.pending_destruction,
       destroyed: byStatus.destroyed,
     },
@@ -76,6 +85,9 @@ async function summary(ctx) {
       open: OPEN_ORDER_STATUSES.reduce((sum, s) => sum + orderByStatus[s], 0),
       byStatus: orderByStatus,
       needsAuthorisation, // destruction / digitize orders waiting for the client's authorisation
+      needsMyApproval: ctx.isMainContact
+        ? await prisma.order.count({ where: { clientId: ctx.clientId, clientApprovalRequired: true, clientApprovedAt: null, status: "requested" } })
+        : 0,
     },
     warehouses,
     recentOrders: recent.map(portalOrder),
@@ -123,7 +135,14 @@ async function findOwnBox(ctx, boxId) {
 async function getBox(ctx, boxId) {
   const box = await findOwnBox(ctx, boxId);
   const visible = await visibleOrderIds(ctx, [box.openOrderId]);
-  return portalBox(box, { showOrder: visible.has(box.openOrderId) });
+  const contents = (await listContents(box.id)).map(({ description, reference, dateFrom, dateTo, docusoftDocumentId }) => ({
+    description,
+    reference,
+    dateFrom,
+    dateTo,
+    docusoftDocumentId,
+  }));
+  return { ...portalBox(box, { showOrder: visible.has(box.openOrderId) }), contents };
 }
 
 // Client-facing history: sirf visibleToClient events, bina staff ke naam / rack / slot ke. Normal contact ko doosre
@@ -155,6 +174,11 @@ async function listOrders(ctx, q = {}) {
     Object.assign(where, WAITING_FOR_AUTHORISATION);
     delete where.type;
     where.status = { in: OPEN_ORDER_STATUSES };
+  }
+  // "Needs your approval" (main contact): destruction requests from the client's other contacts.
+  if (q.needsMyApproval === "true") {
+    if (!ctx.isMainContact) return { items: [], total: 0 };
+    Object.assign(where, { clientApprovalRequired: true, clientApprovedAt: null, status: "requested" });
   }
   const { skip, take } = parsePagination(q);
   const [items, total] = await Promise.all([
@@ -252,6 +276,8 @@ async function createOrder(ctx, body = {}) {
         scheduledFor: scheduledFor ? scheduledFor.toISOString().slice(0, 10) : undefined,
         notes: clean(body.notes, 2000) || undefined,
         requestedVia: "portal",
+        // decided 24 Oct: destruction asked for by an ordinary contact needs the main contact's approval first
+        clientApprovalRequired: type === "destruction" && !ctx.isMainContact,
         destructionAuthorisation,
         digitizationAuthorisation,
       },
@@ -295,7 +321,37 @@ async function authoriseDigitization(ctx, orderId, body = {}) {
   );
 }
 
+// Main contact approves a destruction one of their contacts asked for (then the warehouse can approve it).
+async function clientApprove(ctx, orderId) {
+  if (!ctx.isMainContact) throw httpError(403, "Only the client's main contact can approve this");
+  const order = await findOwnOrder(ctx, orderId);
+  return portalOrder(await orderService.clientApproveOrder(order.id, ctx));
+}
+
+async function orderCertificate(ctx, orderId) {
+  const order = await findOwnOrder(ctx, orderId);
+  return certificates.getForOrder(order.id, { forClient: true });
+}
+
+// A normal contact sees the certificates of its own orders; a main contact sees all of the client's.
+async function listCertificates(ctx, q = {}) {
+  if (ctx.isMainContact) return certificates.listCertificates({ clientId: ctx.clientId, page: q.page, pageSize: q.pageSize }, { forClient: true });
+  const own = await prisma.order.findMany({ where: { ...ownOrders(ctx), type: "destruction" }, select: { id: true } });
+  const ids = new Set(own.map((o) => o.id));
+  const all = await certificates.listCertificates({ clientId: ctx.clientId, page: 1, pageSize: 100 }, { forClient: true });
+  const items = all.items.filter((c) => ids.has(c.orderId));
+  return { items, total: items.length };
+}
+
+async function listNotifications(ctx, q = {}) {
+  return notifications.listForClient(ctx, q);
+}
+
 module.exports = {
+  clientApprove,
+  orderCertificate,
+  listCertificates,
+  listNotifications,
   summary,
   listBoxes,
   getBox,

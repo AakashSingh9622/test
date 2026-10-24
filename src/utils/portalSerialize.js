@@ -59,6 +59,13 @@ function portalOrder(o) {
       ? { name: dg.name, note: dg.note, authorisedBy: dg.authorisedBy, authorisedAt: dateOnly(new Date(dg.authorisedAt)) }
       : undefined,
     collection: collection ? { expectedNewBoxes: collection.expectedNewBoxes } : undefined,
+    permanentWithdrawal: o.permanentWithdrawal || undefined,
+    clientApprovalRequired: o.clientApprovalRequired || undefined,
+    clientApprovedBy: o.clientApprovedBy,
+    clientApprovedAt: o.clientApprovedAt instanceof Date ? o.clientApprovedAt.toISOString() : o.clientApprovedAt,
+    delivery: o.delivery
+      ? { courier: o.delivery.courier, trackingRef: o.delivery.trackingRef, receivedBy: o.delivery.receivedBy, deliveredAt: o.delivery.deliveredAt }
+      : undefined,
     createdAt: dateOnly(o.createdAt),
   });
 }
