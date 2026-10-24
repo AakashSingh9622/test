@@ -8,6 +8,8 @@ const prisma = require("../config/prisma");
 const { getAgreementList } = require("./docusoftClient");
 const { encodeSession } = require("../auth/sessionToken");
 const { getDefaultDatabase, sameAgreement } = require("./appSettingService");
+const { localRolesFor, forgetRoles } = require("./roleService");
+const { effectiveRoles } = require("../auth/permissions");
 
 // Login fail hone ki har wajah ke liye ek clear HTTP status + code -- controller isi se response banata hai.
 class AuthError extends Error {
@@ -58,12 +60,11 @@ async function loginWithDocusoft({ email, password }) {
     throw new AuthError("AGREEMENT_NOT_ALLOWED", 403, "Your account does not have access to this system.");
   }
 
-  // Credentials sahi hain (Table non-empty) -- ab role decide karo: agar kisi bhi row me
-  // strIsAdmin true hai to staff_admin, warna staff_operator (dono login kar sakte hain,
-  // bas permissions alag hongi -- jaise sirf staff_admin naya warehouse add kar sakta hai).
+  // Credentials sahi hain (Table non-empty) -- ab roles: DocuSoft se sirf admin flag aata hai (kisi bhi row me
+  // strIsAdmin true -> staff_admin); baaki roles humare user_role table se. Dono na hon to staff_operator.
   const adminRow = rows.find((row) => row.strIsAdmin === true || row.strIsAdmin === "true");
   const primaryRow = adminRow || rows[0];
-  const role = adminRow ? "staff_admin" : "staff_operator";
+  const roles = effectiveRoles(!!adminRow, await localRolesFor(normEmail));
 
   // WHUser me is login ka latest snapshot cache karo (DocuSoft ko dobara call karne se bachne ke liye).
   const profile = {
@@ -71,7 +72,7 @@ async function loginWithDocusoft({ email, password }) {
     docusoftUserId: Number(primaryRow.intUserId) || 0,
     agreementNo: String(primaryRow.vAgreementNo || "").trim(),
     isAdmin: !!adminRow,
-    role,
+    role: roles[0],
     lastLoginAt: new Date(),
   };
   const whUser = await prisma.wHUser.upsert({
@@ -79,6 +80,7 @@ async function loginWithDocusoft({ email, password }) {
     create: { email: normEmail, ...profile },
     update: profile,
   });
+  forgetRoles(normEmail); // admin flag may have changed in DocuSoft
 
   // Frontend ke AuthUser shape (src/auth/useAuth.tsx) -- side hamesha "staff" (sirf admin login abhi).
   const authUser = {
@@ -86,7 +88,7 @@ async function loginWithDocusoft({ email, password }) {
     name: whUser.name,
     email: whUser.email,
     side: "staff",
-    roles: [whUser.role],
+    roles,
   };
 
   // Session claims frontend ke SessionClaims (session-shared.ts) shape me -- clientId admin ke liye nahi hota.
@@ -123,7 +125,7 @@ async function getUserFromClaims(claims) {
     name: whUser.name,
     email: whUser.email,
     side: "staff",
-    roles: [whUser.role],
+    roles: effectiveRoles(whUser.isAdmin, await localRolesFor(whUser.email)), // fresh: a role change shows without re-login
   };
 }
 

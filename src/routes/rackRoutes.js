@@ -1,6 +1,6 @@
 const express = require("express");
 const { requireAuth } = require("../middleware/authMiddleware");
-const { requireRole } = require("../middleware/requireRole");
+const { requirePermission } = require("../middleware/requirePermission");
 const { getRack, patchRack, getRackRows, listSlots } = require("../controllers/locationController");
 const asyncHandler = require("../utils/asyncHandler");
 
@@ -12,7 +12,7 @@ router.use(requireAuth);
 router.get("/:rackId", asyncHandler(getRack));
 router.get("/:rackId/slots", asyncHandler(listSlots));
 router.get("/:rackId/rows", asyncHandler(getRackRows));
-// Rack ki cell length badalna -- staff_admin-only (warehouse layout change).
-router.patch("/:rackId", requireAuth, requireRole("staff_admin"), asyncHandler(patchRack));
+// Rack ki cell length badalna -- warehouse layout change.
+router.patch("/:rackId", requirePermission("layout.manage"), asyncHandler(patchRack));
 
 module.exports = router;

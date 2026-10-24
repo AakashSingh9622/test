@@ -1,6 +1,7 @@
 // HTTP layer for Warehouse/Rack/Slot -- response shapes match frontend ke
 // frontend/src/mocks/handlers/locations.ts exactly.
 const locationService = require("../services/locationService");
+const { actorFromReq } = require("../utils/actor");
 
 async function listWarehouses(_req, res) {
   res.json(await locationService.listWarehouses());
@@ -11,7 +12,7 @@ async function createWarehouse(req, res) {
   if (!code || !name) {
     return res.status(400).json({ message: "code and name are required" });
   }
-  const warehouse = await locationService.createWarehouse({ code, name, address });
+  const warehouse = await locationService.createWarehouse({ code, name, address }, actorFromReq(req));
   res.status(201).json(warehouse);
 }
 
@@ -46,7 +47,7 @@ async function createRack(req, res) {
     columns: Number(columns),
     cellLength: Number(cellLength),
     lengthUnit: lengthUnit || "cm",
-  });
+  }, actorFromReq(req));
   res.status(201).json(rack);
 }
 
@@ -67,7 +68,7 @@ async function patchRack(req, res) {
   const rack = await locationService.updateRack(req.params.rackId, {
     cellLength: Number(cellLength),
     lengthUnit: lengthUnit || "cm",
-  });
+  }, actorFromReq(req));
   if (!rack) return res.status(404).json({ message: "Rack not found" });
   res.json(rack);
 }
@@ -82,7 +83,7 @@ async function listSlots(req, res) {
 
 async function patchSlot(req, res) {
   // 404 / 400 / 409 service se aate hain (errorMiddleware); pehle har error "Slot not found" ban jaata tha.
-  res.json(await locationService.updateSlot(req.params.slotId, req.body || {}));
+  res.json(await locationService.updateSlot(req.params.slotId, req.body || {}, actorFromReq(req)));
 }
 
 module.exports = {

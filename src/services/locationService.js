@@ -5,6 +5,7 @@ const prisma = require("../config/prisma");
 const { serializeSimple } = require("../utils/serialize");
 const { toCentimetres } = require("../utils/dimensions");
 const httpError = require("../utils/httpError");
+const { appendAdminEvent } = require("./adminAuditService");
 
 const SUM_FIELDS = { _count: { _all: true }, _sum: { used: true, capacity: true } };
 
@@ -37,8 +38,8 @@ async function listWarehouses() {
   return Promise.all(warehouses.map(async (w) => withCapacity(w, await capacityForWarehouse(w.id))));
 }
 
-// Naya warehouse banata hai -- staff_admin-only (route me requireRole se gate hota hai).
-async function createWarehouse({ code, name, address }) {
+// Naya warehouse banata hai -- layout.manage (route me requirePermission se gate hota hai).
+async function createWarehouse({ code, name, address }, actor) {
   const trimmedCode = code.trim();
   const existing = await prisma.warehouse.findUnique({ where: { code: trimmedCode } });
   if (existing) {
@@ -57,7 +58,16 @@ async function createWarehouse({ code, name, address }) {
     err.status = 409;
     throw err;
   }
-  const warehouse = await prisma.warehouse.create({ data: { code: trimmedCode, name: cleanName, address } });
+  const warehouse = await prisma.$transaction(async (tx) => {
+    const created = await tx.warehouse.create({ data: { code: trimmedCode, name: cleanName, address } });
+    await appendAdminEvent(
+      "warehouse_created",
+      actor,
+      { entityType: "warehouse", entityId: created.id, summary: `Created warehouse ${trimmedCode} — ${cleanName}` },
+      tx
+    );
+    return created;
+  });
   return withCapacity(warehouse, { rackCount: 0, slotCount: 0, usedCapacity: 0, totalCapacity: 0 });
 }
 
@@ -71,7 +81,7 @@ async function getWarehouseById(id) {
 // Har cell (row x column) khud ek storage location (slot) hai, uske andar koi sub-slot nahi. User har
 // cell ki length cm ya feet me deta hai (cellLength + lengthUnit); DB me whole centimetres store hote hain
 // aur wahi us cell ki capacity hai. Seed script (src/scripts/seed.js) jaisa hi slot code/barcode convention.
-async function createRack(warehouseId, { code, label, rows, columns, cellLength, lengthUnit }) {
+async function createRack(warehouseId, { code, label, rows, columns, cellLength, lengthUnit }, actor) {
   const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId } });
   if (!warehouse) throw new Error(`Warehouse ${warehouseId} not found`);
 
@@ -107,6 +117,16 @@ async function createRack(warehouseId, { code, label, rows, columns, cellLength,
       }
     }
     await tx.slot.createMany({ data: slots });
+    await appendAdminEvent(
+      "rack_created",
+      actor,
+      {
+        entityType: "rack",
+        entityId: created.id,
+        summary: `Added rack ${trimmedCode} to ${warehouse.code}: ${rows} × ${columns} cells of ${cellLengthCm} cm`,
+      },
+      tx
+    );
     return created;
   });
 
@@ -117,7 +137,7 @@ async function createRack(warehouseId, { code, label, rows, columns, cellLength,
 // (har cell ek hi length ka hai). Agar kisi cell me already utna saaman hai jo nayi length me nahi
 // aayega to 409 -- pehle wo boxes hatao. Status (available/full) used/capacity se recompute hota hai,
 // blocked cells blocked hi rehte hain.
-async function updateRack(rackId, { cellLength, lengthUnit }) {
+async function updateRack(rackId, { cellLength, lengthUnit }, actor) {
   const rack = await prisma.rack.findUnique({ where: { id: rackId } });
   if (!rack) return null;
   const cellLengthCm = toCentimetres(cellLength, lengthUnit);
@@ -134,6 +154,19 @@ async function updateRack(rackId, { cellLength, lengthUnit }) {
     // "full" sirf wahi jo ab poora bhar gaya hai; baaki (blocked chhodkar) available.
     await tx.slot.updateMany({ where: { rackId, status: "full", used: { lt: cellLengthCm } }, data: { status: "available" } });
     await tx.slot.updateMany({ where: { rackId, status: "available", used: cellLengthCm } , data: { status: "full" } });
+    if (rack.cellLengthCm !== cellLengthCm) {
+      await appendAdminEvent(
+        "rack_updated",
+        actor,
+        {
+          entityType: "rack",
+          entityId: rackId,
+          summary: `Changed cell length of rack ${rack.code} from ${rack.cellLengthCm} cm to ${cellLengthCm} cm`,
+          changes: [{ field: "cellLengthCm", from: rack.cellLengthCm, to: cellLengthCm }],
+        },
+        tx
+      );
+    }
   });
 
   return getRackById(rackId);
@@ -181,7 +214,7 @@ const SLOT_STATUS_INPUT = ["blocked", "available", "full"];
 // Block = naye boxes nahi aayenge; jo boxes andar hain wo wahin rehte hain, isliye `used` KABHI nahi chhuta (pehle
 // zero ho jaata tha aur slot khaali dikhta tha). Capacity jo andar rakha hai usse kam nahi ho sakti. Check + update
 // ek hi SQL statement me, taaki beech me koi box allocate ho jaye to bhi slot over-full na bane.
-async function updateSlot(slotId, patch) {
+async function updateSlot(slotId, patch, actor) {
   const slot = await prisma.slot.findUnique({ where: { id: slotId } });
   if (!slot) throw httpError(404, "Slot not found");
   if (patch.status !== undefined && !SLOT_STATUS_INPUT.includes(patch.status)) {
@@ -206,7 +239,24 @@ async function updateSlot(slotId, patch) {
     const current = await prisma.slot.findUnique({ where: { id: slotId } });
     throw httpError(409, `Slot ${slot.code} already holds ${current?.used ?? slot.used} cm, which is more than ${capacity} cm -- move boxes out first`);
   }
-  return serializeSimple(await prisma.slot.findUnique({ where: { id: slotId } }));
+  const updated = await prisma.slot.findUnique({ where: { id: slotId } });
+
+  // History me sirf asli badlav (block/unblock, capacity) -- available <-> full apne aap hota hai, wo nahi.
+  const wasBlocked = slot.status === "blocked";
+  const changes = [];
+  const said = [];
+  if (wasBlocked !== blocked) {
+    changes.push({ field: "blocked", from: wasBlocked, to: blocked });
+    said.push(blocked ? "blocked it" : "unblocked it");
+  }
+  if (slot.capacity !== updated.capacity) {
+    changes.push({ field: "capacity", from: slot.capacity, to: updated.capacity });
+    said.push(`changed capacity from ${slot.capacity} cm to ${updated.capacity} cm`);
+  }
+  if (changes.length) {
+    await appendAdminEvent("slot_updated", actor, { entityType: "slot", entityId: slotId, summary: `Slot ${slot.barcode}: ${said.join(", ")}`, changes });
+  }
+  return serializeSimple(updated);
 }
 
 module.exports = {

@@ -18,25 +18,32 @@ const {
   completeOrder,
 } = require("../controllers/orderController");
 const { requireAuth } = require("../middleware/authMiddleware");
+const { requirePermission } = require("../middleware/requirePermission");
 const asyncHandler = require("../utils/asyncHandler");
 
 const router = express.Router();
 router.use(requireAuth);
 
+// Padhna: koi bhi staff. Badalna: src/auth/permissions.js ke hisaab se.
+const operate = requirePermission("orders.operate");
+const approve = requirePermission("orders.approve");
+const authorise = requirePermission("orders.authorise");
+
 router.get("/", asyncHandler(listOrders));
-router.post("/", asyncHandler(createOrder));
+// (create me client ki authorisation bhi saath aaye to controller orders.authorise alag se check karta hai)
+router.post("/", operate, asyncHandler(createOrder));
 router.get("/:orderId", asyncHandler(getOrder));
 router.get("/:orderId/lines", asyncHandler(getOrderLines));
-router.post("/:orderId/approve", asyncHandler(approveOrder));
-router.post("/:orderId/reject", asyncHandler(rejectOrder));
-router.post("/:orderId/schedule", asyncHandler(scheduleOrder));
-router.post("/:orderId/start", asyncHandler(startOrder));
-router.post("/:orderId/cancel", asyncHandler(cancelOrder));
-router.post("/:orderId/dispatch", asyncHandler(dispatchOrder));
-router.post("/:orderId/authorise-destruction", asyncHandler(authoriseDestruction));
-router.post("/:orderId/destroy", asyncHandler(destroyOrder));
-router.post("/:orderId/authorise-digitization", asyncHandler(authoriseDigitization));
-router.post("/:orderId/digitize", asyncHandler(digitizeOrder));
-router.post("/:orderId/complete", asyncHandler(completeOrder));
+router.post("/:orderId/approve", approve, asyncHandler(approveOrder));
+router.post("/:orderId/reject", approve, asyncHandler(rejectOrder));
+router.post("/:orderId/schedule", operate, asyncHandler(scheduleOrder));
+router.post("/:orderId/start", operate, asyncHandler(startOrder));
+router.post("/:orderId/cancel", operate, asyncHandler(cancelOrder));
+router.post("/:orderId/dispatch", operate, asyncHandler(dispatchOrder));
+router.post("/:orderId/authorise-destruction", authorise, asyncHandler(authoriseDestruction));
+router.post("/:orderId/destroy", operate, asyncHandler(destroyOrder));
+router.post("/:orderId/authorise-digitization", authorise, asyncHandler(authoriseDigitization));
+router.post("/:orderId/digitize", operate, asyncHandler(digitizeOrder));
+router.post("/:orderId/complete", operate, asyncHandler(completeOrder));
 
 module.exports = router;
