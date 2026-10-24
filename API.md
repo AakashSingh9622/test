@@ -104,8 +104,16 @@ interface Slot { id: string; rackId: string; warehouseId: string; code: string; 
 ```
 
 `usedCapacity`/`totalCapacity`/`rackCount`/`slotCount` are always computed live — you never set
-them directly. `Slot.status` is also mostly computed (`used >= capacity` → `"full"`); the only
-thing you can set directly via `PATCH` is `"blocked"` (which also zeroes `used`).
+them directly. `Slot.used` is never set through the API either: it is the total length of the boxes in the cell.
+
+`PATCH /api/slots/:id` rules:
+
+- `status: "blocked"` stops new boxes going in. Boxes already in the cell **stay there and keep counting** in `used`.
+- `status: "available"` or `"full"` both mean *unblock*; the real status is then worked out from `used` and
+  `capacity` (`used >= capacity` → `"full"`). Any other value → `400`.
+- `capacity` must be a positive whole number of cm and can't go below `used` → otherwise `409`
+  (`Slot 1-2 already holds 40 cm, which is more than 30 cm -- move boxes out first`).
+- Unknown slot → `404`.
 
 **Duplicate codes are rejected**: a warehouse `code`, and a rack `code` within the same warehouse,
 must be unique. Violating either returns `409` with a specific message
@@ -120,6 +128,7 @@ GET    /api/boxes?q=&clientId=&status=&onHold=&warehouseId=&orderId=&page=&pageS
                                                        -> { items: Box[], total: number }
 GET    /api/boxes/:id                                 -> Box
 GET    /api/boxes/:id/orders                          -> Order[]   (every order this box has ever been on)
+GET    /api/boxes/:id/movements?page=&pageSize=       -> { items: Movement[], total: number }   (newest first)
 POST   /api/boxes/batch       CreateBoxesBatchInput    -> Box[]                        (201)
 POST   /api/boxes/mark-label-printed  { boxIds: string[] }   -> { ok: true }
 POST   /api/slots/suggest     SuggestSlotsInput        -> SlotSuggestion[]
@@ -132,7 +141,7 @@ POST   /api/boxes/:id/missing { note: string }           -> Box
 
 ```ts
 type BoxStatus = "unallocated" | "stored" | "reserved" | "picked" | "out"
-               | "pending_destruction" | "destroyed"
+               | "pending_destruction" | "destroyed" | "missing" | "digitized"
 type BoxSize = "standard" | "large" // capacity is in centimetres: "large" takes 80 cm of a cell, "standard" 40 cm (src/utils/dimensions.js)
 
 interface Box {
@@ -176,6 +185,25 @@ interface UpdateBoxDetailsInput {
   reason: string; // required — recorded on the audit trail
 }
 ```
+
+```ts
+// Custody / location ledger: one row per physical change of a box's location, never edited or deleted.
+// Unlike the audit trail it holds real slot and warehouse ids, so storage time per warehouse can be worked out.
+type MovementType = "put_away"   // into a slot from nowhere: a new box, or a box back from the client
+                  | "transfer"   // slot -> slot (a move)
+                  | "found"      // a box marked missing is placed in a slot again
+                  | "dispatched" | "destroyed" | "marked_missing" // out of its slot
+interface Movement {
+  id: string; boxId: string; boxNumber: string; clientId: string; type: MovementType;
+  fromSlotId?: string; fromWarehouseId?: string; toSlotId?: string; toWarehouseId?: string;
+  fromLocation?: { warehouse: string; rack: string; slot: string }; toLocation?: { warehouse: string; rack: string; slot: string };
+  orderId?: string; orderNumber?: string;
+  reason?: string; // move reason, missing note, dispatch recipient or destruction method
+  actor: { id: string; name: string; side: "staff" | "client" | "system" }; at: string;
+}
+```
+
+Allocating a box to the slot it is already in writes no movement (nothing moved).
 
 **Box status is derived from actions, not settable directly**: registering sets `"unallocated"`;
 `allocate-batch` sets `"stored"`; creating a non-collection order with this box sets `"reserved"`;
@@ -352,12 +380,12 @@ curl -X POST /api/orders/<id>/dispatch -d '{ "recipientName": "M. Jones" }'
 ## Things this API deliberately does NOT do (yet)
 
 - No Client CRUD — by design, see above.
-- No portal/client-login support — `requestedVia: "portal"` orders can't be created via this API
-  yet (only `staff`-originated orders).
 - No pick/receive scanning workflow beyond what's described above (order lines have a `"picked"`
   status in the schema for this, but no endpoint sets it yet).
-- `GET /api/orders` returns everything matching the filter, unpaginated (`GET /api/boxes` and
-  `GET /api/audit` do support `page`/`pageSize`).
+- No duplicate-submission protection (`Idempotency-Key`) yet: if a request succeeds but its reply is lost, sending it
+  again repeats it. See `docs/GAP_ANALYSIS_AND_ROADMAP.md` §3.2.
+
+(Portal orders are supported through the client-portal API below, and every list endpoint is paginated.)
 
 ## Pagination (all list endpoints)
 

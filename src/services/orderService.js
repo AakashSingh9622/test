@@ -8,9 +8,13 @@ const { assertTransition } = require("./orderMachine");
 const { getBoxIneligibilityReason } = require("./boxEligibility");
 const { releaseBoxSlot, RELEASED_BOX_FIELDS, TX_OPTIONS } = require("./boxAllocationService");
 const { appendAuditEvent } = require("./auditService");
+const { appendMovement } = require("./movementService");
 const { serializeOrder, serializeOrderLine, toDate } = require("../utils/serialize");
 const httpError = require("../utils/httpError");
 const { parsePagination } = require("../utils/pagination");
+
+// Dispatch/destroy ke liye: line ka box + uska slot (movement ledger me slot aur warehouse id dono jaate hain).
+const LINE_BOX_WITH_SLOT = { box: { include: { slot: { select: { id: true, warehouseId: true } } } } };
 
 const NO_OPEN_ORDER = { openOrderId: null, openOrder: Prisma.DbNull };
 
@@ -295,7 +299,7 @@ async function dispatchOrder(orderId, recipientName, actor) {
     if (order.type !== "dispatch") throw httpError(400, "Not a dispatch order");
     assertTransition(order.status, "completed"); // galat status par kuch bhi badalne se pehle hi fail ho jao
 
-    const lines = await tx.orderLine.findMany({ where: { orderId, boxId: { not: null }, status: { notIn: ["missing", "removed"] } }, include: { box: true } });
+    const lines = await tx.orderLine.findMany({ where: { orderId, boxId: { not: null }, status: { notIn: ["missing", "removed"] } }, include: LINE_BOX_WITH_SLOT });
     for (const line of lines) {
       const box = line.box;
       if (!box) continue;
@@ -304,6 +308,13 @@ async function dispatchOrder(orderId, recipientName, actor) {
         where: { id: box.id },
         data: { status: "out", ...RELEASED_BOX_FIELDS, ...NO_OPEN_ORDER },
       });
+      await appendMovement(
+        box,
+        "dispatched",
+        actor,
+        { from: box.slot, fromLocation: box.locationPath, orderId: order.id, orderNumber: order.orderNumber, reason: recipientName },
+        tx
+      );
       await tx.orderLine.update({
         where: { id: line.id },
         data: { status: "dispatched", scannedBy: actor, scannedAt: new Date() },
@@ -363,7 +374,7 @@ async function destroyOrder(orderId, witness, actor) {
 
     const destruction = witness ? { ...order.destruction, witness } : order.destruction;
 
-    const lines = await tx.orderLine.findMany({ where: { orderId, boxId: { not: null }, status: { notIn: ["missing", "removed"] } }, include: { box: true } });
+    const lines = await tx.orderLine.findMany({ where: { orderId, boxId: { not: null }, status: { notIn: ["missing", "removed"] } }, include: LINE_BOX_WITH_SLOT });
     for (const line of lines) {
       const box = line.box;
       if (!box) continue;
@@ -372,6 +383,13 @@ async function destroyOrder(orderId, witness, actor) {
         where: { id: box.id },
         data: { status: "destroyed", ...RELEASED_BOX_FIELDS, ...NO_OPEN_ORDER },
       });
+      await appendMovement(
+        box,
+        "destroyed",
+        actor,
+        { from: box.slot, fromLocation: box.locationPath, orderId: order.id, orderNumber: order.orderNumber, reason: destruction.method },
+        tx
+      );
       await tx.orderLine.update({ where: { id: line.id }, data: { status: "destroyed" } });
       await appendAuditEvent(
         updated,

@@ -4,6 +4,7 @@
 const prisma = require("../config/prisma");
 const { serializeSimple } = require("../utils/serialize");
 const { toCentimetres } = require("../utils/dimensions");
+const httpError = require("../utils/httpError");
 
 const SUM_FIELDS = { _count: { _all: true }, _sum: { used: true, capacity: true } };
 
@@ -173,24 +174,39 @@ async function listSlotsForRack(rackId) {
   return slots.map(serializeSimple);
 }
 
-// Block karne par used zero ho jaata hai, aur (blocked na ho to) status hamesha used/capacity se
-// recompute hota hai, freely set nahi hota.
+// Staff UI unblock karte waqt "available"/"full" bhejti hai -- dono ka matlab "blocked nahi"; asli available/full
+// hamesha used/capacity se nikalta hai, freely set nahi hota.
+const SLOT_STATUS_INPUT = ["blocked", "available", "full"];
+
+// Block = naye boxes nahi aayenge; jo boxes andar hain wo wahin rehte hain, isliye `used` KABHI nahi chhuta (pehle
+// zero ho jaata tha aur slot khaali dikhta tha). Capacity jo andar rakha hai usse kam nahi ho sakti. Check + update
+// ek hi SQL statement me, taaki beech me koi box allocate ho jaye to bhi slot over-full na bane.
 async function updateSlot(slotId, patch) {
   const slot = await prisma.slot.findUnique({ where: { id: slotId } });
-  if (!slot) throw new Error(`Slot ${slotId} not found`);
-
-  let { capacity, used, status } = slot;
-  if (typeof patch.capacity === "number") capacity = patch.capacity;
-  if (patch.status === "blocked") {
-    status = "blocked";
-    used = 0; // blocked slot me koi box nahi reh sakta
+  if (!slot) throw httpError(404, "Slot not found");
+  if (patch.status !== undefined && !SLOT_STATUS_INPUT.includes(patch.status)) {
+    throw httpError(400, 'status must be "blocked", "available" or "full"');
   }
-  if (status !== "blocked") {
-    status = used >= capacity ? "full" : "available";
+  if (patch.capacity !== undefined && !(Number.isInteger(patch.capacity) && patch.capacity > 0)) {
+    throw httpError(400, "capacity must be a positive whole number of centimetres");
   }
 
-  const updated = await prisma.slot.update({ where: { id: slotId }, data: { capacity, used, status } });
-  return serializeSimple(updated);
+  const capacity = patch.capacity ?? slot.capacity;
+  const blocked = patch.status === undefined ? slot.status === "blocked" : patch.status === "blocked";
+  const changed = await prisma.$executeRaw`
+    UPDATE "slot"
+    SET "capacity" = ${capacity},
+        "status" = CASE
+          WHEN ${blocked}::boolean THEN 'blocked'::"SlotStatus"
+          WHEN "used" >= ${capacity} THEN 'full'::"SlotStatus"
+          ELSE 'available'::"SlotStatus" END,
+        "updatedAt" = NOW()
+    WHERE "id" = ${slotId} AND "used" <= ${capacity}`;
+  if (changed !== 1) {
+    const current = await prisma.slot.findUnique({ where: { id: slotId } });
+    throw httpError(409, `Slot ${slot.code} already holds ${current?.used ?? slot.used} cm, which is more than ${capacity} cm -- move boxes out first`);
+  }
+  return serializeSimple(await prisma.slot.findUnique({ where: { id: slotId } }));
 }
 
 module.exports = {

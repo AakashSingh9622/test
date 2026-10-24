@@ -8,6 +8,7 @@
 const { Prisma } = require("../config/prisma");
 const prisma = require("../config/prisma");
 const { appendAuditEvent } = require("./auditService");
+const { appendMovement } = require("./movementService");
 const { serializeBox } = require("../utils/serialize");
 const { boxLengthCm } = require("../utils/dimensions");
 const httpError = require("../utils/httpError");
@@ -88,6 +89,10 @@ async function allocateBoxes({ allocations, reason }, actor) {
       const alreadyHere = box.slotId === slot.id;
       const wasAllocatedElsewhere = !!box.slotId && !alreadyHere;
       const fromLocation = box.locationPath;
+      // Ledger ke liye purane slot ka warehouse bhi chahiye (sirf move par).
+      const fromSlot = wasAllocatedElsewhere
+        ? await tx.slot.findUnique({ where: { id: box.slotId }, select: { id: true, warehouseId: true } })
+        : null;
 
       if (!alreadyHere) {
         // Pehle nayi jagah lo (atomic) -- mili tabhi purani chhodo, warna box kahin ka na rahe.
@@ -116,6 +121,16 @@ async function allocateBoxes({ allocations, reason }, actor) {
         { fromLocation: wasAllocatedElsewhere ? fromLocation : undefined, toLocation: locationPath, note: wasMissing ? `Found${reason ? " -- " + reason : ""}` : reason },
         tx
       );
+      // Box pehle se isi slot me tha to physically kuch nahi hila -- ledger me row nahi.
+      if (!alreadyHere) {
+        await appendMovement(
+          box,
+          wasAllocatedElsewhere ? "transfer" : wasMissing ? "found" : "put_away",
+          actor,
+          { from: fromSlot, to: slot, fromLocation: wasAllocatedElsewhere ? fromLocation : undefined, toLocation: locationPath, reason },
+          tx
+        );
+      }
 
       results.push(serializeBox(updated));
     }

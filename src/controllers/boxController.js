@@ -2,6 +2,7 @@
 const boxService = require("../services/boxService");
 const { allocateBoxes } = require("../services/boxAllocationService");
 const { suggestSlotsForBoxes } = require("../services/slotSuggestionService");
+const { listMovementsForBox } = require("../services/movementService");
 const { actorFromReq } = require("../utils/actor");
 
 function parseStatusArray(q) {
@@ -34,6 +35,16 @@ async function getBox(req, res) {
 
 async function getBoxOrders(req, res) {
   res.json(await boxService.getOrdersForBox(req.params.boxId));
+}
+
+async function getBoxMovements(req, res) {
+  const q = req.query;
+  res.json(
+    await listMovementsForBox(req.params.boxId, {
+      page: q.page ? Number(q.page) : undefined,
+      pageSize: q.pageSize ? Number(q.pageSize) : undefined,
+    })
+  );
 }
 
 async function createBoxesBatch(req, res) {
@@ -98,6 +109,7 @@ module.exports = {
   listBoxes,
   getBox,
   getBoxOrders,
+  getBoxMovements,
   createBoxesBatch,
   markLabelsPrinted,
   suggestSlots,
