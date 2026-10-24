@@ -290,6 +290,7 @@ module.exports = {
   updateAisle,
   deleteAisle,
   resolveLocation,
+  searchRacks,
   refreshBoxLocations,
   createRack,
   listRacksForWarehouse,
@@ -579,8 +580,10 @@ async function deleteAisle(aisleId, actor) {
 
 // --- Find a location by typing / scanning its code -------------------------------------------------------------------
 // "SL-WH1-B04-3-2" (a position's barcode), "B04-3-2" (rack B04, shelf 3, position 2), "B04-3" (shelf: the app picks
-// the best-fitting position), "B04" (just the rack). Read from the right, so rack codes with dashes ("A-01-3") still
-// resolve. One rack code in two warehouses (older racks) -> "ambiguous" with the choices, never a guess.
+// the best-fitting position), "B04" (just the rack). The rack part is the rack's CODE or its NAME (label, what the
+// dropdowns show — "Rack A-01 3" works too). Numbers are read from the right, split by "-", space, "/" or ".", so
+// rack codes / names with dashes still resolve. Several racks match (a code in two warehouses, or a repeated name) ->
+// "ambiguous" with the choices, never a guess; the UI asks again with the chosen rackId.
 
 const ACTIVE_SLOT = ["available", "full"];
 
@@ -611,7 +614,59 @@ function resolved(kind, code, rack, { shelf = null, positions = [], suggested = 
   };
 }
 
-async function resolveLocation(rawCode, { warehouseId, needCm } = {}) {
+const RACK_SEARCH_INCLUDE = { warehouse: { select: { id: true, code: true, name: true } }, zone: true, aisle: true };
+
+// Racks whose code or name is exactly `text` (ignoring case and extra spaces): codes first, names only if no code matched.
+async function racksNamed(text, { warehouseId, rackId } = {}) {
+  const scope = { ...(warehouseId && { warehouseId }), ...(rackId && { id: rackId }) };
+  const byCode = await prisma.rack.findMany({
+    where: { code: { equals: text, mode: "insensitive" }, ...scope },
+    include: RACK_FULL_INCLUDE,
+    orderBy: { warehouse: { code: "asc" } },
+  });
+  if (byCode.length) return byCode;
+  const clean = text.replace(/\s+/g, " ");
+  return prisma.rack.findMany({
+    where: { label: { equals: clean, mode: "insensitive" }, ...scope },
+    include: RACK_FULL_INCLUDE,
+    orderBy: [{ warehouse: { code: "asc" } }, { code: "asc" }],
+  });
+}
+
+const rackChoice = (r) => ({
+  rackId: r.id,
+  rackCode: r.code,
+  rackLabel: r.label,
+  warehouseId: r.warehouseId,
+  warehouseCode: r.warehouse.code,
+  warehouseName: r.warehouse.name,
+  zone: r.zone?.code,
+  aisle: r.aisle?.code,
+});
+
+// The rack part of what was typed: "Rack A-01 3-2" -> "Rack A-01" (for search-as-you-type).
+function rackPart(text) {
+  return text.replace(/([\s\-/.]+\d+){1,2}$/, "").trim() || text;
+}
+
+// Search-as-you-type for the "find a location" box: racks whose code or name contains the text (up to 8).
+async function searchRacks(rawQuery, { warehouseId } = {}) {
+  const q = String(rawQuery ?? "").trim();
+  if (!q) return [];
+  const term = rackPart(q);
+  const racks = await prisma.rack.findMany({
+    where: {
+      OR: [{ code: { contains: term, mode: "insensitive" } }, { label: { contains: term, mode: "insensitive" } }],
+      ...(warehouseId && { warehouseId }),
+    },
+    include: RACK_SEARCH_INCLUDE,
+    orderBy: [{ code: "asc" }],
+    take: 8,
+  });
+  return racks.map((r) => ({ ...rackChoice(r), rows: r.rows, columns: r.columns }));
+}
+
+async function resolveLocation(rawCode, { warehouseId, rackId, needCm } = {}) {
   const code = String(rawCode ?? "").trim();
   if (!code) throw httpError(400, "Type or scan a location code");
 
@@ -623,33 +678,25 @@ async function resolveLocation(rawCode, { warehouseId, needCm } = {}) {
     return resolved("position", code, rack, { shelf: bySlot.row, positions: [bySlot], suggested: bestFit([bySlot], needCm) });
   }
 
-  const parts = code.split("-");
-  const num = (s) => (/^\d+$/.test(s) ? Number(s) : null);
   const tries = [];
-  if (parts.length >= 3 && num(parts.at(-1)) && num(parts.at(-2))) {
-    tries.push({ rackCode: parts.slice(0, -2).join("-"), row: num(parts.at(-2)), column: num(parts.at(-1)) });
-  }
-  if (parts.length >= 2 && num(parts.at(-1))) tries.push({ rackCode: parts.slice(0, -1).join("-"), row: num(parts.at(-1)) });
+  const two = code.match(/^(.*?)[\s\-/.]+(\d+)[\s\-/.]+(\d+)$/);
+  if (two && two[1].trim()) tries.push({ rackCode: two[1].trim(), row: Number(two[2]), column: Number(two[3]) });
+  const one = code.match(/^(.*?)[\s\-/.]+(\d+)$/);
+  if (one && one[1].trim()) tries.push({ rackCode: one[1].trim(), row: Number(one[2]) });
   tries.push({ rackCode: code });
 
   for (const t of tries) {
-    const racks = await prisma.rack.findMany({
-      where: { code: { equals: t.rackCode, mode: "insensitive" }, ...(warehouseId && { warehouseId }) },
-      include: RACK_FULL_INCLUDE,
-      orderBy: { warehouse: { code: "asc" } },
-    });
+    const racks = await racksNamed(t.rackCode, { warehouseId, rackId });
     if (!racks.length) continue;
     if (racks.length > 1) {
+      const sameCode = racks.every((r) => r.code.toLowerCase() === racks[0].code.toLowerCase());
       return {
         kind: "ambiguous",
         code,
-        message: `Rack ${racks[0].code} is in more than one warehouse — choose the warehouse`,
-        choices: racks.map((r) => ({
-          warehouseId: r.warehouseId,
-          warehouseCode: r.warehouse.code,
-          warehouseName: r.warehouse.name,
-          rackLabel: r.label,
-        })),
+        message: sameCode
+          ? `Rack ${racks[0].code} is in more than one warehouse — choose one`
+          : `${racks.length} racks are called "${racks[0].label}" — choose one`,
+        choices: racks.map(rackChoice),
       };
     }
     const rack = racks[0];
@@ -668,20 +715,13 @@ async function resolveLocation(rawCode, { warehouseId, needCm } = {}) {
     return resolved("shelf", code, rack, { shelf: t.row, positions: shelf, suggested: bestFit(shelf, needCm) });
   }
 
-  // Nothing matched: a few rack codes that look like what was typed.
-  const head = tries[0].rackCode.split("-")[0].slice(0, 3);
-  const similar = head
-    ? await prisma.rack.findMany({
-        where: { code: { contains: head, mode: "insensitive" }, ...(warehouseId && { warehouseId }) },
-        select: { code: true },
-        orderBy: { code: "asc" },
-        take: 5,
-      })
-    : [];
+  // Nothing matched: racks whose code or name contains (the start of) what was typed.
+  let similar = await searchRacks(code, { warehouseId });
+  if (!similar.length) similar = await searchRacks(rackPart(code).slice(0, 3), { warehouseId });
   return {
     kind: "not_found",
     code,
     message: `No rack, shelf or position matches "${code}"`,
-    suggestions: [...new Set(similar.map((r) => r.code))],
+    suggestions: [...new Set(similar.map((r) => r.rackCode))].slice(0, 5),
   };
 }

@@ -6,7 +6,7 @@ const { pathFor, RACK_PATH_INCLUDE } = require("../utils/locationPath");
 
 // Total length (cm) jo ye boxes cell me gherenge.
 function unitsFor(sizes, lengths) {
-  return sizes.reduce((sum, size) => sum + (lengths[size] ?? lengths.standard), 0);
+  return sizes.reduce((sum, size) => sum + (lengths[size] ?? lengths.standard ?? 40), 0);
 }
 
 async function suggestSlotsForBoxes({ clientId, boxSizes, warehouseId, preferSlotIds }) {

@@ -133,10 +133,21 @@ async function removeAisle(req, res) {
   res.status(204).end();
 }
 
-// GET /api/locations/resolve?code=B04-3&needCm=80&warehouseId=
+// GET /api/locations/resolve?code=B04-3&needCm=80&warehouseId=&rackId=
 async function resolveLocation(req, res) {
-  const { code, warehouseId, needCm } = req.query;
-  res.json(await locationService.resolveLocation(code, { warehouseId: warehouseId || undefined, needCm: Number(needCm) || 0 }));
+  const { code, warehouseId, rackId, needCm } = req.query;
+  res.json(
+    await locationService.resolveLocation(code, {
+      warehouseId: warehouseId || undefined,
+      rackId: rackId || undefined,
+      needCm: Number(needCm) || 0,
+    })
+  );
+}
+
+// GET /api/locations/racks?q=rac -- search-as-you-type by rack code or name
+async function searchRacks(req, res) {
+  res.json(await locationService.searchRacks(req.query.q, { warehouseId: req.query.warehouseId || undefined }));
 }
 
 module.exports = {
@@ -148,6 +159,7 @@ module.exports = {
   patchAisle,
   removeAisle,
   resolveLocation,
+  searchRacks,
   listWarehouses,
   createWarehouse,
   getWarehouse,

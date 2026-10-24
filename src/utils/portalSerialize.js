@@ -21,6 +21,7 @@ function portalBox(box, { showOrder = true } = {}) {
     filingDateTo: dateOnly(box.filingDateTo),
     destroyAfter: dateOnly(box.destroyAfter),
     size: box.size,
+    sizeName: box.sizeName, // set by portalService (custom sizes have their own names)
     status: box.status,
     onHold: box.onHold,
     warehouse,

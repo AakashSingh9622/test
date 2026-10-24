@@ -21,6 +21,8 @@ const {
   listContents,
   addContent,
   removeContent,
+  correctRegisteredBoxes,
+  lookupBox,
 } = require("../controllers/boxController");
 const { requireAuth } = require("../middleware/authMiddleware");
 const { requirePermission } = require("../middleware/requirePermission");
@@ -32,9 +34,11 @@ router.use(requireAuth);
 const operate = requirePermission("boxes.operate");
 
 router.get("/", asyncHandler(listBoxes));
+router.get("/lookup", asyncHandler(lookupBox)); // before /:boxId
 router.post("/batch", operate, asyncHandler(createBoxesBatch));
 router.post("/mark-label-printed", operate, asyncHandler(markLabelsPrinted));
 router.post("/allocate-batch", operate, asyncHandler(allocateBatch));
+router.post("/correct-batch", operate, asyncHandler(correctRegisteredBoxes));
 // Scan flows: a registered box arrives at Goods-In; box + slot barcode puts it on a shelf.
 router.post("/receive", operate, asyncHandler(receiveAtGoodsIn));
 router.post("/put-away", operate, asyncHandler(putAway));

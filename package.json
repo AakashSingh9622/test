@@ -9,6 +9,7 @@
     "seed": "node src/scripts/seed.js",
     "slots:recompute": "node src/scripts/recomputeSlotUsage.js",
     "locations:refresh": "node src/scripts/refreshLocationPaths.js",
+    "sizes:convert": "node src/scripts/convertBoxSizes.js",
     "postinstall": "prisma generate",
     "db:push": "prisma db push",
     "db:studio": "prisma studio",

@@ -74,7 +74,7 @@ The Supabase project also contains `auth.*`, `storage.*`, `realtime.*` tables. T
 | 7 | `order_line` | One box on one order |
 | 8 | `audit_event` | Immutable history of everything that happened to a box |
 | 9 | `counter` | Atomic sequence numbers (box numbers, order numbers) |
-| 10 | `box_size_config` | Admin-editable length (cm) a `standard` / `large` box takes in a rack cell |
+| 10 | `box_size_config` | Box sizes: the built-in `standard` / `large` plus any an admin adds — name and length (cm) one box takes in a rack cell |
 | 11 | `app_setting` | Key/value settings kept in the database. `defaultDatabase` = the one DocuSoft agreement number (e.g. `0003`) this system is for |
 | 12 | `movement` | Append-only custody/location ledger: one row per physical change of a box's location, with real slot and warehouse ids (source for storage billing) |
 | 13 | `user_role` | Locally assigned staff roles, keyed by e-mail (only `staff_admin` comes from DocuSoft) |
@@ -253,7 +253,7 @@ boxes really in the cell, `npm run slots:recompute` reports it and `npm run slot
 | `description` | text | | |
 | `department`, `reference` | text? | | |
 | `filingDateFrom`, `filingDateTo`, `destroyAfter` | date | | `filingDateTo`, `destroyAfter` optional |
-| `size` | enum `BoxSize` | | `standard` / `large` |
+| `size` | text | | a `box_size_config.size` code (`standard`, `large`, or one an admin added) — was the `BoxSize` enum before Sprint 11 |
 | `lengthCm` | int? | | cm this box takes in a cell, **copied from `box_size_config` when the box is registered** (so later setting changes never corrupt `slot.used`) |
 | `status` | enum `BoxStatus` | | see §3.5 |
 | `onHold`, `holdReason` | bool, text? | | a box on hold cannot be put on an order |
@@ -362,15 +362,21 @@ via, by, at}`, `waived {reason, by, at}`). `invoice.orderId` (indexed), `invoice
 | `billing_run` | a period's charges → invoices | `runNumber` (`BR-000001`); `status` draft/approved; `totals` JSON frozen on approval |
 | `notification` | in-app updates | `audience` client/staff; client rows carry `clientId` + `contactEmail` (null = the client's main contacts) |
 
-#### `box_size_config` — box lengths (settings)
+#### `box_size_config` — box sizes (settings, Sprint 11)
 | Column | Type | Key | Notes |
 |---|---|---|---|
-| `size` | enum `BoxSize` | **PK** | one row per size: `standard`, `large` |
-| `lengthCm` | int | | whole cm, 1–1000. Defaults 40 / 80 (`src/utils/dimensions.js`) |
-| `updatedAt`, `updatedBy` | timestamp, JSON? | | who last changed it (actor) |
+| `size` | text | **PK** | stable code made from the first name: `standard`, `large`, `archive-xl` … |
+| `name` | text? | | shown everywhere; null on the old built-in rows → "Standard" / "Large" |
+| `lengthCm` | int | | whole cm, 1–1000. Built-in defaults 40 / 80 (`src/utils/dimensions.js`) |
+| `active` | bool | | false = retired: kept for existing boxes, not offered for new ones |
+| `sortOrder` | int | | order in the pickers |
+| `createdAt`, `updatedAt`, `updatedBy` | timestamp, JSON? | | who last changed it (actor) |
 
-Edited by `staff_admin` in **Settings → Box sizes**; read by every box registration and slot suggestion (cached for 30 s,
-clearing on update). A change only affects boxes registered afterwards.
+Edited in **Settings → Box sizes** (`settings.manage`); read by every box registration and slot suggestion (cached for
+30 s, cleared on change). A new length only affects boxes registered afterwards (`box.lengthCm` is copied at
+registration). A size in use can be retired but not removed; standard / large are never removed. Admin actions
+`box_size_created`, `box_sizes_updated`, `box_size_deleted`. Upgrading an older database: `npm run sizes:convert` before
+`npx prisma db push` (turns the old enum columns into text, keeping the values).
 
 #### `app_setting` — settings in the database
 | Column | Type | Key | Notes |
@@ -399,7 +405,6 @@ concurrent requests never receive the same number.
 |---|---|
 | `Role` | `staff_admin`, `staff_operator`, `client_admin`, `client_user` |
 | `SlotStatus` | `available`, `full`, `blocked` |
-| `BoxSize` | `standard`, `large` |
 | `BoxStatus` | `unallocated` (registered, no slot) · `stored` · `reserved` (stored, on an open order) · `picked` · `out` (with the client) · `pending_destruction` · `destroyed` (terminal) · `missing` (not in any slot, reason in `missingReason`) · `digitized` (scanned; still in its slot, `digitizedAt` set) |
 | `OrderType` | `collection`, `dispatch`, `destruction`, `digitize` |
 | `OrderStatus` | `requested`, `approved`, `scheduled`, `in_progress`, `completed`, `cancelled`, `rejected` |
@@ -593,8 +598,9 @@ All routes below require a valid staff session unless marked. List endpoints ret
 
 | Method & path | Purpose |
 |---|---|
-| `GET /settings/box-sizes` | any staff — `{sizes:{standard,large}, defaults, updatedAt, updatedBy}` |
-| `PUT /settings/box-sizes` | `staff_admin` — `{standard?, large?}` whole cm 1–1000 |
+| `GET /settings/box-sizes` | any staff — `{items:[{code,name,lengthCm,active,builtIn,boxCount}], updatedAt, updatedBy}` |
+| `POST / PATCH / DELETE /settings/box-sizes[/:code]` | `settings.manage` — add (name + lengthCm), rename / resize / retire, remove an unused one |
+| `PUT /settings/box-sizes` | `settings.manage` — older call: `{<code>: cm}` sets lengths |
 
 **Audit and clients**
 
