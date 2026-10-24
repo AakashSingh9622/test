@@ -9,6 +9,10 @@ const { getBoxIneligibilityReason } = require("./boxEligibility");
 const { releaseBoxSlot, RELEASED_BOX_FIELDS, TX_OPTIONS } = require("./boxAllocationService");
 const { appendAuditEvent } = require("./auditService");
 const { appendMovement } = require("./movementService");
+const { refuseAndRecord } = require("./exceptionService");
+const { assertNoLegalHold } = require("./legalHoldService");
+const { issueCertificate } = require("./certificateService");
+const { notifyOrderStatus, notifyClientAboutOrder, notifyStaff } = require("./notificationService");
 const { serializeOrder, serializeOrderLine, toDate } = require("../utils/serialize");
 const httpError = require("../utils/httpError");
 const { parsePagination } = require("../utils/pagination");
@@ -17,6 +21,25 @@ const { parsePagination } = require("../utils/pagination");
 const LINE_BOX_WITH_SLOT = { box: { include: { slot: { select: { id: true, warehouseId: true } } } } };
 
 const NO_OPEN_ORDER = { openOrderId: null, openOrder: Prisma.DbNull };
+
+// Where a box waits after arriving, before it is put on a shelf (no slot, so no capacity is used).
+function goodsInPath(warehouse) {
+  return { warehouse: warehouse?.code ?? "—", rack: "Goods-In", slot: "—" };
+}
+
+// A scanned code = the box's CURRENT barcode only. (Not the box number: it equals the first barcode, so after a re-label
+// the old, replaced label would still scan.)
+async function findBoxByCode(code, db = prisma) {
+  return db.box.findUnique({ where: { barcode: code } });
+}
+
+// Dispatch / destroy: either nobody scanned (the old one-click way) or every box has been picked.
+function assertAllPickedOrNone(lines) {
+  const picked = lines.filter((l) => l.status === "picked").length;
+  if (picked > 0 && picked < lines.length) {
+    throw httpError(409, `${lines.length - picked} of ${lines.length} boxes aren't picked yet — pick them (or mark them missing) first`);
+  }
+}
 
 // What a box goes back to when it is free again: "digitized" if it was ever digitized, else "stored".
 function restingStatus(box) {
@@ -69,16 +92,20 @@ async function setOrderStatus(order, status, db, extra = {}) {
   for (const box of boxes) {
     await db.box.update({ where: { id: box.id }, data: { openOrder: { ...box.openOrder, status } } });
   }
+  await notifyOrderStatus(updated, status, db);
   return updated;
 }
 
-// Abhi bhi "reserved" pade boxes ko wapas "stored" kar deta hai (reject/cancel -- spec §4).
+// Reject / cancel (spec §4): boxes still held by this order are freed -- reserved / picked ones go back to stored,
+// a box that was coming back on a collection (return_pending) is simply still with the client ("out").
 async function releaseOrderBoxes(order, actor, db) {
   const lines = await db.orderLine.findMany({ where: { orderId: order.id, boxId: { not: null } }, include: { box: true } });
   for (const line of lines) {
     const box = line.box;
-    if (box && box.status === "reserved" && box.openOrderId === order.id) {
-      const updated = await db.box.update({ where: { id: box.id }, data: { status: restingStatus(box), ...NO_OPEN_ORDER } });
+    if (!box || box.openOrderId !== order.id) continue;
+    const status = ["reserved", "picked"].includes(box.status) ? restingStatus(box) : box.status === "return_pending" ? "out" : null;
+    if (status) {
+      const updated = await db.box.update({ where: { id: box.id }, data: { status, ...NO_OPEN_ORDER } });
       await db.orderLine.update({ where: { id: line.id }, data: { status: "removed" } });
       await appendAuditEvent(updated, "removed_from_order", actor, { orderId: order.id, orderNumber: order.orderNumber }, db);
     }
@@ -143,8 +170,8 @@ async function getOrderLines(orderId) {
 }
 
 // Order + lines banata hai; staff-created orders seedha "approved" shuru hote hain, portal wale
-// "requested" (spec §4). Collection orders ke liye boxIds usually khaali hote hain (naye boxes
-// collection ke baad register honge), isliye unki boxes ko "reserved" nahi kiya jaata.
+// "requested" (spec §4). Boxes are claimed for the order: "reserved" for dispatch / destruction / digitize, and
+// "return_pending" for boxes coming back on a collection (they are still with the client until received).
 async function createOrder(input, actor) {
   // Every order belongs to one contact of the client (identified by email): staff pick it in the form, and the
   // portal uses the logged-in contact. Without it the order could not be shown to the right person later.
@@ -186,6 +213,9 @@ async function createOrder(input, actor) {
       boxes.push(box);
     }
 
+    // Legal hold always overrides (spec §4.4): a held box can't even be put on a destruction order.
+    if (input.type === "destruction") await assertNoLegalHold(boxes, tx);
+
     const status = input.requestedVia === "portal" ? "requested" : "approved";
     const seq = await nextSequence(`orderSeq:${input.type}`, tx);
 
@@ -207,6 +237,8 @@ async function createOrder(input, actor) {
         boxCount: boxes.length,
         lineSummary: boxes.length > 0 ? { pending: boxes.length } : {},
         collectionInfo: input.type === "collection" ? { expectedNewBoxes: input.expectedNewBoxes || 0 } : undefined,
+        permanentWithdrawal: input.type === "dispatch" && input.permanentWithdrawal === true,
+        clientApprovalRequired: input.clientApprovalRequired === true,
         destruction: authorisation ?? undefined,
         digitization: digitization ?? undefined,
       },
@@ -224,15 +256,18 @@ async function createOrder(input, actor) {
       });
     }
 
-    if (input.type !== "collection") {
+    const isReturn = input.type === "collection";
+    {
       for (const box of boxes) {
         // Claim the box ONLY if it is still free: two people adding the same box to different orders at the same
         // moment would both pass the check above -- this conditional update lets exactly one of them win.
         const claimed = await tx.box.updateMany({
           // (a digitized box can still be dispatched/destroyed, so it is claimable too; digitize itself only takes "stored" -- see boxEligibility)
-          where: { id: box.id, status: { in: ["stored", "digitized"] }, onHold: false, openOrderId: null },
+          where: isReturn
+            ? { id: box.id, status: "out", openOrderId: null }
+            : { id: box.id, status: { in: ["stored", "digitized"] }, onHold: false, openOrderId: null },
           data: {
-            status: "reserved",
+            status: isReturn ? "return_pending" : "reserved",
             openOrderId: order.id,
             openOrder: { id: order.id, orderNumber: order.orderNumber, type: order.type, status: order.status },
           },
@@ -248,6 +283,22 @@ async function createOrder(input, actor) {
       }
     }
 
+    if (input.requestedVia === "portal") {
+      await notifyStaff(
+        { kind: "order_requested", title: `New ${order.type} request ${order.orderNumber} from ${order.clientName}`, orderId: order.id, clientId: order.clientId },
+        tx
+      );
+      if (order.clientApprovalRequired) {
+        // Shown to the client's main contacts (contactEmail null) -- they approve it in the portal.
+        await notifyClientAboutOrder(
+          { ...order, contactEmail: null },
+          "needs_client_approval",
+          `${order.contactName || order.contactEmail} asked to destroy ${order.boxCount} box${order.boxCount === 1 ? "" : "es"} (${order.orderNumber}) — your approval is needed`,
+          undefined,
+          tx
+        );
+      }
+    }
     return serializeOrder(order);
   }, TX_OPTIONS);
 }
@@ -255,7 +306,26 @@ async function createOrder(input, actor) {
 async function approveOrder(orderId) {
   return prisma.$transaction(async (tx) => {
     const order = await getOrderOrThrow(orderId, tx);
+    if (order.clientApprovalRequired && !order.clientApprovedAt) {
+      throw httpError(409, `${order.orderNumber} is waiting for the client's main contact to approve it in the portal`);
+    }
     return serializeOrder(await setOrderStatus(order, "approved", tx));
+  }, TX_OPTIONS);
+}
+
+// The client's main contact approves a destruction asked for by one of their contacts (portal).
+async function clientApproveOrder(orderId, ctx) {
+  return prisma.$transaction(async (tx) => {
+    const order = await getOrderOrThrow(orderId, tx);
+    if (!order.clientApprovalRequired) throw httpError(409, "This order doesn't need your approval");
+    if (order.clientApprovedAt) throw httpError(409, "This order is already approved");
+    if (order.status !== "requested") throw httpError(409, `This order is ${order.status.replace(/_/g, " ")}`);
+    await tx.order.update({ where: { id: orderId }, data: { clientApprovedBy: ctx.name || ctx.email, clientApprovedAt: new Date() } });
+    await notifyStaff(
+      { kind: "client_approved", title: `${order.clientName} approved ${order.orderNumber} — ready for warehouse approval`, orderId, clientId: order.clientId },
+      tx
+    );
+    return finish(orderId, tx);
   }, TX_OPTIONS);
 }
 
@@ -293,26 +363,35 @@ async function cancelOrder(orderId, reason, actor) {
   }, TX_OPTIONS);
 }
 
-async function dispatchOrder(orderId, recipientName, actor) {
+async function dispatchOrder(orderId, recipientName, actor, { courier, trackingRef } = {}) {
   return prisma.$transaction(async (tx) => {
     const order = await getOrderOrThrow(orderId, tx);
     if (order.type !== "dispatch") throw httpError(400, "Not a dispatch order");
     assertTransition(order.status, "completed"); // galat status par kuch bhi badalne se pehle hi fail ho jao
 
     const lines = await tx.orderLine.findMany({ where: { orderId, boxId: { not: null }, status: { notIn: ["missing", "removed"] } }, include: LINE_BOX_WITH_SLOT });
+    assertAllPickedOrNone(lines);
+    // Permanent withdrawal: the client keeps the boxes for good -- they can't come back on a collection.
+    const leftStatus = order.permanentWithdrawal ? "permanently_withdrawn" : "out";
     for (const line of lines) {
       const box = line.box;
       if (!box) continue;
       await releaseBoxSlot(box, tx);
       const updated = await tx.box.update({
         where: { id: box.id },
-        data: { status: "out", ...RELEASED_BOX_FIELDS, ...NO_OPEN_ORDER },
+        data: { status: leftStatus, ...RELEASED_BOX_FIELDS, ...NO_OPEN_ORDER },
       });
       await appendMovement(
         box,
         "dispatched",
         actor,
-        { from: box.slot, fromLocation: box.locationPath, orderId: order.id, orderNumber: order.orderNumber, reason: recipientName },
+        {
+          from: box.slot,
+          fromLocation: box.locationPath,
+          orderId: order.id,
+          orderNumber: order.orderNumber,
+          reason: order.permanentWithdrawal ? `${recipientName} (permanent withdrawal)` : recipientName,
+        },
         tx
       );
       await tx.orderLine.update({
@@ -328,7 +407,36 @@ async function dispatchOrder(orderId, recipientName, actor) {
       );
     }
     await recomputeLineSummary(orderId, tx);
-    await setOrderStatus(order, "completed", tx);
+    const delivery = {
+      ...(recipientName && { recipientName: String(recipientName).trim().slice(0, 200) }),
+      ...(courier && { courier: String(courier).trim().slice(0, 200) }),
+      ...(trackingRef && { trackingRef: String(trackingRef).trim().slice(0, 200) }),
+      dispatchedAt: new Date().toISOString(),
+    };
+    await setOrderStatus(order, "completed", tx, { delivery });
+    return finish(orderId, tx);
+  }, TX_OPTIONS);
+}
+
+// Proof of delivery for a dispatched order (spec §6.2): who received it, when, and a reference (signature / POD number).
+async function recordDelivery(orderId, input, actor) {
+  const receivedBy = String(input.receivedBy || "").trim();
+  if (!receivedBy) throw httpError(400, "receivedBy is required");
+  const deliveredAt = input.deliveredAt ? new Date(input.deliveredAt) : new Date();
+  if (Number.isNaN(deliveredAt.getTime())) throw httpError(400, "deliveredAt is not a valid date");
+  return prisma.$transaction(async (tx) => {
+    const order = await getOrderOrThrow(orderId, tx);
+    if (order.type !== "dispatch") throw httpError(400, "Only dispatch orders are delivered");
+    if (order.status !== "completed") throw httpError(409, `${order.orderNumber} hasn't been dispatched yet`);
+    const delivery = {
+      ...(order.delivery || {}),
+      receivedBy: receivedBy.slice(0, 200),
+      proofReference: input.proofReference ? String(input.proofReference).trim().slice(0, 200) : undefined,
+      deliveredAt: deliveredAt.toISOString(),
+      recordedBy: { id: actor.id, name: actor.name },
+    };
+    await tx.order.update({ where: { id: orderId }, data: { delivery } });
+    await notifyClientAboutOrder(order, "order_delivered", `${order.orderNumber} was delivered — received by ${delivery.receivedBy}`, undefined, tx);
     return finish(orderId, tx);
   }, TX_OPTIONS);
 }
@@ -337,6 +445,7 @@ async function authoriseDestruction(orderId, input, actor) {
   return prisma.$transaction(async (tx) => {
     const order = await getOrderOrThrow(orderId, tx);
     if (order.type !== "destruction") throw httpError(400, "Not a destruction order");
+    if (order.destruction?.approvedBy) throw httpError(409, "This destruction is already approved — it can't be re-authorised");
 
     await tx.order.update({
       where: { id: orderId },
@@ -365,16 +474,45 @@ async function authoriseDestruction(orderId, input, actor) {
   }, TX_OPTIONS);
 }
 
-async function destroyOrder(orderId, witness, actor) {
+// The second signature (spec §4.4 two-person control): a records manager who did NOT prepare the order approves it.
+async function approveDestruction(orderId, actor) {
+  return prisma.$transaction(async (tx) => {
+    const order = await getOrderOrThrow(orderId, tx);
+    if (order.type !== "destruction") throw httpError(400, "Not a destruction order");
+    if (!order.destruction) throw httpError(409, "The client's authorisation must be recorded first");
+    if (order.destruction.approvedBy) throw httpError(409, "This destruction is already approved");
+    if (!["approved", "scheduled", "in_progress", "ready"].includes(order.status)) {
+      throw httpError(409, `${order.orderNumber} is ${order.status.replace(/_/g, " ")}`);
+    }
+    if (order.requestedBy?.side === "staff" && order.requestedBy.id === actor.id) {
+      throw httpError(403, "You prepared this destruction order — a different person must approve it");
+    }
+    const lines = await tx.orderLine.findMany({ where: { orderId, boxId: { not: null }, status: { notIn: ["missing", "removed"] } }, include: { box: true } });
+    await assertNoLegalHold(lines.map((l) => l.box).filter(Boolean), tx);
+    const destruction = { ...order.destruction, approvedBy: { id: actor.id, name: actor.name }, approvedAt: new Date().toISOString() };
+    await tx.order.update({ where: { id: orderId }, data: { destruction } });
+    for (const line of lines) {
+      if (line.box) await appendAuditEvent(line.box, "destruction_approved", actor, { orderId: order.id, orderNumber: order.orderNumber }, tx);
+    }
+    return finish(orderId, tx);
+  }, TX_OPTIONS);
+}
+
+async function destroyOrder(orderId, witness, actor, { place } = {}) {
   return prisma.$transaction(async (tx) => {
     const order = await getOrderOrThrow(orderId, tx);
     if (order.type !== "destruction") throw httpError(400, "Not a destruction order");
     if (!order.destruction) throw httpError(400, "Destruction must be authorised first");
+    if (!order.destruction.approvedBy) throw httpError(409, "A records manager must approve this destruction first (second signature)");
     assertTransition(order.status, "completed");
 
     const destruction = witness ? { ...order.destruction, witness } : order.destruction;
 
     const lines = await tx.orderLine.findMany({ where: { orderId, boxId: { not: null }, status: { notIn: ["missing", "removed"] } }, include: LINE_BOX_WITH_SLOT });
+    assertAllPickedOrNone(lines);
+    // A hold placed after the approval still wins.
+    await assertNoLegalHold(lines.map((l) => l.box).filter(Boolean), tx);
+    const destroyedBoxes = [];
     for (const line of lines) {
       const box = line.box;
       if (!box) continue;
@@ -391,6 +529,7 @@ async function destroyOrder(orderId, witness, actor) {
         tx
       );
       await tx.orderLine.update({ where: { id: line.id }, data: { status: "destroyed" } });
+      destroyedBoxes.push(box);
       await appendAuditEvent(
         updated,
         "destroyed",
@@ -406,6 +545,14 @@ async function destroyOrder(orderId, witness, actor) {
     }
     await recomputeLineSummary(orderId, tx);
     await setOrderStatus(order, "completed", tx, { destruction });
+    const certificate = await issueCertificate({ order, boxes: destroyedBoxes, destruction, place, actor }, tx);
+    await notifyClientAboutOrder(
+      order,
+      "certificate_issued",
+      `Certificate of destruction ${certificate.certificateNumber} is ready for ${order.orderNumber}`,
+      undefined,
+      tx
+    );
     return finish(orderId, tx);
   }, TX_OPTIONS);
 }
@@ -463,16 +610,180 @@ async function digitizeOrder(orderId, actor) {
   }, TX_OPTIONS);
 }
 
-// Collection orders ke liye pick/dispatch/destroy jaisa koi step nahi -- complete seedha close kar deta hai.
-async function completeOrder(orderId) {
+// One returning box arrives: the line is received and the box waits at the warehouse's Goods-In ("received") until
+// it is put on a shelf. Fixes B7 (boxes used to stay "out" after the collection was completed).
+async function receiveReturnLine(tx, order, line, warehouse, actor) {
+  const box = line.box;
+  if (box && box.status === "return_pending") {
+    const toLocation = goodsInPath(warehouse);
+    const updated = await tx.box.update({
+      where: { id: box.id },
+      data: { status: "received", goodsInWarehouseId: warehouse?.id ?? null, locationPath: toLocation, ...NO_OPEN_ORDER },
+    });
+    await appendMovement(
+      box,
+      "received",
+      actor,
+      { to: warehouse ? { id: undefined, warehouseId: warehouse.id } : null, toLocation, orderId: order.id, orderNumber: order.orderNumber },
+      tx
+    );
+    await appendAuditEvent(updated, "received", actor, { orderId: order.id, orderNumber: order.orderNumber, toLocation }, tx);
+  }
+  await tx.orderLine.update({ where: { id: line.id }, data: { status: "received", scannedAt: new Date(), scannedBy: actor } });
+}
+
+async function warehouseOrThrow(warehouseId, db) {
+  if (!warehouseId) return null;
+  const warehouse = await db.warehouse.findUnique({ where: { id: warehouseId } });
+  if (!warehouse) throw httpError(404, "Warehouse not found");
+  return warehouse;
+}
+
+// Finishes a collection: returning boxes that weren't scanned are received now (into warehouseId's Goods-In if given).
+async function completeOrder(orderId, actor, { warehouseId } = {}) {
   return prisma.$transaction(async (tx) => {
     const order = await getOrderOrThrow(orderId, tx);
     if (order.type !== "collection") throw httpError(400, "Only collection orders can be completed directly");
     assertTransition(order.status, "completed");
-    await tx.orderLine.updateMany({ where: { orderId }, data: { status: "received" } });
+    const warehouse = await warehouseOrThrow(warehouseId, tx);
+    const pending = await tx.orderLine.findMany({ where: { orderId, status: "pending" }, include: { box: true } });
+    for (const line of pending) await receiveReturnLine(tx, order, line, warehouse, actor);
     await recomputeLineSummary(orderId, tx);
     await setOrderStatus(order, "completed", tx);
     return finish(orderId, tx);
+  }, TX_OPTIONS);
+}
+
+// --- Hold / resume (supervisor) -----------------------------------------------------------------------------------
+
+async function holdOrder(orderId, reason, actor) {
+  const text = String(reason || "").trim();
+  if (!text) throw httpError(400, "A reason is required to put an order on hold");
+  return prisma.$transaction(async (tx) => {
+    const order = await getOrderOrThrow(orderId, tx);
+    const notes = order.notes ? `${order.notes}\nOn hold: ${text}` : `On hold: ${text}`;
+    await setOrderStatus(order, "on_hold", tx, { heldFromStatus: order.status, holdReason: text.slice(0, 1000), notes });
+    return finish(orderId, tx);
+  }, TX_OPTIONS);
+}
+
+async function resumeOrder(orderId) {
+  return prisma.$transaction(async (tx) => {
+    const order = await getOrderOrThrow(orderId, tx);
+    if (order.status !== "on_hold" || !order.heldFromStatus) throw httpError(409, `Order ${order.orderNumber} is not on hold`);
+    await setOrderStatus(order, order.heldFromStatus, tx, { heldFromStatus: null, holdReason: null });
+    return finish(orderId, tx);
+  }, TX_OPTIONS);
+}
+
+// --- Pick list, pick scan, receive scan ---------------------------------------------------------------------------
+
+// The order's boxes in walking order: warehouse, rack, row, column (spec §6.2). Boxes not on a shelf come last.
+async function getPickList(orderId) {
+  const order = await getOrderOrThrow(orderId, prisma);
+  const lines = await prisma.orderLine.findMany({
+    where: { orderId, boxId: { not: null }, status: { not: "removed" } },
+    include: { box: { include: { slot: { include: { rack: { select: { code: true } }, warehouse: { select: { code: true } } } } } } },
+  });
+  const key = (l) => {
+    const s = l.box?.slot;
+    // same slot -> by box number, so the list is always in the same order
+    return s
+      ? [0, s.warehouse.code, s.rack.code, String(s.row).padStart(4, "0"), String(s.column).padStart(4, "0"), l.boxNumber || ""]
+      : [1, l.boxNumber || ""];
+  };
+  lines.sort((a, b) => {
+    const ka = key(a);
+    const kb = key(b);
+    for (let i = 0; i < Math.max(ka.length, kb.length); i++) {
+      if (ka[i] === kb[i]) continue;
+      return String(ka[i] ?? "").localeCompare(String(kb[i] ?? ""));
+    }
+    return 0;
+  });
+  return {
+    order: serializeOrder(order),
+    lines: lines.map((l) => ({
+      lineId: l.id,
+      boxId: l.boxId,
+      boxNumber: l.boxNumber,
+      barcode: l.box?.barcode,
+      description: l.box?.description,
+      lineStatus: l.status,
+      boxStatus: l.box?.status,
+      slotBarcode: l.box?.slot?.barcode,
+      location: l.box?.locationPath ?? undefined,
+      scannedAt: l.scannedAt?.toISOString(),
+    })),
+  };
+}
+
+// One box scanned while picking. Wrong / unknown box -> refused AND put in the supervisor queue. Scanning the same box
+// twice is fine. When the last box is picked the order becomes "ready".
+async function pickBox(orderId, rawCode, actor) {
+  const code = String(rawCode || "").trim();
+  if (!code) throw httpError(400, "Scan or type a box barcode");
+  const order = await getOrderOrThrow(orderId, prisma);
+  if (!["dispatch", "destruction"].includes(order.type)) throw httpError(400, "Only dispatch and destruction orders are picked");
+  if (!["in_progress", "ready"].includes(order.status)) {
+    throw httpError(409, `Order ${order.orderNumber} is ${order.status.replace(/_/g, " ")} — start picking first`);
+  }
+  const ref = { orderId: order.id, orderNumber: order.orderNumber, boxBarcode: code };
+  const box = await findBoxByCode(code);
+  if (!box) await refuseAndRecord(404, "box_not_found", actor, { ...ref, message: `No box has the barcode ${code}` });
+  const line = await prisma.orderLine.findFirst({ where: { orderId, boxId: box.id, status: { in: ["pending", "picked"] } } });
+  if (!line) {
+    await refuseAndRecord(409, "wrong_box", actor, { ...ref, boxId: box.id, message: `${box.boxNumber} is not on order ${order.orderNumber} — put it back` });
+  }
+
+  return prisma.$transaction(async (tx) => {
+    const taken = await tx.orderLine.updateMany({
+      where: { id: line.id, status: "pending" },
+      data: { status: "picked", scannedAt: new Date(), scannedBy: actor },
+    });
+    if (taken.count === 1) {
+      const updated = await tx.box.update({ where: { id: box.id }, data: { status: "picked" } });
+      await appendAuditEvent(updated, "picked", actor, { orderId: order.id, orderNumber: order.orderNumber, fromLocation: box.locationPath ?? undefined }, tx);
+      await recomputeLineSummary(orderId, tx);
+    }
+    const remaining = await tx.orderLine.count({ where: { orderId, boxId: { not: null }, status: "pending" } });
+    const current = await tx.order.findUnique({ where: { id: orderId } });
+    if (remaining === 0 && current.status === "in_progress") await setOrderStatus(current, "ready", tx);
+    return { order: await finish(orderId, tx), boxNumber: box.boxNumber, alreadyPicked: taken.count === 0, remaining };
+  }, TX_OPTIONS);
+}
+
+// One returning box scanned at the dock for a collection order.
+async function receiveReturnBox(orderId, rawCode, warehouseId, actor) {
+  const code = String(rawCode || "").trim();
+  if (!code) throw httpError(400, "Scan or type a box barcode");
+  const order = await getOrderOrThrow(orderId, prisma);
+  if (order.type !== "collection") throw httpError(400, "Only collection orders receive boxes");
+  if (order.status !== "in_progress") {
+    throw httpError(409, `Order ${order.orderNumber} is ${order.status.replace(/_/g, " ")} — start receiving first`);
+  }
+  const warehouse = await warehouseOrThrow(warehouseId, prisma);
+  const ref = { orderId: order.id, orderNumber: order.orderNumber, boxBarcode: code };
+  const box = await findBoxByCode(code);
+  if (!box) await refuseAndRecord(404, "box_not_found", actor, { ...ref, message: `No box has the barcode ${code}` });
+  const line = await prisma.orderLine.findFirst({ where: { orderId, boxId: box.id, status: { in: ["pending", "received"] } } });
+  if (!line) {
+    await refuseAndRecord(409, "wrong_box", actor, {
+      ...ref,
+      boxId: box.id,
+      message: `${box.boxNumber} is not on collection ${order.orderNumber} — keep it apart and tell a supervisor`,
+    });
+  }
+
+  return prisma.$transaction(async (tx) => {
+    const fresh = await tx.orderLine.findUnique({ where: { id: line.id }, include: { box: true } });
+    const alreadyReceived = fresh.status === "received";
+    if (!alreadyReceived) {
+      await receiveReturnLine(tx, order, fresh, warehouse, actor);
+      await recomputeLineSummary(orderId, tx);
+    }
+    const remaining = await tx.orderLine.count({ where: { orderId, boxId: { not: null }, status: "pending" } });
+    return { order: await finish(orderId, tx), boxNumber: box.boxNumber, alreadyReceived, remaining };
   }, TX_OPTIONS);
 }
 
@@ -494,4 +805,14 @@ module.exports = {
   authoriseDigitization,
   digitizeOrder,
   completeOrder,
+  holdOrder,
+  resumeOrder,
+  clientApproveOrder,
+  recordDelivery,
+  approveDestruction,
+  getPickList,
+  pickBox,
+  receiveReturnBox,
+  goodsInPath,
+  findBoxByCode,
 };

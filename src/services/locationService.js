@@ -207,30 +207,32 @@ async function listSlotsForRack(rackId) {
   return slots.map(serializeSimple);
 }
 
-// Staff UI unblock karte waqt "available"/"full" bhejti hai -- dono ka matlab "blocked nahi"; asli available/full
-// hamesha used/capacity se nikalta hai, freely set nahi hota.
-const SLOT_STATUS_INPUT = ["blocked", "available", "full"];
+// Slot states: available / full = ACTIVE (full is worked out from used vs capacity, never set by hand).
+// blocked / quarantined / inactive = LOCKED: no new boxes; the boxes already inside stay and keep counting.
+// The staff UI sends "available" or "full" to unlock -- both just mean "active again".
+const LOCK_STATES = ["blocked", "quarantined", "inactive"];
+const SLOT_STATUS_INPUT = [...LOCK_STATES, "available", "full"];
 
-// Block = naye boxes nahi aayenge; jo boxes andar hain wo wahin rehte hain, isliye `used` KABHI nahi chhuta (pehle
-// zero ho jaata tha aur slot khaali dikhta tha). Capacity jo andar rakha hai usse kam nahi ho sakti. Check + update
-// ek hi SQL statement me, taaki beech me koi box allocate ho jaye to bhi slot over-full na bane.
+// `used` is NEVER touched here (it used to be zeroed on block, so the cell looked empty). Capacity can't go below what
+// is stored. Check + update in one SQL statement, so a box allocated at the same moment can't over-fill the cell.
 async function updateSlot(slotId, patch, actor) {
   const slot = await prisma.slot.findUnique({ where: { id: slotId } });
   if (!slot) throw httpError(404, "Slot not found");
   if (patch.status !== undefined && !SLOT_STATUS_INPUT.includes(patch.status)) {
-    throw httpError(400, 'status must be "blocked", "available" or "full"');
+    throw httpError(400, `status must be one of: ${SLOT_STATUS_INPUT.join(", ")}`);
   }
   if (patch.capacity !== undefined && !(Number.isInteger(patch.capacity) && patch.capacity > 0)) {
     throw httpError(400, "capacity must be a positive whole number of centimetres");
   }
 
   const capacity = patch.capacity ?? slot.capacity;
-  const blocked = patch.status === undefined ? slot.status === "blocked" : patch.status === "blocked";
+  const wasLock = LOCK_STATES.includes(slot.status) ? slot.status : null;
+  const lock = patch.status === undefined ? wasLock : LOCK_STATES.includes(patch.status) ? patch.status : null;
   const changed = await prisma.$executeRaw`
     UPDATE "slot"
     SET "capacity" = ${capacity},
         "status" = CASE
-          WHEN ${blocked}::boolean THEN 'blocked'::"SlotStatus"
+          WHEN ${lock}::text IS NOT NULL THEN CAST(${lock}::text AS "SlotStatus")
           WHEN "used" >= ${capacity} THEN 'full'::"SlotStatus"
           ELSE 'available'::"SlotStatus" END,
         "updatedAt" = NOW()
@@ -241,13 +243,12 @@ async function updateSlot(slotId, patch, actor) {
   }
   const updated = await prisma.slot.findUnique({ where: { id: slotId } });
 
-  // History me sirf asli badlav (block/unblock, capacity) -- available <-> full apne aap hota hai, wo nahi.
-  const wasBlocked = slot.status === "blocked";
+  // History me sirf asli badlav (state, capacity) -- available <-> full apne aap hota hai, wo nahi.
   const changes = [];
   const said = [];
-  if (wasBlocked !== blocked) {
-    changes.push({ field: "blocked", from: wasBlocked, to: blocked });
-    said.push(blocked ? "blocked it" : "unblocked it");
+  if (wasLock !== lock) {
+    changes.push({ field: "state", from: wasLock ?? "active", to: lock ?? "active" });
+    said.push(lock ? `set to ${lock}` : `made active again (was ${wasLock})`);
   }
   if (slot.capacity !== updated.capacity) {
     changes.push({ field: "capacity", from: slot.capacity, to: updated.capacity });

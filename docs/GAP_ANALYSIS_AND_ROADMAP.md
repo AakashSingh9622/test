@@ -136,7 +136,7 @@ starts to cost money.
 | B4 | `patchSlot` turned every error into `404 Slot not found` | Misleading errors | ✅ Fixed (Sprint 1) |
 | B5 | Placing/releasing a box hold is admin-only in the UI but open to any staff in the API | The rule can be bypassed | Sprint 2 (with the role model) |
 | B6 | Staff login (`POST /api/auth/login`) has no rate limit | Password guessing against DocuSoft accounts | ⏸ Hardening (§6) |
-| B7 | Completing a collection order marks lines `received` but leaves the boxes `out` and writes no `received` event | Returned boxes look like they are still with the client until someone re-allocates them | Sprint 3 (return flow) |
+| B7 | Completing a collection order marked lines `received` but left the boxes `out` and wrote no `received` event | Returned boxes looked like they were still with the client until someone re-allocated them | ✅ Fixed (Sprint 3 return flow) |
 | B8 | `audit_event.boxId` is required, so warehouse/rack/slot/settings/role changes are never audited | Spec §12 requires audit of admin changes; needed once roles can be assigned | Sprint 2 |
 | B9 | `API.md` "does NOT do" section is out of date (portal login and order pagination exist) | Misleading for integrators | ✅ Fixed (Sprint 1) |
 
@@ -176,9 +176,9 @@ starts to cost money.
 |---|---|---|---|
 | Immutable `BoxId`, distinct printable barcode | UUID id; `BX########` barcode, unique | ✅ | Authorised re-label keeping the same id (Sprint 3) |
 | Lifecycle `REGISTERED → RECEIVED → STORED → RESERVED → PICKED → DISPATCHED → RETURN_PENDING → STORED` + `QUARANTINED`, `MISSING`, `PERMANENTLY_WITHDRAWN`, `DESTROYED` | `unallocated, stored, reserved, picked (unused), out, pending_destruction (unused), destroyed, missing, digitized` | 🟡 | Add `received`, `return_pending`, `quarantined`, `permanently_withdrawn`; make `picked` real (Sprint 3) |
-| Retention category at intake | Only a `destroyAfter` date | ❌ | Retention category on the box, linked to retention rules (Sprint 4) |
-| Contents and DMS links | — | ❌ | Basic content lines with optional DocuSoft document id (Sprint 5) |
-| Search and export | Search ✅ (case-insensitive contains); CSV export only in the browser for one page/history | 🟡 | Server-side CSV exports for inventory, movements, audit (Sprint 5) |
+| Retention category at intake | `box.retentionCategory` = code of a current retention rule | ✅ (Sprint 4) | — |
+| Contents and DMS links | `box_content` lines with optional DocuSoft document id; shown in the portal | ✅ (Sprint 5) | — |
+| Search and export | Search ✅; server-side streamed CSV for inventory, movements, audit, charges | ✅ (Sprint 5) | — |
 | Bulk import | — | ❌ | Later |
 
 ### 5.4 Retrieval, custody, requests (spec §4.3, §6.2–§6.3)
@@ -188,30 +188,30 @@ starts to cost money.
 | Request lifecycle `SUBMITTED → APPROVED → PICKING → READY → DISPATCHED/COLLECTED → RETURNED/CLOSED` + `CANCELLED`, `ON_HOLD`, `EXCEPTION` | `requested → approved → scheduled → in_progress → completed` + `cancelled`, `rejected` | 🟡 | Add `ready`, `on_hold`, `exception`; keep `scheduled` (Sprint 3) |
 | Each line has its own pick/dispatch/return state | Lines exist; no endpoint sets `picked`; dispatch completes all lines at once | 🟡 | Per-line pick scan; wrong box → exception (Sprint 3) |
 | Location-ordered pick list | Pick list page in the UI | 🟡 | Server sorts lines by warehouse/rack/row/column (Sprint 3) |
-| Handover records recipient, time, operator, proof reference | Recipient name only | 🟡 | `proofReference` (Stage 2) |
+| Handover records recipient, time, operator, proof reference | `order.delivery`: recipient, courier, tracking, dispatched at; then received by, proof reference, delivered at | ✅ (Later) | — |
 | Return: scan receipt, put away, close line | Separate collection order; boxes stay `out` (B7) | 🟡 | Return flow: `return_pending` → put-away (Sprint 3) |
 | Exceptions queue | Errors go back to the caller; nothing is queued | ❌ | `exception` table + supervisor queue (Sprint 3) |
-| Dispatch jobs / courier / manifests | — | ❌ | Stage 2 |
-| Customer notifications | — | ❌ | Stage 2 |
+| Dispatch jobs / courier / manifests | Courier + tracking on dispatch; printable delivery note | 🟡 | No separate dispatch-job/route planning |
+| Customer notifications | In-app (`notification` table; portal + staff dashboards) | 🟡 | Email later (decision 24 Oct: in-app for now) |
 
 ### 5.5 Customer portal (spec P1)
 
 | Spec requirement | Current state | Status |
 |---|---|---|
 | Self-service search, retrieval, status | Live: summary, boxes, box history, orders, create/cancel, authorise destruction/digitize; contact-level scoping; staff-only data stripped | ✅ |
-| Approvals by customer administrator | Main contact sees all orders; no approval step for other contacts' requests | 🟡 (Stage 2) |
-| Download certificate of destruction | — | ❌ (Sprint 4) |
-| Notifications | — | ❌ (Stage 2) |
+| Approvals by customer administrator | Destruction requests from ordinary contacts wait for the main contact's approval (decision: destruction only) | ✅ |
+| Download certificate of destruction | `certificate.html` (printable / save as PDF), linked from the completed order | ✅ |
+| Notifications | In-app "Updates" on the dashboard; email later | 🟡 |
 
 ### 5.6 Retention and destruction (spec §4.4)
 
 | Spec requirement | Current state | Status | Gap / action |
 |---|---|---|---|
-| Versioned retention rules, trigger dates, eligibility | `destroyAfter` per box | ❌ | `retention_rule` table (category, trigger, duration, version); eligibility calculation; "due for review" list |
-| Legal hold always overrides | Box-level `onHold` blocks new orders | 🟡 | `legal_hold` table (scope: box / client / retention category, authority, reason, start/end); only a records/compliance manager can release one; destruction hard-blocked while any hold applies |
-| Manifest → separate approver → operator confirms | Client types name + picks method; any staff marks destroyed; optional witness | 🟡 | Records manager prepares the manifest (the destruction order) → a **different** authorised person approves (enforced: approver ≠ preparer) → operator confirms physical destruction |
-| Certificate of destruction | Placeholder page only (`/print/destruction-certificate/[orderId]` is a stub); nothing stored | ❌ | See below |
-| A scheduled job may only *suggest* | No job | ❌ | "Due for destruction" suggestions only; never destroys automatically |
+| Versioned retention rules, trigger dates, eligibility | `retention_rule` (code, years, trigger, version); due-for-destruction list | ✅ (Sprint 4) | — |
+| Legal hold always overrides | `legal_hold` (box / client / category); records manager places/releases; blocks putting on and destroying | ✅ (Sprint 4) | — |
+| Manifest → separate approver → operator confirms | Client authorises → records manager (not the requester) approves → operator destroys | ✅ (Sprint 4) | — |
+| Certificate of destruction | `destruction_certificate`, frozen at completion; staff print page; portal page | ✅ (Sprint 4) | — |
+| A scheduled job may only *suggest* | "Due for destruction" review list, computed on request | ✅ | Never destroys automatically |
 
 **Certificate of destruction (new requirement from review).** Issued automatically when a destruction order is
 completed:
@@ -227,9 +227,12 @@ completed:
 - **Kept permanently** as audit/compliance proof, even though the boxes themselves are destroyed.
 - A PDF download can be added later if a print-to-PDF from the browser is not enough.
 
-### 5.7 Contracts, charge events, billing (spec §7) — to be built
+### 5.7 Contracts, charge events, billing (spec §7) — ✅ built (Sprints 5–6)
 
-All ❌. What gets built:
+Built as planned below, simplified for the prototype: rate cards (default + per client, dated) instead of separate
+contracts; no minimum fee or billing cycle field; storage prorated by day from the movement ledger (decision 24 Oct).
+Approving a billing run creates one draft invoice per client (the Sprint 7 invoice), sent to Sage as before. Original
+plan:
 
 - **Contracts and rate cards** per client, effective-dated: rate per charge type (intake, storage, retrieval,
   delivery, collection, scanning/digitizing, permanent withdrawal, destruction, other), per box size, minimum fee,
@@ -292,11 +295,18 @@ operational core, Sprints 4–6 add the features requested in the review.
 - Admin endpoint to assign/remove roles; audit of role and layout/settings changes (B8). FE: Users & roles screen
   (Settings → Users is currently a stub).
 
-**Sprint 3 — scan-driven operations**
+**Sprint 3 — scan-driven operations ✅ built** (backend, staff frontend, client-portal labels). 80 backend checks plus
+the Sprint 1/2/7 regressions pass. Order state `exception` was not added: mismatched scans go to the exception queue
+instead, and a supervisor can put the order on hold.
 - Location state split (active/blocked/quarantined/inactive); staging location.
 - Box statuses `received`, `return_pending`, `quarantined`, `permanently_withdrawn`.
 - Barcode-based put-away, per-line pick scan, location-ordered pick list, order states `ready`/`on_hold`/`exception`,
   return flow (B7), exception queue. FE: Pick and Receive screens.
+
+**Sprints 4, 5, 6 and Later ✅ built** (backend, staff frontend, client portal) — 92 backend checks for these, plus
+the Sprint 1/2/3/7 regressions (202 checks) pass. Decisions (24 Oct): notifications in-app only; storage prorated by
+days; client-admin approval for destruction requests only. Behaviour change: a destruction order now needs a records
+manager's approval (someone other than the requester) before it can be destroyed.
 
 **Sprint 4 — retention, legal hold, two-person destruction, certificate**
 - Retention rules + retention category on boxes; due-for-review list.
@@ -327,6 +337,8 @@ operational core, Sprints 4–6 add the features requested in the review.
 
 **Later — customer operations (spec P1)**
 - Customer-admin approval of contacts' requests, email notifications, dispatch jobs with courier and proof of delivery.
+  Built: main-contact approval of destruction requests, in-app notifications, courier/tracking + proof of delivery,
+  delivery note. Not yet: email.
 
 ---
 
@@ -342,7 +354,7 @@ operational core, Sprints 4–6 add the features requested in the review.
 | W06 retrieve and return, custody history | 🟡 | Sprint 3 |
 | W07 correction cannot erase history | 🟡 | Good enough for the prototype |
 | P01 portal retrieval | ✅ | — |
-| C01 legal hold + separate approvals + certificate | ❌ | Sprint 4 |
-| B01–B02 pricing, re-run billing without duplicates | ❌ | Sprints 5–6 |
-| S01–S04, ST01–ST03 Sage/Stripe | ❌ | Sprint 7 |
+| C01 legal hold + separate approvals + certificate | ✅ | Sprint 4 |
+| B01–B02 pricing, re-run billing without duplicates | ✅ | Sprints 5–6 |
+| S01–S04, ST01–ST03 Sage/Stripe | 🟡 (Sage built; Stripe read-only) | Sprint 7 |
 | SEC01 cross-tenant denial | ✅ by deployment (separate database per tenant) | — |

@@ -44,6 +44,8 @@ router.use(apiLimiter, requirePortalAuth);
 router.get("/auth/me", (req, res) => res.json(req.portal));
 
 router.get("/summary", asyncHandler(async (req, res) => res.json(await portal.summary(req.portal))));
+router.get("/notifications", asyncHandler(async (req, res) => res.json(await portal.listNotifications(req.portal, req.query))));
+router.get("/certificates", asyncHandler(async (req, res) => res.json(await portal.listCertificates(req.portal, req.query))));
 
 router.get("/boxes", asyncHandler(async (req, res) => res.json(await portal.listBoxes(req.portal, req.query))));
 router.get("/boxes/:boxId", asyncHandler(async (req, res) => res.json(await portal.getBox(req.portal, req.params.boxId))));
@@ -58,6 +60,14 @@ router.post(
   asyncHandler(async (req, res) => res.status(201).json(await portal.createOrder(req.portal, req.body)))
 );
 router.get("/orders/:orderId", asyncHandler(async (req, res) => res.json(await portal.getOrder(req.portal, req.params.orderId))));
+router.get(
+  "/orders/:orderId/certificate",
+  asyncHandler(async (req, res) => res.json(await portal.orderCertificate(req.portal, req.params.orderId)))
+);
+router.post(
+  "/orders/:orderId/client-approve",
+  asyncHandler(async (req, res) => res.json(await portal.clientApprove(req.portal, req.params.orderId)))
+);
 router.get(
   "/orders/:orderId/lines",
   asyncHandler(async (req, res) => res.json(await portal.orderLines(req.portal, req.params.orderId)))

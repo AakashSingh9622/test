@@ -16,6 +16,8 @@ const PERMISSIONS = [
   "orders.authorise", // record a client's destruction / digitizing authorisation
   "billing.view", // see invoices and the Sage settings
   "billing.manage", // prepare invoices, send them to Sage, change the Sage settings
+  "records.manage", // retention rules and legal holds
+  "records.approve", // the second signature on a destruction (must not be the person who prepared it)
 ];
 
 const ROLE_PERMISSIONS = {
@@ -23,7 +25,7 @@ const ROLE_PERMISSIONS = {
   warehouse_admin: ["layout.manage", "settings.manage", "audit.read", "boxes.operate", "boxes.hold", "orders.operate", "orders.approve"],
   operations_manager: ["audit.read", "boxes.operate", "orders.operate", "orders.approve", "orders.authorise"],
   staff_operator: ["boxes.operate", "orders.operate"],
-  records_manager: ["audit.read", "boxes.hold", "orders.authorise"],
+  records_manager: ["audit.read", "boxes.hold", "orders.authorise", "records.manage", "records.approve"],
   finance_manager: ["audit.read", "billing.view", "billing.manage"],
   auditor: ["audit.read", "billing.view"],
 };

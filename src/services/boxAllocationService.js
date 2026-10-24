@@ -46,17 +46,22 @@ async function reserveSlotSpace(db, slotId, cm) {
     UPDATE "slot"
     SET "used" = "used" + ${cm},
         "status" = CASE WHEN "used" + ${cm} >= "capacity" THEN 'full'::"SlotStatus" ELSE 'available'::"SlotStatus" END
-    WHERE "id" = ${slotId} AND "status" <> 'blocked'::"SlotStatus" AND "capacity" - "used" >= ${cm}`;
+    WHERE "id" = ${slotId} AND "status"::text IN ('available', 'full') AND "capacity" - "used" >= ${cm}`;
   return changed === 1;
 }
 
-// Slot ki `cm` jagah atomically wapas karta hai (kabhi 0 se neeche nahi jaata; blocked slot blocked hi rehta hai).
+// Locked = no new boxes (blocked / quarantined / inactive). Status is compared as TEXT in SQL, not cast to the enum,
+// so these statements also run on a database that doesn't have the newer enum values yet.
+const LOCKED_SLOT_STATUSES = ["blocked", "quarantined", "inactive"];
+const isActiveSlot = (slot) => !LOCKED_SLOT_STATUSES.includes(slot.status);
+
+// Slot ki `cm` jagah atomically wapas karta hai (kabhi 0 se neeche nahi jaata; locked slot locked hi rehta hai).
 async function releaseSlotSpace(db, slotId, cm) {
   await db.$executeRaw`
     UPDATE "slot"
     SET "used" = GREATEST("used" - ${cm}, 0),
         "status" = CASE
-          WHEN "status" = 'blocked'::"SlotStatus" THEN "status"
+          WHEN "status"::text IN ('blocked', 'quarantined', 'inactive') THEN "status"
           WHEN GREATEST("used" - ${cm}, 0) >= "capacity" THEN 'full'::"SlotStatus"
           ELSE 'available'::"SlotStatus" END
     WHERE "id" = ${slotId}`;
@@ -83,16 +88,23 @@ async function allocateBoxes({ allocations, reason }, actor) {
       if (!box) throw httpError(404, `Box ${boxId} not found`);
       if (!slot) throw httpError(404, `Slot ${slotId} not found`);
       if (box.status === "destroyed") throw httpError(400, `Box ${box.boxNumber} is destroyed`);
-      if (slot.status === "blocked") throw httpError(400, `Slot ${slot.code} is blocked`);
+      if (box.status === "permanently_withdrawn") throw httpError(400, `Box ${box.boxNumber} was permanently withdrawn by the client`);
+      if (box.status === "return_pending") {
+        throw httpError(400, `Box ${box.boxNumber} is still with the client — receive it on its collection order first`);
+      }
+      if (!isActiveSlot(slot)) throw httpError(400, `Slot ${slot.code} is ${slot.status}`);
 
       const units = unitsFor(box);
       const alreadyHere = box.slotId === slot.id;
       const wasAllocatedElsewhere = !!box.slotId && !alreadyHere;
+      const fromGoodsIn = box.status === "received";
       const fromLocation = box.locationPath;
-      // Ledger ke liye purane slot ka warehouse bhi chahiye (sirf move par).
+      // Ledger ke liye purani jagah ka warehouse bhi chahiye: move par purana slot, Goods-In se aaye to wo warehouse.
       const fromSlot = wasAllocatedElsewhere
         ? await tx.slot.findUnique({ where: { id: box.slotId }, select: { id: true, warehouseId: true } })
-        : null;
+        : fromGoodsIn && box.goodsInWarehouseId
+          ? { id: undefined, warehouseId: box.goodsInWarehouseId }
+          : null;
 
       if (!alreadyHere) {
         // Pehle nayi jagah lo (atomic) -- mili tabhi purani chhodo, warna box kahin ka na rahe.
@@ -101,15 +113,22 @@ async function allocateBoxes({ allocations, reason }, actor) {
       }
 
       const locationPath = await locationPathForSlot(slot, tx);
-      // Reserved/picked boxes (kisi order par) move karne par apna status rakhte hain; sirf unallocated/out -> stored.
+      // Reserved/picked/quarantined boxes move karne par apna status rakhte hain; unallocated/received/out -> stored.
       // A missing box that is placed in a slot has been found: it becomes stored again.
       const wasMissing = box.status === "missing";
-      // (a found box that had been digitized goes back to "digitized")
-      const status = box.status === "unallocated" || box.status === "out" || wasMissing ? (box.digitizedAt ? "digitized" : "stored") : box.status;
+      const comesIntoStorage = ["unallocated", "received", "out"].includes(box.status) || wasMissing;
+      // (a box that had been digitized goes back to "digitized")
+      const status = comesIntoStorage ? (box.digitizedAt ? "digitized" : "stored") : box.status;
       // Box ko sirf tab badlo jab wo abhi bhi wahi hai jo humne padha tha (kisi aur ne beech me move na kar diya ho).
       const moved = await tx.box.updateMany({
-        where: { id: box.id, slotId: box.slotId },
-        data: { slotId: slot.id, locationPath, status, ...(wasMissing && { missingReason: null, missingAt: null }) },
+        where: { id: box.id, slotId: box.slotId, status: box.status },
+        data: {
+          slotId: slot.id,
+          locationPath,
+          status,
+          ...(wasMissing && { missingReason: null, missingAt: null }),
+          ...(fromGoodsIn && { goodsInWarehouseId: null }),
+        },
       });
       if (moved.count !== 1) throw httpError(409, `Box ${box.boxNumber} was changed by someone else -- please retry`);
       const updated = await tx.box.findUnique({ where: { id: box.id } });
@@ -127,7 +146,7 @@ async function allocateBoxes({ allocations, reason }, actor) {
           box,
           wasAllocatedElsewhere ? "transfer" : wasMissing ? "found" : "put_away",
           actor,
-          { from: fromSlot, to: slot, fromLocation: wasAllocatedElsewhere ? fromLocation : undefined, toLocation: locationPath, reason },
+          { from: fromSlot, to: slot, fromLocation: wasAllocatedElsewhere || fromGoodsIn ? fromLocation : undefined, toLocation: locationPath, reason },
           tx
         );
       }
@@ -147,5 +166,7 @@ module.exports = {
   releaseSlotSpace,
   releaseBoxSlot,
   RELEASED_BOX_FIELDS,
+  LOCKED_SLOT_STATUSES,
+  isActiveSlot,
   allocateBoxes,
 };

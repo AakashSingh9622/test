@@ -3,6 +3,7 @@ const boxService = require("../services/boxService");
 const { allocateBoxes } = require("../services/boxAllocationService");
 const { suggestSlotsForBoxes } = require("../services/slotSuggestionService");
 const { listMovementsForBox } = require("../services/movementService");
+const contents = require("../services/boxContentService");
 const { actorFromReq } = require("../utils/actor");
 
 function parseStatusArray(q) {
@@ -99,6 +100,39 @@ async function releaseBoxHold(req, res) {
   res.json(await boxService.releaseBoxHold(req.params.boxId, actorFromReq(req)));
 }
 
+async function receiveAtGoodsIn(req, res) {
+  const { barcode, warehouseId } = req.body || {};
+  res.json(await boxService.receiveAtGoodsIn(barcode, warehouseId, actorFromReq(req)));
+}
+
+async function putAway(req, res) {
+  res.json(await boxService.putAwayByBarcode(req.body || {}, actorFromReq(req)));
+}
+
+async function quarantineBox(req, res) {
+  res.json(await boxService.quarantineBox(req.params.boxId, (req.body || {}).reason, actorFromReq(req)));
+}
+
+async function releaseQuarantine(req, res) {
+  res.json(await boxService.releaseQuarantine(req.params.boxId, actorFromReq(req)));
+}
+
+async function listContents(req, res) {
+  res.json(await contents.listContents(req.params.boxId));
+}
+
+async function addContent(req, res) {
+  res.status(201).json(await contents.addContent(req.params.boxId, req.body || {}, actorFromReq(req)));
+}
+
+async function removeContent(req, res) {
+  res.json(await contents.removeContent(req.params.boxId, req.params.contentId, actorFromReq(req)));
+}
+
+async function relabelBox(req, res) {
+  res.json(await boxService.relabelBox(req.params.boxId, (req.body || {}).reason, actorFromReq(req)));
+}
+
 async function markBoxMissing(req, res) {
   const { note } = req.body || {};
   if (!note) return res.status(400).json({ message: "note is required" });
@@ -118,4 +152,12 @@ module.exports = {
   placeBoxHold,
   releaseBoxHold,
   markBoxMissing,
+  receiveAtGoodsIn,
+  putAway,
+  quarantineBox,
+  releaseQuarantine,
+  relabelBox,
+  listContents,
+  addContent,
+  removeContent,
 };

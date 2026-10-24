@@ -13,6 +13,14 @@ const {
   placeBoxHold,
   releaseBoxHold,
   markBoxMissing,
+  receiveAtGoodsIn,
+  putAway,
+  quarantineBox,
+  releaseQuarantine,
+  relabelBox,
+  listContents,
+  addContent,
+  removeContent,
 } = require("../controllers/boxController");
 const { requireAuth } = require("../middleware/authMiddleware");
 const { requirePermission } = require("../middleware/requirePermission");
@@ -27,6 +35,9 @@ router.get("/", asyncHandler(listBoxes));
 router.post("/batch", operate, asyncHandler(createBoxesBatch));
 router.post("/mark-label-printed", operate, asyncHandler(markLabelsPrinted));
 router.post("/allocate-batch", operate, asyncHandler(allocateBatch));
+// Scan flows: a registered box arrives at Goods-In; box + slot barcode puts it on a shelf.
+router.post("/receive", operate, asyncHandler(receiveAtGoodsIn));
+router.post("/put-away", operate, asyncHandler(putAway));
 router.get("/:boxId", asyncHandler(getBox));
 router.get("/:boxId/orders", asyncHandler(getBoxOrders));
 router.get("/:boxId/movements", asyncHandler(getBoxMovements));
@@ -34,5 +45,11 @@ router.patch("/:boxId", operate, asyncHandler(updateBoxDetails));
 router.post("/:boxId/hold", requirePermission("boxes.hold"), asyncHandler(placeBoxHold));
 router.delete("/:boxId/hold", requirePermission("boxes.hold"), asyncHandler(releaseBoxHold));
 router.post("/:boxId/missing", operate, asyncHandler(markBoxMissing));
+router.post("/:boxId/quarantine", requirePermission("boxes.hold"), asyncHandler(quarantineBox));
+router.delete("/:boxId/quarantine", requirePermission("boxes.hold"), asyncHandler(releaseQuarantine));
+router.post("/:boxId/relabel", operate, asyncHandler(relabelBox));
+router.get("/:boxId/contents", asyncHandler(listContents));
+router.post("/:boxId/contents", operate, asyncHandler(addContent));
+router.delete("/:boxId/contents/:contentId", operate, asyncHandler(removeContent));
 
 module.exports = router;

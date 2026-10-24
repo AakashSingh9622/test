@@ -13,7 +13,7 @@ async function suggestSlotsForBoxes({ clientId, boxSizes, warehouseId, preferSlo
   const totalUnits = unitsFor(boxSizes, await getBoxSizes());
   if (totalUnits <= 0) return [];
 
-  const where = { status: { not: "blocked" } };
+  const where = { status: { in: ["available", "full"] } }; // only active slots (not blocked / quarantined / inactive)
   if (warehouseId) where.warehouseId = warehouseId;
   // rack + warehouse ek hi query me -- locationPath banane ke liye alag lookups nahi chahiye.
   const candidateSlots = await prisma.slot.findMany({ where, include: { rack: true, warehouse: true } });
