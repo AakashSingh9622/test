@@ -27,7 +27,7 @@ async function listRacks(req, res) {
 }
 
 async function createRack(req, res) {
-  const { code, label, rows, columns, cellLength, lengthUnit } = req.body || {};
+  const { code, label, rows, columns, cellLength, lengthUnit, zoneId, aisleId } = req.body || {};
   if (!code || !label || !rows || !columns || !cellLength) {
     return res.status(400).json({ message: "code, label, rows, columns, and cellLength are required" });
   }
@@ -47,6 +47,8 @@ async function createRack(req, res) {
     columns: Number(columns),
     cellLength: Number(cellLength),
     lengthUnit: lengthUnit || "cm",
+    zoneId,
+    aisleId,
   }, actorFromReq(req));
   res.status(201).json(rack);
 }
@@ -57,17 +59,24 @@ async function getRack(req, res) {
   res.json(rack);
 }
 
+// Any of: cellLength (+ lengthUnit), label, zoneId, aisleId (null / "" = take it out of its zone / aisle).
 async function patchRack(req, res) {
-  const { cellLength, lengthUnit } = req.body || {};
-  if (!(Number(cellLength) > 0)) {
+  const { cellLength, lengthUnit, label, zoneId, aisleId } = req.body || {};
+  if (cellLength === undefined && label === undefined && zoneId === undefined && aisleId === undefined) {
+    return res.status(400).json({ message: "Send cellLength, label, zoneId or aisleId" });
+  }
+  if (cellLength !== undefined && !(Number(cellLength) > 0)) {
     return res.status(400).json({ message: "cellLength must be a positive number" });
   }
   if (lengthUnit !== undefined && !["cm", "ft"].includes(lengthUnit)) {
     return res.status(400).json({ message: 'lengthUnit must be "cm" or "ft"' });
   }
   const rack = await locationService.updateRack(req.params.rackId, {
-    cellLength: Number(cellLength),
+    cellLength: cellLength === undefined ? undefined : Number(cellLength),
     lengthUnit: lengthUnit || "cm",
+    label,
+    zoneId,
+    aisleId,
   }, actorFromReq(req));
   if (!rack) return res.status(404).json({ message: "Rack not found" });
   res.json(rack);
@@ -86,7 +95,59 @@ async function patchSlot(req, res) {
   res.json(await locationService.updateSlot(req.params.slotId, req.body || {}, actorFromReq(req)));
 }
 
+// --- Zones, aisles, find by code (Sprint 10) ---
+
+async function getWarehouseLayout(req, res) {
+  const warehouse = await locationService.getWarehouseById(req.params.warehouseId);
+  if (!warehouse) return res.status(404).json({ message: "Warehouse not found" });
+  res.json(await locationService.warehouseLayout(req.params.warehouseId));
+}
+
+async function createZone(req, res) {
+  const { code, name } = req.body || {};
+  res.status(201).json(await locationService.createZone(req.params.warehouseId, { code, name }, actorFromReq(req)));
+}
+
+async function patchZone(req, res) {
+  const { code, name } = req.body || {};
+  res.json(await locationService.updateZone(req.params.zoneId, { code, name }, actorFromReq(req)));
+}
+
+async function removeZone(req, res) {
+  await locationService.deleteZone(req.params.zoneId, actorFromReq(req));
+  res.status(204).end();
+}
+
+async function createAisle(req, res) {
+  const { code, name, zoneId } = req.body || {};
+  res.status(201).json(await locationService.createAisle(req.params.warehouseId, { code, name, zoneId }, actorFromReq(req)));
+}
+
+async function patchAisle(req, res) {
+  const { code, name, zoneId } = req.body || {};
+  res.json(await locationService.updateAisle(req.params.aisleId, { code, name, zoneId }, actorFromReq(req)));
+}
+
+async function removeAisle(req, res) {
+  await locationService.deleteAisle(req.params.aisleId, actorFromReq(req));
+  res.status(204).end();
+}
+
+// GET /api/locations/resolve?code=B04-3&needCm=80&warehouseId=
+async function resolveLocation(req, res) {
+  const { code, warehouseId, needCm } = req.query;
+  res.json(await locationService.resolveLocation(code, { warehouseId: warehouseId || undefined, needCm: Number(needCm) || 0 }));
+}
+
 module.exports = {
+  getWarehouseLayout,
+  createZone,
+  patchZone,
+  removeZone,
+  createAisle,
+  patchAisle,
+  removeAisle,
+  resolveLocation,
   listWarehouses,
   createWarehouse,
   getWarehouse,

@@ -75,19 +75,34 @@ both the same way: HTTP status code is authoritative, `message` is for display.)
 
 ---
 
-## Warehouses / Racks / Slots
+## Warehouses / Zones / Aisles / Racks / Slots
+
+Hierarchy warehouse → zone → aisle → rack → shelf → position (Sprint 10). **Zone and aisle are optional** labels on the
+rack (an aisle sits in a zone or straight in the warehouse; a rack in an aisle carries the aisle's zone). **Shelf = the
+rack's row, position = the cell (slot)** — slots, capacity and barcodes are unchanged. Rack codes of new racks are unique
+across all warehouses, so `B04-3` finds a shelf on its own.
 
 ```text
 GET    /api/warehouses                              -> Warehouse[]
 POST   /api/warehouses        {code,name,address?}   -> Warehouse            (staff_admin only, 201)
 GET    /api/warehouses/:id                           -> Warehouse
 GET    /api/warehouses/:id/racks                     -> Rack[]
-POST   /api/warehouses/:id/racks  { code, label, rows, columns, cellLength, lengthUnit?: "cm" | "ft" }
+POST   /api/warehouses/:id/racks  { code, label, rows, columns, cellLength, lengthUnit?: "cm" | "ft", zoneId?, aisleId? }
        # every row x column cell is ONE storage location (slot) of length `cellLength` (feet are converted
        # to whole centimetres and stored); no sub-slots. Response Rack includes cellLengthCm.
                                                       -> Rack                 (staff_admin only, 201)
                                                       — also creates rows×columns Slot documents
-GET    /api/racks/:id                                -> Rack
+GET    /api/warehouses/:id/layout                    -> { zones: Zone[], aisles: Aisle[], racks: Rack[] }
+       # one call for the browse picker / warehouse page; zones and aisles carry rackCount, usedCapacity, totalCapacity
+POST   /api/warehouses/:id/zones   { code, name? }              -> Zone    (layout.manage, 201; code unique per warehouse)
+POST   /api/warehouses/:id/aisles  { code, name?, zoneId? }     -> Aisle   (layout.manage, 201; code unique per warehouse)
+PATCH  /api/zones/:id              { code?, name? }             -> Zone    (layout.manage)
+PATCH  /api/aisles/:id             { code?, name?, zoneId? }    -> Aisle   (layout.manage; its racks move with it)
+DELETE /api/zones/:id | /api/aisles/:id                         -> 204     (409 while it still has racks / aisles)
+GET    /api/locations/resolve?code=&needCm=&warehouseId=        -> LocationLookup   (any staff)
+       # "B04-3" shelf (suggestedSlotId = best fit for needCm), "B04-3-2" position, a slot barcode, or "B04" rack;
+       # read from the right, so rack codes with dashes work. kind: position | shelf | rack | ambiguous | not_found
+GET    /api/racks/:id                                -> Rack (with zone / aisle objects)
 GET    /api/racks/:id/slots                          -> Slot[]
 PATCH  /api/slots/:id         { status?, capacity? (cm) }  -> Slot   (staff_admin only)
 POST   /api/slots/suggest     SuggestSlotsInput       -> SlotSuggestion[]
@@ -96,8 +111,12 @@ POST   /api/slots/suggest     SuggestSlotsInput       -> SlotSuggestion[]
 ```ts
 interface Warehouse { id: string; code: string; name: string; address?: string;
   rackCount: number; slotCount: number; usedCapacity: number; totalCapacity: number }
-interface Rack { id: string; warehouseId: string; code: string; label: string;
-  rows: number; columns: number; cellLengthCm: number; usedCapacity: number; totalCapacity: number }
+interface Rack { id: string; warehouseId: string; zoneId?: string; aisleId?: string; code: string; label: string;
+  rows: number /* shelves */; columns: number /* positions per shelf */; cellLengthCm: number;
+  usedCapacity: number; totalCapacity: number }
+interface Zone { id: string; warehouseId: string; code: string; name?: string; rackCount?: number;
+  usedCapacity?: number; totalCapacity?: number }
+interface Aisle extends Zone { zoneId?: string }
 interface Slot { id: string; rackId: string; warehouseId: string; code: string; barcode: string;
   row: number; column: number; capacity: number /* cm */; used: number /* cm of boxes inside */;
   status: "available" | "full" | "blocked" }
@@ -151,7 +170,8 @@ interface Box {
   filingDateFrom: string; filingDateTo?: string; destroyAfter?: string; // ISO date strings
   size: BoxSize; status: BoxStatus; onHold: boolean; holdReason?: string; labelPrinted: boolean;
   slotId?: string;
-  locationPath?: { warehouse: string; rack: string; slot: string }; // set once status is "stored"
+  // set once status is "stored"; zone / aisle / shelf / position since Sprint 10 (older rows: warehouse, rack, slot)
+  locationPath?: { warehouse: string; zone?: string; aisle?: string; rack: string; slot: string; shelf?: number; position?: number };
   openOrder?: { id: string; orderNumber: string; type: OrderType; status: OrderStatus }; // set once "reserved"
   createdAt: string; createdBy: { id: string; name: string; side: "staff" | "client" | "system" };
 }
@@ -274,18 +294,48 @@ interface CreateOrderInput {
 ### Order lifecycle
 
 ```
-requested ──approve──> approved ──schedule──> scheduled ──start──> in_progress ──┐
-    │                      │                       │                             │
-  reject                cancel                  cancel                      (type-specific
-    │                      │                       │                        completion action
-    v                      v                       v                        below) ──> completed
- rejected               cancelled               cancelled
+requested ──approve──> billing ──schedule*──> scheduled ──start──> in_progress ──┐
+    │                     │                       │                              │
+  reject               cancel                  cancel                       (type-specific
+    │                     │                       │                         completion action
+    v                     v                       v                         below) ──> completed
+ rejected              cancelled               cancelled
+                        * only once billing is paid or waived (409 otherwise)
 ```
 
-Every order created through `POST /api/orders` from this backend is **staff-created**, so it
-always starts at `approved` (skipping `requested`) — `requested` only happens for `portal`-origin
-orders, which aren't created by this API yet (portal isn't wired up). Any transition not shown
-above → `409 invalid_transition`.
+Orders created through `POST /api/orders` (staff) start at `billing`; portal requests start at `requested` and go to
+`billing` when approved. `approved` exists only on orders from before the billing stage — they can still be scheduled.
+Any transition not shown above → `409 invalid_transition` (plus `on_hold` / resume and `ready`, see Sprint 3).
+
+**Billing stage** (`order.billing`): `awaiting_invoice` → `invoice_draft` → `awaiting_payment` → `paid`; with
+"payment not required" (on account) → `awaiting_acknowledgement` → `acknowledged`; or `waived`. Settled = paid /
+acknowledged / waived.
+
+```text
+POST /api/invoices { orderId, clientId, clientName, invoiceDate, dueDate, lines, ... }   billing.manage — the order's invoice
+     (one per order, same client; every line points at the order). Deleting the draft -> awaiting_invoice again.
+POST /api/invoices/:id/issued { ..., grossTotal?, currency?, stripeCustomerId? }      -> awaiting_payment (amount = grossTotal, else net)
+POST /api/orders/:id/billing/payment { method: bank_transfer|card|other, reference?, amount?, note? }  billing.manage -> paid
+POST /api/orders/:id/billing/waive   { reason }                                        billing.manage -> waived
+POST /api/orders/:id/billing/payment-required { required }   billing.manage — false = on account: acknowledge, don't pay
+POST /api/orders/:id/billing/acknowledge      { note? }      billing.manage — the client acknowledged (email / phone)
+POST /api/portal/orders/:id/acknowledge-invoice               the client acknowledges in the portal -> acknowledged
+
+POST /api/invoices/:id/payments { amount, method, reference?, date?, note? }  billing.manage — any invoice in Sage, part
+     payments allowed; a fully paid order invoice also pays its order
+GET  /api/invoices/sage-sync?clientId=   -> invoices to check in Sage    POST /api/invoices/sage-sync
+     { items: [{ invoiceId, totalAmount, outstandingAmount }] } -> { updated, ordersPaid }   ("Update from Sage")
+GET  /api/billing/accounts?from&to&q&page   -> { items: [{ clientId, clientName, invoices, paidInvoices, unpaidInvoices,
+     invoiced, paid, outstanding, balance, overdue, lastInvoiceDate }], total, totals }   (billing.view)
+GET  /api/billing/accounts/:clientId?from&to -> { summary, items, earlierUnpaid, drafts }   one client's statement
+POST /api/portal/orders/:id/payment  { paymentIntentId, amount (minor units), currency }  card paid in the portal -> paid
+```
+
+The portal charges the card through DocuSoft's Stripe proxy (`attachCard` + `makePayment`) and then reports it; the
+amount must equal the invoice total. Repeating the same `paymentIntentId` is harmless; a different one on a paid order
+is `409`. The monthly charge run skips an order billed at this stage (invoice issued / paid); a waived order is charged.
+Phase 1: invoice lines are typed by finance; prefilling them from the rate card comes later. Invoices carry `amountPaid`,
+`outstanding`, `paidAt`, `payments` and `sageSyncedAt`; the standing accounts count invoices in Sage (`issued`) only.
 
 Type-specific completion, once `in_progress`:
 - **dispatch** → `POST /:id/dispatch` (needs `recipientName`) — releases each box's slot, box
@@ -565,7 +615,14 @@ request — loop over pages (the frontend does this for CSV exports).
 
 Extra filters: `GET /api/boxes?rackId=&row=` (boxes stored in a rack / one row of it).
 `GET /api/racks/:id/rows` -> `[{ row, boxCount, onOrderCount }]` (one SQL aggregate for the rack page).
-`PATCH /api/racks/:id { cellLength, lengthUnit? }` (staff_admin) changes the cell length of every cell in the rack.
+`PATCH /api/racks/:id { cellLength?, lengthUnit?, label?, zoneId?, aisleId? }` (layout.manage) changes the cell length of
+every cell in the rack and / or its label and place (`null` = out of its zone / aisle; an aisle decides the zone). A new
+zone / aisle — or renaming one — rewrites the **current** `locationPath` of the boxes on those racks in the same
+transaction; history (audit, movements, order lines) is never rewritten. `npm run locations:refresh -- --apply` does
+the same for every stored box once (old `rack: "B-04"` labels become the real code `B04`).
+
+`POST /api/boxes/put-away { boxBarcode, slotBarcode }` also takes a shelf / position code (`B04-3`, `B04-3-2`): a shelf
+goes to its best-fitting position; a code in two warehouses is refused (scan the position label) and queued.
 
 ## Orders belong to a client contact (clientId + contactEmail)
 
@@ -609,6 +666,8 @@ Token lifetime: `PORTAL_TOKEN_TTL_MINUTES` (default 60) — call login again whe
 | `POST /orders` | request an order (always status `requested`, for this client + this contact). Body: `type`, `boxIds`, `address`, `expectedNewBoxes`, `scheduledFor`, `contactPhone`, `notes`; destruction also needs `destructionAuthorisation: { name, method }` |
 | `POST /orders/:id/cancel` | only while `requested` |
 | `POST /orders/:id/authorise-destruction` | `{ name, method }` for a staff-created destruction order waiting for the client |
+| `POST /orders/:id/payment` | billing stage: the card payment made on the order page (`{ paymentIntentId, amount, currency }`). `GET /orders?awaitingPayment=true` lists orders to pay; `/summary` has `orders.awaitingPayment`; orders carry `billing` (status, invoice number, amount, currency, and `stripeCustomerId` while waiting for payment) |
+| `POST /orders/:id/acknowledge-invoice` | billing stage, payment not required (on account): the client acknowledges the invoice instead of paying; listed under `awaitingPayment=true` too |
 | `POST /orders/:id/client-approve` | main contact only: approve a destruction asked for by another contact (it waits for this before the warehouse can approve). `GET /orders?needsMyApproval=true` lists them; `/summary` has `orders.needsMyApproval` |
 | `GET /orders/:id/certificate` · `GET /certificates` | certificate of destruction (client copy, no staff names) |
 | `GET /notifications?page&pageSize` | in-app updates on this contact's orders (main contact: all of the client's) |

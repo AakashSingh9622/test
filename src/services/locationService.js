@@ -1,8 +1,10 @@
-// Warehouse -> Rack -> Slot business logic. rackCount/slotCount/usedCapacity/totalCapacity
+// Warehouse -> (Zone -> Aisle, optional) -> Rack -> Slot business logic. rackCount/slotCount/usedCapacity/totalCapacity
 // Warehouse aur Rack rows me store NAHI hote (prisma/schema.prisma dekho) -- yahan slot rows
 // se on-read aggregate karke attach kiye jaate hain, taaki asli data se kabhi out-of-sync na ho.
 const prisma = require("../config/prisma");
+const { Prisma } = require("../config/prisma");
 const { serializeSimple } = require("../utils/serialize");
+const { pathFor } = require("../utils/locationPath");
 const { toCentimetres } = require("../utils/dimensions");
 const httpError = require("../utils/httpError");
 const { appendAdminEvent } = require("./adminAuditService");
@@ -81,25 +83,34 @@ async function getWarehouseById(id) {
 // Har cell (row x column) khud ek storage location (slot) hai, uske andar koi sub-slot nahi. User har
 // cell ki length cm ya feet me deta hai (cellLength + lengthUnit); DB me whole centimetres store hote hain
 // aur wahi us cell ki capacity hai. Seed script (src/scripts/seed.js) jaisa hi slot code/barcode convention.
-async function createRack(warehouseId, { code, label, rows, columns, cellLength, lengthUnit }, actor) {
+async function createRack(warehouseId, { code, label, rows, columns, cellLength, lengthUnit, zoneId, aisleId }, actor) {
   const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId } });
   if (!warehouse) throw new Error(`Warehouse ${warehouseId} not found`);
 
-  // Same warehouse ke andar ek jaisa rack code dobara allow nahi -- DB me bhi unique constraint
-  // hai (safety net), par ye pehle hi check karke ek clear, specific error deta hai.
+  // Rack code ab SAARE warehouses me unique (Sprint 10) -- taaki "B04-3" akela hi shelf dhoondh le. DB sirf ek
+  // warehouse ke andar enforce karta hai (purane racks me alag warehouses me same code ho sakta hai).
   const trimmedCode = code.trim();
-  const existingRack = await prisma.rack.findUnique({
-    where: { warehouseId_code: { warehouseId, code: trimmedCode } },
+  if (/^\d+$/.test(trimmedCode)) {
+    throw httpError(400, "A rack code needs at least one letter (e.g. B04), so B04-3 can't be mistaken for a shelf");
+  }
+  const existingRack = await prisma.rack.findFirst({
+    where: { code: { equals: trimmedCode, mode: "insensitive" } },
+    include: { warehouse: { select: { code: true } } },
   });
   if (existingRack) {
-    const err = new Error(`Rack code "${trimmedCode}" already exists in this warehouse`);
-    err.status = 409;
-    throw err;
+    throw httpError(
+      409,
+      `Rack code "${existingRack.code}" is already used in ${existingRack.warehouse.code} — rack codes must be unique across warehouses`
+    );
   }
+  const placement = await rackPlacement(warehouseId, { zoneId: zoneId || null, aisleId: aisleId || null });
+  const where = await placementText(placement);
 
   const cellLengthCm = toCentimetres(cellLength, lengthUnit); // galat unit/value par error (controller 400 deta hai)
   const rack = await prisma.$transaction(async (tx) => {
-    const created = await tx.rack.create({ data: { warehouseId, code: trimmedCode, label, rows, columns, cellLengthCm } });
+    const created = await tx.rack.create({
+      data: { warehouseId, code: trimmedCode, label, rows, columns, cellLengthCm, ...placement },
+    });
     const slots = [];
     for (let row = 1; row <= rows; row++) {
       for (let col = 1; col <= columns; col++) {
@@ -123,7 +134,7 @@ async function createRack(warehouseId, { code, label, rows, columns, cellLength,
       {
         entityType: "rack",
         entityId: created.id,
-        summary: `Added rack ${trimmedCode} to ${warehouse.code}: ${rows} × ${columns} cells of ${cellLengthCm} cm`,
+        summary: `Added rack ${trimmedCode} to ${warehouse.code}${where}: ${rows} × ${columns} cells of ${cellLengthCm} cm`,
       },
       tx
     );
@@ -133,13 +144,15 @@ async function createRack(warehouseId, { code, label, rows, columns, cellLength,
   return withCapacity(rack, { usedCapacity: 0, totalCapacity: cellLengthCm * rows * columns });
 }
 
-// Rack ki cell length badalta hai: rack.cellLengthCm aur uske SAARE slots ki capacity ek saath update
-// (har cell ek hi length ka hai). Agar kisi cell me already utna saaman hai jo nayi length me nahi
-// aayega to 409 -- pehle wo boxes hatao. Status (available/full) used/capacity se recompute hota hai,
-// blocked cells blocked hi rehte hain.
-async function updateRack(rackId, { cellLength, lengthUnit }, actor) {
+// Rack ki cell length / label / zone / aisle badalta hai (jo bheja wahi). Cell length: rack.cellLengthCm aur uske SAARE
+// slots ki capacity ek saath update (har cell ek hi length ka hai). Agar kisi cell me already utna saaman hai jo nayi
+// length me nahi aayega to 409 -- pehle wo boxes hatao. Status (available/full) used/capacity se recompute hota hai,
+// blocked cells blocked hi rehte hain. Zone / aisle badle to rack ke boxes ki stored location bhi (updateRackDetails).
+async function updateRack(rackId, { cellLength, lengthUnit, label, zoneId, aisleId }, actor) {
   const rack = await prisma.rack.findUnique({ where: { id: rackId } });
   if (!rack) return null;
+  await updateRackDetails(rack, { label, zoneId, aisleId }, actor);
+  if (cellLength === undefined) return getRackById(rackId);
   const cellLengthCm = toCentimetres(cellLength, lengthUnit);
 
   await prisma.$transaction(async (tx) => {
@@ -197,9 +210,14 @@ async function rackRowStats(rackId) {
 }
 
 async function getRackById(id) {
-  const rack = await prisma.rack.findUnique({ where: { id } });
+  const rack = await prisma.rack.findUnique({ where: { id }, include: { zone: true, aisle: true } });
   if (!rack) return null;
-  return withCapacity(rack, await capacityForRack(rack.id));
+  const { zone, aisle, ...row } = rack;
+  return {
+    ...withCapacity(row, await capacityForRack(rack.id)),
+    ...(zone && { zone: serializeSimple(zone) }),
+    ...(aisle && { aisle: serializeSimple(aisle) }),
+  };
 }
 
 async function listSlotsForRack(rackId) {
@@ -264,6 +282,15 @@ module.exports = {
   listWarehouses,
   createWarehouse,
   getWarehouseById,
+  warehouseLayout,
+  createZone,
+  updateZone,
+  deleteZone,
+  createAisle,
+  updateAisle,
+  deleteAisle,
+  resolveLocation,
+  refreshBoxLocations,
   createRack,
   listRacksForWarehouse,
   getRackById,
@@ -272,3 +299,389 @@ module.exports = {
   listSlotsForRack,
   updateSlot,
 };
+
+// --- Zones and aisles (Sprint 10) -----------------------------------------------------------------------------------
+// Optional levels above the rack. Shelf = the rack's row and position = the cell, so slots never change here.
+
+const LAYOUT_TX = { maxWait: 10000, timeout: 60000 };
+
+const cleanCode = (code, what) => {
+  const c = String(code ?? "").trim();
+  if (!c) throw httpError(400, `${what} code is required`);
+  if (c.length > 20) throw httpError(400, `${what} code is at most 20 characters`);
+  return c;
+};
+const cleanName = (name) => (name === undefined ? undefined : String(name ?? "").trim().replace(/\s+/g, " ") || null);
+
+// One call for the browse picker and the warehouse page: zones, aisles and racks (each with capacity totals), flat --
+// the browser groups them. Capacity comes from the one grouped slot query in listRacksForWarehouse.
+async function warehouseLayout(warehouseId) {
+  const [zones, aisles, racks] = await Promise.all([
+    prisma.zone.findMany({ where: { warehouseId }, orderBy: { code: "asc" } }),
+    prisma.aisle.findMany({ where: { warehouseId }, orderBy: { code: "asc" } }),
+    listRacksForWarehouse(warehouseId),
+  ]);
+  const add = (map, key, rack) => {
+    if (!key) return;
+    const t = map.get(key) ?? { rackCount: 0, usedCapacity: 0, totalCapacity: 0 };
+    t.rackCount += 1;
+    t.usedCapacity += rack.usedCapacity;
+    t.totalCapacity += rack.totalCapacity;
+    map.set(key, t);
+  };
+  const byZone = new Map();
+  const byAisle = new Map();
+  for (const r of racks) {
+    add(byZone, r.zoneId, r);
+    add(byAisle, r.aisleId, r);
+  }
+  const empty = { rackCount: 0, usedCapacity: 0, totalCapacity: 0 };
+  return {
+    zones: zones.map((z) => withCapacity(z, byZone.get(z.id) ?? empty)),
+    aisles: aisles.map((a) => withCapacity(a, byAisle.get(a.id) ?? empty)),
+    racks,
+  };
+}
+
+async function assertCodeFree(model, warehouseId, code, exceptId, what) {
+  const clash = await prisma[model].findFirst({
+    where: { warehouseId, code: { equals: code, mode: "insensitive" }, ...(exceptId && { id: { not: exceptId } }) },
+  });
+  if (clash) throw httpError(409, `${what} "${clash.code}" already exists in this warehouse`);
+}
+
+async function getZoneOrThrow(zoneId, warehouseId, db = prisma) {
+  const zone = zoneId ? await db.zone.findUnique({ where: { id: zoneId } }) : null;
+  if (!zone || (warehouseId && zone.warehouseId !== warehouseId)) throw httpError(404, "Zone not found in this warehouse");
+  return zone;
+}
+
+async function getAisleOrThrow(aisleId, warehouseId, db = prisma) {
+  const aisle = aisleId ? await db.aisle.findUnique({ where: { id: aisleId } }) : null;
+  if (!aisle || (warehouseId && aisle.warehouseId !== warehouseId)) throw httpError(404, "Aisle not found in this warehouse");
+  return aisle;
+}
+
+// Where a rack sits. An aisle decides the zone (its own, or none); a zone alone is fine too.
+async function rackPlacement(warehouseId, { zoneId, aisleId }, db = prisma) {
+  if (aisleId) {
+    const aisle = await getAisleOrThrow(aisleId, warehouseId, db);
+    return { zoneId: aisle.zoneId ?? null, aisleId: aisle.id };
+  }
+  if (zoneId) return { zoneId: (await getZoneOrThrow(zoneId, warehouseId, db)).id, aisleId: null };
+  return { zoneId: null, aisleId: null };
+}
+
+// " zone A, aisle 3" (or "") -- for the admin log.
+async function placementText({ zoneId, aisleId }, db = prisma) {
+  const [zone, aisle] = await Promise.all([
+    zoneId ? db.zone.findUnique({ where: { id: zoneId } }) : null,
+    aisleId ? db.aisle.findUnique({ where: { id: aisleId } }) : null,
+  ]);
+  return [zone && ` zone ${zone.code}`, aisle && ` aisle ${aisle.code}`].filter(Boolean).join(",");
+}
+
+// Rewrites the CURRENT location of the boxes on the racks matching `rackFilter` (raw SQL on rack "r") from the live
+// layout -- after a zone / aisle / rack change, so a box shows where it really is. History (audit, movements, order
+// lines) is never touched. One statement, however many boxes.
+async function refreshBoxLocations(rackFilter, db = prisma) {
+  return db.$executeRaw`
+    UPDATE "box" b
+    SET "locationPath" = jsonb_strip_nulls(jsonb_build_object(
+      'warehouse', w."code", 'zone', z."code", 'aisle', a."code", 'rack', r."code",
+      'slot', s."code", 'shelf', s."row", 'position', s."column"))
+    FROM "slot" s
+      JOIN "rack" r ON r."id" = s."rackId"
+      JOIN "warehouse" w ON w."id" = r."warehouseId"
+      LEFT JOIN "zone" z ON z."id" = r."zoneId"
+      LEFT JOIN "aisle" a ON a."id" = r."aisleId"
+    WHERE s."id" = b."slotId" AND ${rackFilter}`;
+}
+
+// Label and / or zone + aisle of a rack. Only the zone sent: the rack keeps its aisle if that aisle is in the zone.
+async function updateRackDetails(rack, { label, zoneId, aisleId }, actor) {
+  const changes = [];
+  const said = [];
+  const data = {};
+  if (label !== undefined) {
+    const clean = String(label ?? "").trim();
+    if (!clean) throw httpError(400, "label can't be empty");
+    if (clean !== rack.label) {
+      data.label = clean;
+      changes.push({ field: "label", from: rack.label, to: clean });
+      said.push(`label "${rack.label}" → "${clean}"`);
+    }
+  }
+  let placement = null;
+  if (zoneId !== undefined || aisleId !== undefined) {
+    let nextAisle = aisleId !== undefined ? aisleId || null : rack.aisleId;
+    if (aisleId === undefined && nextAisle) {
+      const current = await prisma.aisle.findUnique({ where: { id: nextAisle } });
+      if ((current?.zoneId ?? null) !== (zoneId || null)) nextAisle = null;
+    }
+    placement = await rackPlacement(rack.warehouseId, {
+      zoneId: zoneId === undefined ? rack.zoneId : zoneId || null,
+      aisleId: nextAisle,
+    });
+    if (placement.zoneId === rack.zoneId && placement.aisleId === rack.aisleId) placement = null;
+  }
+  if (!changes.length && !placement) return;
+  await prisma.$transaction(async (tx) => {
+    if (placement) {
+      Object.assign(data, placement);
+      const before = (await placementText(rack, tx)).trim() || "no zone / aisle";
+      const after = (await placementText(placement, tx)).trim() || "no zone / aisle";
+      changes.push({ field: "placement", from: before, to: after });
+      said.push(`moved from ${before} to ${after}`);
+    }
+    await tx.rack.update({ where: { id: rack.id }, data });
+    if (placement) await refreshBoxLocations(Prisma.sql`r."id" = ${rack.id}`, tx);
+    await appendAdminEvent(
+      "rack_updated",
+      actor,
+      { entityType: "rack", entityId: rack.id, summary: `Rack ${rack.code}: ${said.join(", ")}`, changes },
+      tx
+    );
+  }, LAYOUT_TX);
+}
+
+const changeText = (changes) => changes.map((c) => `${c.field} "${c.from ?? ""}" → "${c.to ?? ""}"`).join(", ");
+
+async function createZone(warehouseId, { code, name }, actor) {
+  const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId } });
+  if (!warehouse) throw httpError(404, "Warehouse not found");
+  const c = cleanCode(code, "Zone");
+  await assertCodeFree("zone", warehouseId, c, null, "Zone");
+  return prisma.$transaction(async (tx) => {
+    const zone = await tx.zone.create({ data: { warehouseId, code: c, name: cleanName(name) ?? null } });
+    await appendAdminEvent(
+      "zone_created",
+      actor,
+      { entityType: "zone", entityId: zone.id, summary: `Added zone ${c} to ${warehouse.code}${zone.name ? ` — ${zone.name}` : ""}` },
+      tx
+    );
+    return serializeSimple(zone);
+  });
+}
+
+async function updateZone(zoneId, { code, name }, actor) {
+  const zone = await getZoneOrThrow(zoneId);
+  const data = {};
+  if (code !== undefined) {
+    const c = cleanCode(code, "Zone");
+    if (c !== zone.code) {
+      await assertCodeFree("zone", zone.warehouseId, c, zone.id, "Zone");
+      data.code = c;
+    }
+  }
+  if (name !== undefined && cleanName(name) !== zone.name) data.name = cleanName(name);
+  if (!Object.keys(data).length) return serializeSimple(zone);
+  return prisma.$transaction(async (tx) => {
+    const updated = await tx.zone.update({ where: { id: zone.id }, data });
+    if (data.code) await refreshBoxLocations(Prisma.sql`r."zoneId" = ${zone.id}`, tx);
+    const changes = Object.keys(data).map((field) => ({ field, from: zone[field], to: updated[field] }));
+    await appendAdminEvent(
+      "zone_updated",
+      actor,
+      { entityType: "zone", entityId: zone.id, summary: `Zone ${zone.code}: ${changeText(changes)}`, changes },
+      tx
+    );
+    return serializeSimple(updated);
+  }, LAYOUT_TX);
+}
+
+async function deleteZone(zoneId, actor) {
+  const zone = await getZoneOrThrow(zoneId);
+  const [racks, aisles] = await Promise.all([
+    prisma.rack.count({ where: { zoneId } }),
+    prisma.aisle.count({ where: { zoneId } }),
+  ]);
+  if (racks || aisles) {
+    const what = [racks && `${racks} rack${racks === 1 ? "" : "s"}`, aisles && `${aisles} aisle${aisles === 1 ? "" : "s"}`]
+      .filter(Boolean)
+      .join(" and ");
+    throw httpError(409, `Zone ${zone.code} still has ${what} — move them out first`);
+  }
+  await prisma.$transaction(async (tx) => {
+    await tx.zone.delete({ where: { id: zone.id } });
+    await appendAdminEvent("zone_deleted", actor, { entityType: "zone", entityId: zone.id, summary: `Removed zone ${zone.code}` }, tx);
+  });
+}
+
+async function createAisle(warehouseId, { code, name, zoneId }, actor) {
+  const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId } });
+  if (!warehouse) throw httpError(404, "Warehouse not found");
+  const c = cleanCode(code, "Aisle");
+  await assertCodeFree("aisle", warehouseId, c, null, "Aisle");
+  const zone = zoneId ? await getZoneOrThrow(zoneId, warehouseId) : null;
+  return prisma.$transaction(async (tx) => {
+    const aisle = await tx.aisle.create({
+      data: { warehouseId, zoneId: zone?.id ?? null, code: c, name: cleanName(name) ?? null },
+    });
+    await appendAdminEvent(
+      "aisle_created",
+      actor,
+      { entityType: "aisle", entityId: aisle.id, summary: `Added aisle ${c} to ${warehouse.code}${zone ? ` zone ${zone.code}` : ""}` },
+      tx
+    );
+    return serializeSimple(aisle);
+  });
+}
+
+// Moving an aisle to another zone takes its racks with it (a rack in an aisle always carries the aisle's zone).
+async function updateAisle(aisleId, { code, name, zoneId }, actor) {
+  const aisle = await getAisleOrThrow(aisleId);
+  const data = {};
+  if (code !== undefined) {
+    const c = cleanCode(code, "Aisle");
+    if (c !== aisle.code) {
+      await assertCodeFree("aisle", aisle.warehouseId, c, aisle.id, "Aisle");
+      data.code = c;
+    }
+  }
+  if (name !== undefined && cleanName(name) !== aisle.name) data.name = cleanName(name);
+  if (zoneId !== undefined && (zoneId || null) !== aisle.zoneId) {
+    data.zoneId = zoneId ? (await getZoneOrThrow(zoneId, aisle.warehouseId)).id : null;
+  }
+  if (!Object.keys(data).length) return serializeSimple(aisle);
+  return prisma.$transaction(async (tx) => {
+    const updated = await tx.aisle.update({ where: { id: aisle.id }, data });
+    if ("zoneId" in data) await tx.rack.updateMany({ where: { aisleId: aisle.id }, data: { zoneId: data.zoneId } });
+    if (data.code || "zoneId" in data) await refreshBoxLocations(Prisma.sql`r."aisleId" = ${aisle.id}`, tx);
+    const zoneCode = async (id) => (id ? (await tx.zone.findUnique({ where: { id } }))?.code : "none");
+    const changes = [];
+    for (const field of Object.keys(data)) {
+      changes.push(
+        field === "zoneId"
+          ? { field: "zone", from: await zoneCode(aisle.zoneId), to: await zoneCode(updated.zoneId) }
+          : { field, from: aisle[field], to: updated[field] }
+      );
+    }
+    await appendAdminEvent(
+      "aisle_updated",
+      actor,
+      { entityType: "aisle", entityId: aisle.id, summary: `Aisle ${aisle.code}: ${changeText(changes)}`, changes },
+      tx
+    );
+    return serializeSimple(updated);
+  }, LAYOUT_TX);
+}
+
+async function deleteAisle(aisleId, actor) {
+  const aisle = await getAisleOrThrow(aisleId);
+  const racks = await prisma.rack.count({ where: { aisleId } });
+  if (racks) throw httpError(409, `Aisle ${aisle.code} still has ${racks} rack${racks === 1 ? "" : "s"} — move them out first`);
+  await prisma.$transaction(async (tx) => {
+    await tx.aisle.delete({ where: { id: aisle.id } });
+    await appendAdminEvent("aisle_deleted", actor, { entityType: "aisle", entityId: aisle.id, summary: `Removed aisle ${aisle.code}` }, tx);
+  });
+}
+
+// --- Find a location by typing / scanning its code -------------------------------------------------------------------
+// "SL-WH1-B04-3-2" (a position's barcode), "B04-3-2" (rack B04, shelf 3, position 2), "B04-3" (shelf: the app picks
+// the best-fitting position), "B04" (just the rack). Read from the right, so rack codes with dashes ("A-01-3") still
+// resolve. One rack code in two warehouses (older racks) -> "ambiguous" with the choices, never a guess.
+
+const ACTIVE_SLOT = ["available", "full"];
+
+// Smallest free space that still takes `needCm` (fills gaps first, like the suggestions); null if none fits.
+function bestFit(slots, needCm) {
+  const need = Math.max(Number(needCm) || 0, 1);
+  const fits = slots.filter((s) => ACTIVE_SLOT.includes(s.status) && s.capacity - s.used >= need);
+  fits.sort((a, b) => a.capacity - a.used - (b.capacity - b.used) || a.column - b.column);
+  return fits[0] ?? null;
+}
+
+const RACK_FULL_INCLUDE = { warehouse: true, zone: true, aisle: true };
+
+function resolved(kind, code, rack, { shelf = null, positions = [], suggested = null } = {}) {
+  const { warehouse, zone, aisle, ...rackRow } = rack;
+  const slot = kind === "position" ? positions[0] : suggested;
+  return {
+    kind,
+    code,
+    warehouse: { id: warehouse.id, code: warehouse.code, name: warehouse.name },
+    zone: zone ? serializeSimple(zone) : null,
+    aisle: aisle ? serializeSimple(aisle) : null,
+    rack: serializeSimple(rackRow),
+    shelf,
+    positions: positions.map(serializeSimple),
+    suggestedSlotId: suggested?.id ?? null,
+    locationPath: slot ? pathFor(rack, slot) : null,
+  };
+}
+
+async function resolveLocation(rawCode, { warehouseId, needCm } = {}) {
+  const code = String(rawCode ?? "").trim();
+  if (!code) throw httpError(400, "Type or scan a location code");
+
+  const bySlot =
+    (await prisma.slot.findUnique({ where: { barcode: code } })) ??
+    (await prisma.slot.findFirst({ where: { barcode: { equals: code, mode: "insensitive" } } }));
+  if (bySlot && (!warehouseId || bySlot.warehouseId === warehouseId)) {
+    const rack = await prisma.rack.findUnique({ where: { id: bySlot.rackId }, include: RACK_FULL_INCLUDE });
+    return resolved("position", code, rack, { shelf: bySlot.row, positions: [bySlot], suggested: bestFit([bySlot], needCm) });
+  }
+
+  const parts = code.split("-");
+  const num = (s) => (/^\d+$/.test(s) ? Number(s) : null);
+  const tries = [];
+  if (parts.length >= 3 && num(parts.at(-1)) && num(parts.at(-2))) {
+    tries.push({ rackCode: parts.slice(0, -2).join("-"), row: num(parts.at(-2)), column: num(parts.at(-1)) });
+  }
+  if (parts.length >= 2 && num(parts.at(-1))) tries.push({ rackCode: parts.slice(0, -1).join("-"), row: num(parts.at(-1)) });
+  tries.push({ rackCode: code });
+
+  for (const t of tries) {
+    const racks = await prisma.rack.findMany({
+      where: { code: { equals: t.rackCode, mode: "insensitive" }, ...(warehouseId && { warehouseId }) },
+      include: RACK_FULL_INCLUDE,
+      orderBy: { warehouse: { code: "asc" } },
+    });
+    if (!racks.length) continue;
+    if (racks.length > 1) {
+      return {
+        kind: "ambiguous",
+        code,
+        message: `Rack ${racks[0].code} is in more than one warehouse — choose the warehouse`,
+        choices: racks.map((r) => ({
+          warehouseId: r.warehouseId,
+          warehouseCode: r.warehouse.code,
+          warehouseName: r.warehouse.name,
+          rackLabel: r.label,
+        })),
+      };
+    }
+    const rack = racks[0];
+    if (t.row === undefined) return resolved("rack", code, rack);
+    if (t.row < 1 || t.row > rack.rows) {
+      return { kind: "not_found", code, message: `Rack ${rack.code} has shelves 1–${rack.rows}`, suggestions: [] };
+    }
+    if (t.column !== undefined) {
+      const slot = await prisma.slot.findFirst({ where: { rackId: rack.id, row: t.row, column: t.column } });
+      if (!slot) {
+        return { kind: "not_found", code, message: `Shelf ${t.row} of rack ${rack.code} has positions 1–${rack.columns}`, suggestions: [] };
+      }
+      return resolved("position", code, rack, { shelf: t.row, positions: [slot], suggested: bestFit([slot], needCm) });
+    }
+    const shelf = await prisma.slot.findMany({ where: { rackId: rack.id, row: t.row }, orderBy: { column: "asc" } });
+    return resolved("shelf", code, rack, { shelf: t.row, positions: shelf, suggested: bestFit(shelf, needCm) });
+  }
+
+  // Nothing matched: a few rack codes that look like what was typed.
+  const head = tries[0].rackCode.split("-")[0].slice(0, 3);
+  const similar = head
+    ? await prisma.rack.findMany({
+        where: { code: { contains: head, mode: "insensitive" }, ...(warehouseId && { warehouseId }) },
+        select: { code: true },
+        orderBy: { code: "asc" },
+        take: 5,
+      })
+    : [];
+  return {
+    kind: "not_found",
+    code,
+    message: `No rack, shelf or position matches "${code}"`,
+    suggestions: [...new Set(similar.map((r) => r.code))],
+  };
+}

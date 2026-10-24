@@ -64,6 +64,16 @@ router.get(
   "/orders/:orderId/certificate",
   asyncHandler(async (req, res) => res.json(await portal.orderCertificate(req.portal, req.params.orderId)))
 );
+// Card payment made in the portal (Stripe via DocuSoft's proxy): { paymentIntentId, amount (minor units), currency }
+router.post(
+  "/orders/:orderId/payment",
+  asyncHandler(async (req, res) => res.json(await portal.payOrder(req.portal, req.params.orderId, req.body || {})))
+);
+// Payment not required (on account): the client acknowledges the order's invoice instead of paying it.
+router.post(
+  "/orders/:orderId/acknowledge-invoice",
+  asyncHandler(async (req, res) => res.json(await portal.acknowledgeInvoice(req.portal, req.params.orderId)))
+);
 router.post(
   "/orders/:orderId/client-approve",
   asyncHandler(async (req, res) => res.json(await portal.clientApprove(req.portal, req.params.orderId)))

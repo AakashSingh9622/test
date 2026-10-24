@@ -65,7 +65,9 @@ The Supabase project also contains `auth.*`, `storage.*`, `realtime.*` tables. T
 |---|---|---|
 | 1 | `wh_user` | Cache of staff who logged in (identity data from DocuSoft; no password) |
 | 2 | `warehouse` | A warehouse site (top of the storage hierarchy) |
-| 3 | `rack` | A rack inside a warehouse (a `rows × columns` grid) |
+| 2a | `zone` | Optional area of a warehouse (Sprint 10) |
+| 2b | `aisle` | Optional aisle of a warehouse, in a zone or not (Sprint 10) |
+| 3 | `rack` | A rack inside a warehouse (a `rows × columns` grid: rows = shelves, columns = positions), optionally in a zone / aisle |
 | 4 | `slot` | One cell of a rack grid — the place where boxes are physically stored |
 | 5 | `box` | A physical archive box owned by a client |
 | 6 | `order` | A collection / dispatch / destruction order |
@@ -86,6 +88,11 @@ The Supabase project also contains `auth.*`, `storage.*`, `realtime.*` tables. T
 ```mermaid
 erDiagram
     warehouse ||--o{ rack        : "rack.warehouseId"
+    warehouse ||--o{ zone        : "zone.warehouseId"
+    warehouse ||--o{ aisle       : "aisle.warehouseId"
+    zone      |o--o{ aisle       : "aisle.zoneId (nullable)"
+    zone      |o--o{ rack        : "rack.zoneId (nullable)"
+    aisle     |o--o{ rack        : "rack.aisleId (nullable)"
     warehouse ||--o{ slot        : "slot.warehouseId (denormalised)"
     rack      ||--o{ slot        : "slot.rackId"
     slot      |o--o{ box         : "box.slotId (nullable)"
@@ -118,7 +125,9 @@ warehouse ──< rack ──< slot ──< box ──< order_line >── order
 |---|---|---|
 | `wh_user` | `email` | one cached row per login email |
 | `warehouse` | `code` | short human code (`WH1`) |
-| `rack` | `(warehouseId, code)` | rack code unique *within* a warehouse |
+| `rack` | `(warehouseId, code)` | rack code unique *within* a warehouse; new / renamed racks are also checked across **all** warehouses in code (older racks may share a code) |
+| `zone` | `(warehouseId, code)` | zone code unique within a warehouse |
+| `aisle` | `(warehouseId, code)` | aisle code unique within a warehouse (not just its zone) |
 | `slot` | `barcode` | a slot barcode identifies exactly one slot |
 | `box` | `boxNumber`, `barcode` | printed on the label; used for scanning |
 | `order` | `orderNumber` | `DSP-000123` is unique across all orders |
@@ -128,6 +137,9 @@ warehouse ──< rack ──< slot ──< box ──< order_line >── order
 | Child → Parent | Column | On parent delete | Notes |
 |---|---|---|---|
 | `rack → warehouse` | `warehouseId` | **CASCADE** | |
+| `zone → warehouse`, `aisle → warehouse` | `warehouseId` | **CASCADE** | |
+| `aisle → zone` | `zoneId` (nullable) | **SET NULL** | the API refuses to delete a zone that still has aisles / racks |
+| `rack → zone`, `rack → aisle` | `zoneId`, `aisleId` (nullable) | **SET NULL** | the API refuses to delete one that still has racks |
 | `slot → rack` | `rackId` | **CASCADE** | |
 | `slot → warehouse` | `warehouseId` | **CASCADE** | duplicate of rack's warehouse (fast "all slots of a warehouse") |
 | `box → slot` | `slotId` (nullable) | **SET NULL** | box survives, becomes unplaced |
@@ -193,8 +205,23 @@ Capacity figures (`rackCount`, `slotCount`, `usedCapacity`, `totalCapacity`) are
 | `label` | text | | display name |
 | `rows`, `columns` | int | | grid size, e.g. 4 × 6 |
 | `cellLengthCm` | int | | length of **one cell** in centimetres (user may enter feet; converted and rounded) |
+| `zoneId`, `aisleId` | text? | **FK → zone.id / aisle.id** | optional (Sprint 10); a rack in an aisle always carries that aisle's zone |
 
-Creating a rack creates all `rows × columns` slots in the same transaction.
+Creating a rack creates all `rows × columns` slots in the same transaction. A rack's row is a **shelf** and a cell a
+**position**: the code `B04-3` (shelf) / `B04-3-2` (position) finds them (`GET /api/locations/resolve`).
+
+#### `zone` / `aisle` (Sprint 10)
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | uuid text | **PK** | |
+| `warehouseId` | text | **FK → warehouse.id** | part of unique `(warehouseId, code)` |
+| `zoneId` | text? | **FK → zone.id** | aisle only: the zone it sits in, or none |
+| `code` | text | UQ (with warehouseId) | e.g. `A`, `3` |
+| `name` | text? | | optional display name |
+
+Admin actions `zone_created`, `zone_updated`, `zone_deleted`, `aisle_created`, `aisle_updated`, `aisle_deleted`;
+moving a rack is `rack_updated`. `box.locationPath` (and the snapshots in `audit_event` / `movement` / `order_line`) now
+read `{ warehouse, zone?, aisle?, rack, slot, shelf, position }`; older rows keep `{ warehouse, rack, slot }`.
 
 #### `slot` — one cell of a rack
 There are **no sub-slots**: each row×column cell is itself the storage location.
@@ -313,6 +340,16 @@ New columns: `box.retentionCategory` (code of a current retention rule); `order.
 `clientApprovedBy`, `clientApprovedAt` (destruction asked for by an ordinary client contact), `order.delivery` (JSON:
 recipientName, courier, trackingRef, dispatchedAt, receivedBy, proofReference, deliveredAt); `invoice.billingRunId`.
 `order.destruction` (JSON) gains `approvedBy {id, name}` and `approvedAt` — the second signature.
+
+**Billing stage:** order status `billing` (between `requested` and `scheduled`; `approved` remains for older orders) and
+`order.billing` (JSON: `status` awaiting_invoice / invoice_draft / awaiting_payment / paid / waived, `invoiceId`,
+`invoiceNumber`, `sageInvoiceNumber`, `amount`, `currency`, `stripeCustomerId`, `payment {method, amount, reference,
+via, by, at}`, `waived {reason, by, at}`). `invoice.orderId` (indexed), `invoice.grossTotal` (Sage's total incl. VAT),
+`invoice.currency`, `invoice.amountPaid` (portal / staff payments, or what Sage says after "Update from Sage"),
+`invoice.paidAt`, `invoice.payments` (JSON list), `invoice.sageSyncedAt`. `order.billing` also holds
+`paymentNotRequired` and `acknowledged {by, at, via, note?}`. Admin actions `order_payment_recorded`,
+`order_billing_waived`, `order_payment_requirement_changed`, `order_invoice_acknowledged`, `invoice_payment_recorded`,
+`invoices_synced_from_sage`.
 
 | Table | What | Key points |
 |---|---|---|

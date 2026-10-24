@@ -66,6 +66,21 @@ function portalOrder(o) {
     delivery: o.delivery
       ? { courier: o.delivery.courier, trackingRef: o.delivery.trackingRef, receivedBy: o.delivery.receivedBy, deliveredAt: o.delivery.deliveredAt }
       : undefined,
+    // Billing stage: what the client needs to pay (no staff names, no internal notes / waive reason).
+    billing: o.billing
+      ? strip({
+          status: o.billing.status,
+          invoiceNumber: o.billing.invoiceNumber,
+          sageInvoiceNumber: o.billing.sageInvoiceNumber,
+          amount: o.billing.amount,
+          currency: o.billing.currency,
+          paymentNotRequired: o.billing.paymentNotRequired || undefined,
+          stripeCustomerId: o.billing.status === "awaiting_payment" ? o.billing.stripeCustomerId : undefined,
+          acknowledgedAt: o.billing.acknowledged?.at,
+          paidAt: o.billing.payment?.at,
+          paidBy: o.billing.payment ? (o.billing.payment.method === "card" ? "card" : "bank transfer") : undefined,
+        })
+      : undefined,
     createdAt: dateOnly(o.createdAt),
   });
 }

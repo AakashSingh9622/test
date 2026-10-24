@@ -136,6 +136,9 @@ async function generateCharges({ from, to, clientId }, actor) {
   await prisma.$transaction(async (tx) => {
     // --- services from completed orders
     for (const o of orders) {
+      // Billed up front at the order's billing stage (its own invoice went to Sage) -- don't charge it again here.
+      // (Billing waived = on account / no charge at that stage, so it is still charged by the run.)
+      if (o.billing?.invoiceId && ["awaiting_payment", "paid"].includes(o.billing.status)) continue;
       const when = day(o.completedAt);
       const card = pickCard(cards, o.clientId, when);
       if (!card) {

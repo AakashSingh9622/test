@@ -11,6 +11,7 @@ const { appendAuditEvent } = require("./auditService");
 const { appendMovement } = require("./movementService");
 const { serializeBox } = require("../utils/serialize");
 const { boxLengthCm } = require("../utils/dimensions");
+const { pathFor, RACK_PATH_INCLUDE } = require("../utils/locationPath");
 const httpError = require("../utils/httpError");
 
 // Interactive transactions ka default timeout 5s hai -- remote Supabase pooler ke saath
@@ -23,21 +24,12 @@ function unitsFor(box) {
   return box.lengthCm ?? boxLengthCm(box);
 }
 
-function rackLabelFor(rack) {
-  return `${rack.code[0]}-${rack.code.slice(1)}`;
-}
-
-// Slot ka readable locationPath snapshot banata hai (Box.locationPath me store hota hai).
+// Slot ka readable locationPath snapshot banata hai (Box.locationPath me store hota hai) -- warehouse, zone, aisle aur
+// rack ek hi query me. Rack ka code jaisa hai waisa (pehle "B04" -> "B-04" banta tha, jo "new1" jaise codes bigaad deta tha).
 async function locationPathForSlot(slot, db = prisma) {
-  const [rack, warehouse] = await Promise.all([
-    db.rack.findUnique({ where: { id: slot.rackId } }),
-    db.warehouse.findUnique({ where: { id: slot.warehouseId } }),
-  ]);
-  return {
-    warehouse: warehouse ? warehouse.code : slot.warehouseId,
-    rack: rack ? rackLabelFor(rack) : slot.rackId,
-    slot: slot.code,
-  };
+  const rack = await db.rack.findUnique({ where: { id: slot.rackId }, include: RACK_PATH_INCLUDE });
+  if (!rack) return { warehouse: slot.warehouseId, rack: slot.rackId, slot: slot.code };
+  return pathFor(rack, slot);
 }
 
 // Slot me `cm` jagah atomically le leta hai. true = mil gayi; false = slot blocked hai ya jagah nahi bachi.
@@ -160,7 +152,6 @@ async function allocateBoxes({ allocations, reason }, actor) {
 
 module.exports = {
   TX_OPTIONS,
-  rackLabelFor,
   locationPathForSlot,
   reserveSlotSpace,
   releaseSlotSpace,

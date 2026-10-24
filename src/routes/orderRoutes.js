@@ -28,6 +28,8 @@ const {
 const { requireAuth } = require("../middleware/authMiddleware");
 const { requirePermission } = require("../middleware/requirePermission");
 const asyncHandler = require("../utils/asyncHandler");
+const { actorFromReq } = require("../utils/actor");
+const orderBilling = require("../services/orderBillingService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -65,5 +67,23 @@ router.get("/:orderId/certificate", asyncHandler(getCertificate));
 // Proof of delivery for a dispatched order.
 router.post("/:orderId/delivered", operate, asyncHandler(recordDelivery));
 router.post("/:orderId/resume", approve, asyncHandler(resumeOrder));
+// Billing stage (the invoice itself: POST /api/invoices with orderId). Paid or waived -> the order can be scheduled.
+//   POST /:orderId/billing/payment { method: bank_transfer|card|other, reference?, amount?, note? }
+//   POST /:orderId/billing/waive   { reason }
+//   POST /:orderId/billing/payment-required { required }   "payment not required" = on account: the client only acknowledges
+//   POST /:orderId/billing/acknowledge      { note? }      staff record the client's acknowledgement
+const billing = requirePermission("billing.manage");
+router.post("/:orderId/billing/payment", billing, asyncHandler(async (req, res) => {
+  res.json(await orderBilling.recordPayment(req.params.orderId, req.body || {}, actorFromReq(req)));
+}));
+router.post("/:orderId/billing/payment-required", billing, asyncHandler(async (req, res) => {
+  res.json(await orderBilling.setPaymentRequired(req.params.orderId, (req.body || {}).required, actorFromReq(req)));
+}));
+router.post("/:orderId/billing/acknowledge", billing, asyncHandler(async (req, res) => {
+  res.json(await orderBilling.acknowledgeInvoice(req.params.orderId, actorFromReq(req), { via: "staff", note: (req.body || {}).note }));
+}));
+router.post("/:orderId/billing/waive", billing, asyncHandler(async (req, res) => {
+  res.json(await orderBilling.waiveBilling(req.params.orderId, (req.body || {}).reason, actorFromReq(req)));
+}));
 
 module.exports = router;

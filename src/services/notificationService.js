@@ -24,6 +24,7 @@ const TYPE_NAME = { collection: "collection", dispatch: "delivery", destruction:
 // What the client is told when their order changes status (null = nothing worth telling).
 const CLIENT_STATUS_TEXT = {
   approved: (o) => `Your ${TYPE_NAME[o.type]} request ${o.orderNumber} was approved`,
+  billing: (o) => `Your ${TYPE_NAME[o.type]} request ${o.orderNumber} was approved — your invoice follows`,
   rejected: (o) => `Your ${TYPE_NAME[o.type]} request ${o.orderNumber} was declined`,
   scheduled: (o) => `${o.orderNumber} is scheduled`,
   in_progress: (o) => (o.type === "dispatch" ? `${o.orderNumber} is being prepared for delivery` : `${o.orderNumber} is in progress`),

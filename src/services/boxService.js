@@ -8,6 +8,7 @@ const { getBoxSizes } = require("./boxSizeService");
 const { TX_OPTIONS, releaseBoxSlot, RELEASED_BOX_FIELDS, allocateBoxes, isActiveSlot } = require("./boxAllocationService");
 const { recomputeLineSummary, goodsInPath, findBoxByCode } = require("./orderService");
 const { recordException, refuseAndRecord } = require("./exceptionService");
+const { resolveLocation } = require("./locationService");
 const { boxLengthCm } = require("../utils/dimensions");
 const { serializeBox, serializeOrder, serializeSimple, dateOnly, toDate } = require("../utils/serialize");
 const httpError = require("../utils/httpError");
@@ -279,16 +280,30 @@ async function receiveAtGoodsIn(rawCode, warehouseId, actor) {
   }, TX_OPTIONS);
 }
 
-// Scan the box, scan the shelf (slot) barcode: the box goes there. Any mismatch is refused AND queued for a supervisor.
+// Scan the box, then the slot barcode -- or type a shelf / position code ("B04-3", "B04-3-2", Sprint 10): the box goes
+// there (a shelf: its best-fitting position). Any mismatch is refused AND queued for a supervisor.
 async function putAwayByBarcode({ boxBarcode, slotBarcode, reason }, actor) {
   const boxCode = String(boxBarcode || "").trim();
   const slotCode = String(slotBarcode || "").trim();
   if (!boxCode || !slotCode) throw httpError(400, "Scan the box and then the slot");
   const box = await findBoxByCode(boxCode);
   if (!box) await refuseAndRecord(404, "box_not_found", actor, { boxBarcode: boxCode, slotBarcode: slotCode, message: `No box has the barcode ${boxCode}` });
-  const slot = await prisma.slot.findUnique({ where: { barcode: slotCode } });
+  const need = box.lengthCm ?? boxLengthCm(box);
   const ref = { boxId: box.id, boxBarcode: boxCode, slotBarcode: slotCode };
-  if (!slot) await refuseAndRecord(404, "slot_not_found", actor, { ...ref, message: `No slot has the barcode ${slotCode}` });
+  let slot = await prisma.slot.findUnique({ where: { barcode: slotCode } });
+  if (!slot) {
+    const found = await resolveLocation(slotCode, { needCm: need });
+    if (found.kind === "position") slot = found.positions[0];
+    else if (found.kind === "shelf") {
+      if (!found.suggestedSlotId) {
+        await refuseAndRecord(409, "slot_full", actor, { ...ref, message: `No position on shelf ${slotCode} has ${need} cm free for ${box.boxNumber}` });
+      }
+      slot = found.positions.find((p) => p.id === found.suggestedSlotId);
+    } else if (found.kind === "ambiguous") {
+      await refuseAndRecord(409, "slot_not_found", actor, { ...ref, message: `${found.message} — scan the position label instead` });
+    }
+  }
+  if (!slot) await refuseAndRecord(404, "slot_not_found", actor, { ...ref, message: `No slot or shelf has the code ${slotCode}` });
   ref.slotId = slot.id;
   if (!isActiveSlot(slot)) {
     await refuseAndRecord(409, "slot_unavailable", actor, { ...ref, message: `Slot ${slot.barcode} is ${slot.status} — choose another slot` });
@@ -299,7 +314,6 @@ async function putAwayByBarcode({ boxBarcode, slotBarcode, reason }, actor) {
       message: `${box.boxNumber} is ${box.status.replace(/_/g, " ")} and can't be put away`,
     });
   }
-  const need = box.lengthCm ?? boxLengthCm(box);
   const free = slot.capacity - slot.used;
   if (box.slotId !== slot.id && free < need) {
     await refuseAndRecord(409, "slot_full", actor, { ...ref, message: `Slot ${slot.barcode} has ${free} cm free, ${box.boxNumber} needs ${need} cm` });
