@@ -3,6 +3,7 @@ const prisma = require("../config/prisma");
 const { Prisma } = prisma;
 const { nextSequence } = require("./counterService");
 const { appendAuditEvent } = require("./auditService");
+const { appendMovement } = require("./movementService");
 const { getBoxSizes } = require("./boxSizeService");
 const { TX_OPTIONS, releaseBoxSlot, RELEASED_BOX_FIELDS } = require("./boxAllocationService");
 const { recomputeLineSummary } = require("./orderService");
@@ -193,7 +194,7 @@ async function markBoxMissing(boxId, note, actor) {
   const reason = String(note || "").trim();
   if (!reason) throw httpError(400, "A reason is required to mark a box missing");
   return prisma.$transaction(async (tx) => {
-    const box = await tx.box.findUnique({ where: { id: boxId } });
+    const box = await tx.box.findUnique({ where: { id: boxId }, include: { slot: { select: { id: true, warehouseId: true } } } });
     if (!box) throw httpError(404, "Box not found");
     if (box.status === "missing") throw httpError(409, `${box.boxNumber} is already marked missing`);
     if (box.status === "destroyed") throw httpError(400, `${box.boxNumber} is destroyed`);
@@ -223,6 +224,7 @@ async function markBoxMissing(boxId, note, actor) {
       );
     }
     await appendAuditEvent(updated, "marked_missing", actor, { note: reason, fromLocation: box.locationPath ?? undefined }, tx);
+    await appendMovement(box, "marked_missing", actor, { from: box.slot, fromLocation: box.locationPath, reason }, tx);
     return serializeBox(updated);
   }, TX_OPTIONS);
 }

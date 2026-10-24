@@ -56,7 +56,7 @@ database only keeps the DocuSoft `clientId` (plus a copy of the name / contact e
 
 ## 3. Database
 
-### 3.1 Tables (11, all in the `public` schema)
+### 3.1 Tables (12, all in the `public` schema)
 
 The Supabase project also contains `auth.*`, `storage.*`, `realtime.*` tables. Those are Supabase internals and are
 **not used** by this application.
@@ -74,6 +74,7 @@ The Supabase project also contains `auth.*`, `storage.*`, `realtime.*` tables. T
 | 9 | `counter` | Atomic sequence numbers (box numbers, order numbers) |
 | 10 | `box_size_config` | Admin-editable length (cm) a `standard` / `large` box takes in a rack cell |
 | 11 | `app_setting` | Key/value settings kept in the database. `defaultDatabase` = the one DocuSoft agreement number (e.g. `0003`) this system is for |
+| 12 | `movement` | Append-only custody/location ledger: one row per physical change of a box's location, with real slot and warehouse ids (source for storage billing) |
 
 ### 3.2 Relationship diagram
 
@@ -205,7 +206,9 @@ There are **no sub-slots**: each row×column cell is itself the storage location
 | `used` | int | | total length (cm) of the boxes currently in the cell |
 | `status` | enum `SlotStatus` | | `available` / `full` (`used ≥ capacity`) / `blocked` (staff_admin) |
 
-`used` and `status` are **maintained counters**, changed only by atomic SQL (see §5.7).
+`used` and `status` are **maintained counters**, changed only by atomic SQL (see §5.7). Blocking a cell keeps `used`
+(the boxes stay inside, no new ones can go in); capacity can never be set below `used`. If `used` ever drifts from the
+boxes really in the cell, `npm run slots:recompute` reports it and `npm run slots:recompute -- --apply` fixes it.
 
 #### `box`
 | Column | Type | Key | Notes |
@@ -280,6 +283,26 @@ Rows are only ever **inserted**; there is no update or delete code path.
 | `note` | text? | | reason, recipient name, destruction method … |
 | `visibleToClient` | bool | | decided by event type; the portal only returns `true` rows |
 
+#### `movement` — custody / location ledger (append-only)
+Rows are only ever **inserted**, in the same transaction that changes the box's slot. Where `audit_event` is the
+readable history, this table is the machine-readable one: real ids, so storage time per warehouse can be rebuilt.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | uuid text | **PK** | |
+| `boxId` | text | **FK → box.id** | |
+| `boxNumber`, `clientId` | text | | copies |
+| `type` | enum `MovementType` | | §3.5 |
+| `fromSlotId`, `fromWarehouseId` | text? | | where the box was (plain ids, no FK) |
+| `toSlotId`, `toWarehouseId` | text? | | where it went (plain ids, no FK) |
+| `fromLocation`, `toLocation` | JSON? | | `{warehouse, rack, slot}` snapshot |
+| `orderId`, `orderNumber` | text? | | for dispatch / destruction |
+| `reason` | text? | | move reason, missing note, recipient or destruction method |
+| `actor` | JSON | | `{id, name, side}` |
+| `at` | timestamp | | |
+
+Indexes: `(boxId, at)`, `(clientId, at)`, `(at)`.
+
 #### `box_size_config` — box lengths (settings)
 | Column | Type | Key | Notes |
 |---|---|---|---|
@@ -322,6 +345,7 @@ concurrent requests never receive the same number.
 | `OrderType` | `collection`, `dispatch`, `destruction`, `digitize` |
 | `OrderStatus` | `requested`, `approved`, `scheduled`, `in_progress`, `completed`, `cancelled`, `rejected` |
 | `RequestedVia` | `staff`, `portal` |
+| `MovementType` | `put_away` (into a slot from nowhere: new box, or back from the client) · `transfer` (slot → slot) · `found` (missing box placed again) · `dispatched` · `destroyed` · `marked_missing` |
 | `OrderLineStatus` | `pending`, `picked`, `dispatched`, `received`, `destroyed`, `digitized`, `missing`, `removed` |
 | `AuditEventType` | `registered`, `label_printed`, `allocated`, `moved`, `details_edited`, `added_to_order`, `removed_from_order`, `picked`, `dispatched`, `collected`, `received`, `refiled`, `marked_missing`, `destruction_authorised`, `destroyed`, `hold_placed`, `hold_released`, `status_changed` |
 

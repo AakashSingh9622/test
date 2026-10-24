@@ -81,12 +81,8 @@ async function listSlots(req, res) {
 }
 
 async function patchSlot(req, res) {
-  try {
-    const slot = await locationService.updateSlot(req.params.slotId, req.body || {});
-    res.json(slot);
-  } catch {
-    res.status(404).json({ message: "Slot not found" });
-  }
+  // 404 / 400 / 409 service se aate hain (errorMiddleware); pehle har error "Slot not found" ban jaata tha.
+  res.json(await locationService.updateSlot(req.params.slotId, req.body || {}));
 }
 
 module.exports = {

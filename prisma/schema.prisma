@@ -213,6 +213,7 @@ model Box {
 
   orderLines  OrderLine[]
   auditEvents AuditEvent[]
+  movements   Movement[]
 
   // Portal lists a client's boxes (optionally by status), newest first -> composites cover filter + sort.
   @@index([clientId, status])
@@ -316,6 +317,43 @@ model AuditEvent {
   @@index([clientId])
   @@index([orderId])
   @@map("audit_event")
+}
+
+enum MovementType {
+  put_away // first placement into a slot: a newly registered box, or a box back from the client
+  transfer // slot -> slot
+  found // a box marked missing is placed in a slot again
+  dispatched // slot -> out with the client
+  destroyed // slot -> destroyed
+  marked_missing // slot -> unknown
+}
+
+// Custody / location ledger (spec §4.1) -- append-only, kabhi update/delete nahi hota. Har physical location change
+// ki ek row. audit_event display history hai (location sirf readable snapshot); yahan asli slot/warehouse ids hain,
+// isliye storage billing (har warehouse me box-days, spec §7.2) isi se nikalti hai.
+model Movement {
+  id              String       @id @default(uuid())
+  boxId           String
+  box             Box          @relation(fields: [boxId], references: [id], onDelete: Cascade)
+  boxNumber       String
+  clientId        String
+  type            MovementType
+  fromSlotId      String? // plain ids, no FK: the ledger must outlive layout changes
+  fromWarehouseId String?
+  toSlotId        String?
+  toWarehouseId   String?
+  fromLocation    Json? // { warehouse, rack, slot } snapshot, same as audit_event
+  toLocation      Json?
+  orderId         String?
+  orderNumber     String?
+  reason          String?
+  actor           Json
+  at              DateTime     @default(now())
+
+  @@index([boxId, at])
+  @@index([clientId, at])
+  @@index([at])
+  @@map("movement")
 }
 
 // Atomic auto-increment (box numbers, per-type order numbers).

@@ -6,6 +6,7 @@ const {
   listBoxes,
   getBox,
   getBoxOrders,
+  getBoxMovements,
   createBoxesBatch,
   markLabelsPrinted,
   allocateBatch,
@@ -26,6 +27,7 @@ router.post("/mark-label-printed", asyncHandler(markLabelsPrinted));
 router.post("/allocate-batch", asyncHandler(allocateBatch));
 router.get("/:boxId", asyncHandler(getBox));
 router.get("/:boxId/orders", asyncHandler(getBoxOrders));
+router.get("/:boxId/movements", asyncHandler(getBoxMovements));
 router.patch("/:boxId", asyncHandler(updateBoxDetails));
 router.post("/:boxId/hold", asyncHandler(placeBoxHold));
 router.delete("/:boxId/hold", asyncHandler(releaseBoxHold));
