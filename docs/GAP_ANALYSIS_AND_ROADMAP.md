@@ -26,6 +26,7 @@ deferred (out of scope for the prototype)
 | Sage and Stripe | DocuSoft's practice management system already integrates with Sage One and Stripe; reuse that integration. For now, add the connection settings only. The connection keys will come from a DocuSoft Practice API; **details to be agreed with the product owner when this feature is developed.** The Sage/Stripe proof of concept is on hold until then. |
 | Engineering safeguards | Prototype stage: leave out the engineering overhead (migrations, automated test suite, background worker/outbox, correlation ids, API versioning, vault, hardening). Listed in §6 so they aren't forgotten later. |
 | Physical storage model | Keep shared capacity in centimetres; add an optional `maxBoxes` per slot for exclusive positions. |
+| Location hierarchy | Zone and aisle are **optional labels on the rack**; shelf = the rack's row, position = the cell. Slots, capacity and barcodes don't change. Small warehouses can ignore zones and aisles (decision 24 Oct; built in Sprint 10, taken ahead of Sprints 8 and 9). |
 | Customer billing profile | Store a small local billing profile per client (billing contact, Sage contact id, tax treatment, no client master data). Planned for when billing is built, not now. |
 | Movement ledger and idempotency | Went ahead with the §3 recommendations: **movement ledger built** (Sprint 1); **idempotency deferred** (option 1), revisit with option 2 before billing goes live. |
 
@@ -158,7 +159,7 @@ starts to cost money.
 
 | Spec requirement | Current state | Status | Gap / action |
 |---|---|---|---|
-| Hierarchy warehouse → zone → aisle → rack → shelf → position | warehouse → rack → cell (row × column) | 🟡 | Enough for the prototype |
+| Hierarchy warehouse → zone → aisle → rack → shelf → position | warehouse → (zone → aisle, optional) → rack → shelf (row) → position (cell) | ✅ (Sprint 10) | — |
 | Location barcodes, unique | `slot.barcode` unique | ✅ | — |
 | Capacity: exclusive or shared | Shared capacity in centimetres, atomic reserve/release in SQL | ✅ | Optional `maxBoxes` per slot (decision §1) |
 | Location states `ACTIVE`/`BLOCKED`/`QUARANTINED`/`INACTIVE` | `available`/`full`/`blocked` (mixes occupancy and state) | 🟡 | Split *state* from *fullness*; add quarantined/inactive (Sprint 3) |
@@ -185,7 +186,7 @@ starts to cost money.
 
 | Spec requirement | Current state | Status | Gap / action |
 |---|---|---|---|
-| Request lifecycle `SUBMITTED → APPROVED → PICKING → READY → DISPATCHED/COLLECTED → RETURNED/CLOSED` + `CANCELLED`, `ON_HOLD`, `EXCEPTION` | `requested → approved → scheduled → in_progress → completed` + `cancelled`, `rejected` | 🟡 | Add `ready`, `on_hold`, `exception`; keep `scheduled` (Sprint 3) |
+| Request lifecycle `SUBMITTED → APPROVED → PICKING → READY → DISPATCHED/COLLECTED → RETURNED/CLOSED` + `CANCELLED`, `ON_HOLD`, `EXCEPTION` | `requested → billing → scheduled → in_progress → (ready) → completed` + `on_hold`, `cancelled`, `rejected`; mismatches go to the exception queue | ✅ (Sprint 3 + billing stage) | — |
 | Each line has its own pick/dispatch/return state | Lines exist; no endpoint sets `picked`; dispatch completes all lines at once | 🟡 | Per-line pick scan; wrong box → exception (Sprint 3) |
 | Location-ordered pick list | Pick list page in the UI | 🟡 | Server sorts lines by warehouse/rack/row/column (Sprint 3) |
 | Handover records recipient, time, operator, proof reference | `order.delivery`: recipient, courier, tracking, dispatched at; then received by, proof reference, delivered at | ✅ (Later) | — |
@@ -272,6 +273,8 @@ Kept here so they aren't lost. None of them block the prototype.
 - `pg_trgm` search indexes, performance targets, security review, penetration test.
 - Idempotency, if option 1 is chosen in §3.2.
 
+(The error codes users actually see are pulled forward into Sprint 8 for the Spanish UI.)
+
 ---
 
 ## 7. Roadmap
@@ -332,8 +335,126 @@ manager's approval (someone other than the requester) before it can be destroyed
 - Staff frontend: one Sage module (`src/api/sage.ts`; fixes report findings 3, 4, 6, 8), Invoices list / new / detail,
   Send to Sage (contact by CCode → Sage reference → created; an existing Sage invoice with our number is reused, never
   duplicated), Settings → Sage One, Stripe payments of the client (read-only, via Practice's proxy). 12 unit tests.
-- Open: verify the VAT ids (`GB_LOWER` etc.) and the whole flow against a real Sage test business; Stripe checkout needs
-  a "create checkout" endpoint on DocuSoft's Stripe proxy (it can only read payments today).
+- Sending to Sage first checks that Sage One is the practice's active accounting system (`Json_GetXeroQBDetails`, as
+  Practice); if not, nothing is sent and an admin is pointed to Practice → Settings, anyone else to their administrator.
+- Open: verify the VAT ids (`GB_LOWER` etc.) and the whole flow against a real Sage test business. (Card payments: the
+  Stripe proxy can charge a card — `attachCard` + `makePayment`, as the proposals page does; used by the billing stage
+  below.)
+
+**Billing stage in the order flow ✅ built** — the order flow is now **Request → Billing → Schedule → In progress →
+Complete** (backend, staff frontend, client portal; 127 backend checks, regressions pass).
+- Approving a request moves it to `billing` (staff-created orders start there). Finance raises the order's invoice
+  (`POST /api/invoices` with `orderId`) and sends it to Sage; Sage's total incl. VAT is what the customer pays.
+- The customer pays by card on the order page in the portal (Stripe through DocuSoft's proxy, like the proposals page;
+  needs the client's Stripe customer on its DocuSoft card), or finance records a bank transfer. Finance may waive
+  billing with a reason (no charge). **Schedule is locked until paid, acknowledged or waived** (decision 24 Oct).
+- **Payment not required** (clients billed monthly / annually on account): a tick on the order's Billing card. The
+  invoice is still raised and sent to Sage, but the customer only **acknowledges** it in the portal (or finance records
+  the acknowledgement); the order then goes ahead and the invoice stays owed on the client's account.
+- **Standing accounts** (Billing → Accounts): per client, for a period — invoices raised, how many paid, invoiced /
+  paid / owed — plus the whole balance and how much is overdue; a statement page per client. Paid amounts come from
+  portal card payments, payments finance records on an invoice (part payments allowed) and **Update from Sage** (reads
+  each invoice's outstanding amount from Sage in the browser; a fully paid order invoice also settles its order).
+- Orders from before the billing stage show "Approved" in the progress steps and can still be scheduled.
+- An order billed at this stage is left out of the monthly charge run (no double billing); a waived one is still charged
+  by the run.
+- **Phase 2 (when the rate card work is picked up): prefill the order's invoice lines from the client's rate card.**
+  Phase 1 (now): finance types the lines (decision 24 Oct).
+- Open: the WMS doesn't mark the Sage invoice paid — record the payment in Sage too (the Sage proxy has no payment
+  call); "Update from Sage" then brings it back. A card payment is reported by the portal; staff can check it against
+  Stripe on the order page. A card that needs 3-D Secure isn't handled by the proxy's `makePayment` (same as the
+  proposals page). Next: a billing cycle per client (pay per order / monthly / annual) sets "payment not required"
+  automatically — Sprint 9.
+
+**Sprint 8 — UI language: English / Spanish (proposed)** — staff frontend and client portal; no backend change except
+error codes.
+- Language button in the header of both apps: **English (default)** / **Español**. The choice is remembered in the
+  browser and applies straight away, without reloading the page.
+- **Translation files, not the browser's translator.** Every piece of UI text moves into an English and a Spanish
+  message file (staff app: `next-intl`; portal: a small `t()` helper reading the same kind of JSON file). The Spanish
+  text is first machine-translated, then checked by a Spanish speaker against a short glossary of warehouse terms
+  (put-away, slot, legal hold, retention category …).
+- Why not the browser's built-in translation: the page translation in Chrome/Edge/Safari is started by the user, not by
+  our button, and each browser behaves differently; it rewrites the page text behind React's back, a known cause of
+  crashes in React apps; and it also translates barcodes, box numbers, client names and descriptions. Chrome's
+  on-device Translator API can be called from a button, but it works only in desktop Chrome, downloads a language model
+  on first use, and has the same React and wording problems. Neither lets us review what operators and clients read.
+- Dates and numbers follow the chosen language (`date-fns` locale / `Intl`).
+- API error messages are English text today. Errors shown to users get a code that the frontend translates — the
+  user-facing subset of the error codes deferred in §6.
+- Not translated: what people type (box descriptions, notes, client and contact names) and barcodes. **Open question
+  for the product owner:** should documents given to clients (certificate of destruction, delivery note, invoices) be
+  issued in the client's language?
+- Most of the effort is moving text out of every screen into the message files; the staff app is the larger part.
+
+**Sprint 9 — client billing cycle (planned)** — backend, staff frontend, client portal. Every client gets a billing
+cycle that decides how its orders are billed at the billing stage:
+- **Pay per order** (default): each order's invoice must be paid (portal card / recorded payment) before scheduling —
+  today's behaviour.
+- **Monthly / annual (on account)**: the order's "Payment not required" is ticked automatically — the client only
+  acknowledges the invoice and the order goes ahead; the invoice stays owed on the standing account. Finance can still
+  untick it for one order (e.g. a large job paid up front).
+- Stored per client in a small `client_billing_profile` table keyed by the DocuSoft client id (clients themselves stay
+  in DocuSoft): cycle, effective from, who changed it — history kept, every change in the admin log.
+- Staff: set the cycle on the client (Billing → Accounts → client, and visible on the order's Billing card); the
+  Accounts list shows each client's cycle and can be filtered by it.
+- Portal: the client sees its billing cycle; on-account clients see "acknowledge" instead of "pay".
+- Open question for the product owner: should monthly / annual clients get **one periodic invoice** (the billing run,
+  Sprint 6) instead of one invoice per order? If so, their orders would only need acknowledging an order summary, not
+  an invoice, and the billing run would pick their orders up at month / year end.
+
+**Sprint 10 — warehouse hierarchy: zones and aisles ✅ built** (taken ahead of Sprints 8 and 9, which wait) — backend and
+staff frontend; no portal change (clients only see the warehouse name). Spec hierarchy warehouse → zone → aisle → rack → shelf → position (§5.2), built on top of
+today's layout instead of replacing it (decision 24 Oct):
+
+| Level | Comes from |
+|---|---|
+| Warehouse | as today |
+| Zone | **new**, optional, set on the rack |
+| Aisle | **new**, optional, set on the rack; sits in a zone **or straight in the warehouse** (changed while building: a small warehouse that only numbers its aisles shouldn't have to invent a zone) |
+| Rack | as today |
+| Shelf | the rack's row (already has row stats and row blocking) |
+| Position | the cell / slot (row × column) — capacity in cm, barcode, `box.slotId` all unchanged |
+
+- **Database (additive, plain `db push`, no backfill):** new `zone` (warehouse, code, name) and `aisle` (warehouse,
+  zone?, code, name) tables; `rack.zoneId` / `rack.aisleId`, both optional, indexed. A rack may have a zone without an aisle; an
+  aisle implies its zone. Existing racks start with neither. New admin actions: zone/aisle created, updated, deleted;
+  rack moved to another zone/aisle. Deleting a zone or aisle that still has racks is refused.
+- **Small warehouses lose nothing:** with no zones, screens and pickers look exactly like today (empty levels are
+  skipped; racks without a zone/aisle are grouped under "No zone").
+- **Two ways to choose a location** (registration's allocate step, Move box, put-away):
+  1. **Browse:** warehouse → zone → aisle → rack → shelf/position grid. One call returns a warehouse's whole tree (zones →
+     aisles → racks with capacity totals) and the browser filters the dropdowns — same number of calls as today
+     (warehouse list, warehouse contents, rack grid).
+  2. **Type or scan a code:** `B04-3` = rack B04, shelf 3 → the app fills in warehouse, zone, aisle and rack and picks
+     the best-fitting position on that shelf (the user can change it); `B04-3-2` = that exact position; the full slot
+     barcode (`SL-…`) still works. One indexed lookup (`GET /api/locations/resolve?code=`), read from the right so rack
+     codes containing dashes still resolve; no match → "did you mean" suggestions; a wrong scan still goes to the
+     exceptions queue.
+- **Rack codes unique across all warehouses** for new and renamed racks, so a code is enough on its own. If existing
+  racks share a code in two warehouses, the lookup asks which warehouse instead of guessing.
+- **Location snapshot** (`box.locationPath`, audit, movement, order lines) gains optional `zone` and `aisle`; old
+  snapshots stay as they are (history is append-only) and display fine because only keys are added. One shared
+  formatter shows "WH1 › Zone A › Aisle 3 › Rack B04 › Shelf 3 · Position 2", skipping missing parts. Replaces
+  `rackLabelFor` (fixes the `n-ew-1` rack label bug). Moving a rack to another zone/aisle refreshes the stored location of
+  the boxes already in it, in the same transaction.
+- **Capacity totals** per zone and aisle from one grouped query (cm used per rack), like the warehouse/rack totals today.
+- **Staff screens:** warehouse page manages zones and aisles and groups racks under them; Add/Edit rack gets Zone and
+  Aisle; rack page calls rows "Shelf 1…n"; location paths everywhere use the shared formatter; new print page for shelf
+  / position labels (today only box labels print).
+- **Nice to have in the same sprint:** suggestions also prefer the client's aisle/zone; pick lists sorted zone → aisle →
+  rack → shelf (shorter walk).
+- **Not affected:** slots and capacity, existing barcodes, put-away/allocation/pick logic, storage billing (box-days per
+  warehouse from the movement ledger), the billing stage, the portal.
+- **Not in scope (would need the full model):** shelves with their own names, or a different number of positions per
+  shelf in one rack — block or deactivate single positions instead.
+- Built as: `GET /warehouses/:id/layout`, zone / aisle create / rename / move / remove (`layout.manage`, admin log),
+  `PATCH /racks/:id` takes label / zoneId / aisleId, `GET /locations/resolve`, put-away by shelf code, suggestions
+  prefer the client's aisle / zone, pick lists in walking order, CSV export with the full path, optional
+  `npm run locations:refresh -- --apply` to rewrite old stored locations once. Staff app: Zones & aisles dialog and
+  grouped racks on the warehouse page, zone / aisle in Add / Edit rack, rows shown as shelves with their code, one
+  "type a code or browse" picker for registration and Move box, shelf / position label printing
+  (`/print/location-labels`). A numbers-only rack code is refused (`12-3` would read as a shelf).
 
 **Later — customer operations (spec P1)**
 - Customer-admin approval of contacts' requests, email notifications, dispatch jobs with courier and proof of delivery.

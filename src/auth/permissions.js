@@ -5,7 +5,7 @@
 // badalne wale kaamon ke liye hain.
 
 const PERMISSIONS = [
-  "layout.manage", // create warehouse / rack, change rack cell length, block or resize a slot
+  "layout.manage", // create warehouse / zone / aisle / rack, change a rack (cell length, zone, aisle), block or resize a slot
   "settings.manage", // box sizes and other settings
   "users.manage", // see staff users, assign / remove roles
   "audit.read", // global audit log + admin (system) audit log

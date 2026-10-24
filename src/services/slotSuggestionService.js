@@ -1,8 +1,8 @@
 // Slot suggestion algorithm -- frontend/src/domain/slotSuggestion.ts se port kiya gaya, same
 // scoring/reasons, bas ab real Postgres data (Slot/Rack/Warehouse/Box) se chalta hai.
 const prisma = require("../config/prisma");
-const { rackLabelFor } = require("./boxAllocationService");
 const { getBoxSizes } = require("./boxSizeService");
+const { pathFor, RACK_PATH_INCLUDE } = require("../utils/locationPath");
 
 // Total length (cm) jo ye boxes cell me gherenge.
 function unitsFor(sizes, lengths) {
@@ -15,21 +15,27 @@ async function suggestSlotsForBoxes({ clientId, boxSizes, warehouseId, preferSlo
 
   const where = { status: { in: ["available", "full"] } }; // only active slots (not blocked / quarantined / inactive)
   if (warehouseId) where.warehouseId = warehouseId;
-  // rack + warehouse ek hi query me -- locationPath banane ke liye alag lookups nahi chahiye.
-  const candidateSlots = await prisma.slot.findMany({ where, include: { rack: true, warehouse: true } });
+  // rack + warehouse / zone / aisle ek hi query me -- locationPath banane ke liye alag lookups nahi chahiye.
+  const candidateSlots = await prisma.slot.findMany({ where, include: { rack: { include: RACK_PATH_INCLUDE } } });
   const eligible = candidateSlots.filter((s) => s.capacity - s.used >= totalUnits);
   if (eligible.length === 0) return [];
 
-  // Client ke existing boxes kis rack me hain -- "same rack" bonus dene ke liye.
+  // Client ke existing boxes kis rack / aisle / zone me hain -- "same rack" (ya kam se kam same aisle / zone) bonus ke liye.
   const clientBoxes = await prisma.box.findMany({
     where: { clientId, slotId: { not: null } },
-    select: { slot: { select: { rackId: true } } },
+    select: { slot: { select: { rackId: true, rack: { select: { zoneId: true, aisleId: true } } } } },
   });
   const clientBoxCountByRack = new Map();
+  const clientBoxCountByAisle = new Map();
+  const clientBoxCountByZone = new Map();
+  const bump = (map, key) => key && map.set(key, (map.get(key) || 0) + 1);
   for (const b of clientBoxes) {
     if (!b.slot) continue;
-    clientBoxCountByRack.set(b.slot.rackId, (clientBoxCountByRack.get(b.slot.rackId) || 0) + 1);
+    bump(clientBoxCountByRack, b.slot.rackId);
+    bump(clientBoxCountByAisle, b.slot.rack?.aisleId);
+    bump(clientBoxCountByZone, b.slot.rack?.zoneId);
   }
+  const boxes = (n) => `${n} other box${n === 1 ? "" : "es"} from this client`;
 
   const preferSet = new Set((preferSlotIds || []).map(String));
 
@@ -44,9 +50,17 @@ async function suggestSlotsForBoxes({ clientId, boxSizes, warehouseId, preferSlo
     }
 
     const clientCount = clientBoxCountByRack.get(slot.rackId) || 0;
+    const aisleCount = (slot.rack.aisleId && clientBoxCountByAisle.get(slot.rack.aisleId)) || 0;
+    const zoneCount = (slot.rack.zoneId && clientBoxCountByZone.get(slot.rack.zoneId)) || 0;
     if (clientCount > 0) {
       score += 20;
-      reasons.push(`Same rack as ${clientCount} other box${clientCount === 1 ? "" : "es"} from this client`);
+      reasons.push(`Same rack as ${boxes(clientCount)}`);
+    } else if (aisleCount > 0) {
+      score += 10;
+      reasons.push(`Same aisle as ${boxes(aisleCount)}`);
+    } else if (zoneCount > 0) {
+      score += 5;
+      reasons.push(`Same zone as ${boxes(zoneCount)}`);
     }
 
     const wasted = free - totalUnits;
@@ -67,11 +81,7 @@ async function suggestSlotsForBoxes({ clientId, boxSizes, warehouseId, preferSlo
 
   return scored.slice(0, 5).map(({ slot, score, reasons, free }) => ({
     slotId: slot.id,
-    locationPath: {
-      warehouse: slot.warehouse.code,
-      rack: rackLabelFor(slot.rack),
-      slot: slot.code,
-    },
+    locationPath: pathFor(slot.rack, slot),
     freeCapacity: free - totalUnits,
     score,
     reasons,

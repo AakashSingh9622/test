@@ -7,6 +7,9 @@
 // died half-way (browser closed) can be retried after SENDING_LOCK_MS. Before creating, the browser also searches Sage
 // for an invoice with our invoiceNumber as reference, so a retry after "created in Sage but not recorded here" finds
 // the first one instead of making a second.
+//
+// An invoice can bill ONE order (orderId) -- the order's billing stage (orderBillingService): creating it, deleting the
+// draft and creating it in Sage move the order's billing along; the customer then pays Sage's total (grossTotal).
 const prisma = require("../config/prisma");
 const { Prisma } = prisma;
 const { nextSequence } = require("./counterService");
@@ -16,6 +19,7 @@ const { TX_OPTIONS } = require("./boxAllocationService");
 const { dateOnly, toDate } = require("../utils/serialize");
 const httpError = require("../utils/httpError");
 const { parsePagination } = require("../utils/pagination");
+const orderBilling = require("./orderBillingService");
 
 const SENDING_LOCK_MS = 2 * 60 * 1000;
 const KINDS = ["storage", "intake", "collection", "dispatch", "destruction", "digitize", "other"];
@@ -53,6 +57,17 @@ function serializeInvoice(inv) {
     notes: inv.notes ?? undefined,
     status: inv.status,
     netTotal: num(inv.netTotal),
+    grossTotal: inv.grossTotal == null ? undefined : num(inv.grossTotal),
+    currency: inv.currency ?? undefined,
+    orderId: inv.orderId ?? undefined,
+    // standing account: what's been paid (portal / staff / Sage) and what's still owed -- issued invoices only
+    ...(inv.status === "issued" && {
+      amountPaid: num(inv.amountPaid ?? 0),
+      outstanding: Math.max(0, Math.round((num(inv.grossTotal ?? inv.netTotal) - num(inv.amountPaid ?? 0)) * 100) / 100),
+    }),
+    paidAt: inv.paidAt?.toISOString(),
+    payments: Array.isArray(inv.payments) && inv.payments.length ? inv.payments : undefined,
+    sageSyncedAt: inv.sageSyncedAt?.toISOString(),
     sendingSince: inv.sendingSince?.toISOString(),
     lastError: inv.lastError ?? undefined,
     sageContactId: inv.sageContactId ?? undefined,
@@ -110,6 +125,14 @@ function cleanLines(rawLines) {
       sourceId: l.sourceType === "order" && l.sourceId ? String(l.sourceId) : null,
     };
   });
+}
+
+// Sage's total incl. VAT, reported by the browser after creating the invoice (null if Sage didn't say).
+function grossTotalOf(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0 || n > 1e9) throw httpError(400, "grossTotal must be a positive number");
+  return new Prisma.Decimal(n).toDecimalPlaces(2);
 }
 
 function netTotalOf(lines) {
@@ -225,10 +248,16 @@ async function suggestLines({ clientId, from, to }) {
 
 // --- writes --------------------------------------------------------------------------------------------------------
 
+// Every line of an order's invoice points at the order, so the "suggested lines" of a period invoice and the monthly
+// charge run don't bill the same order again.
+const forOrder = (lines, orderId) => (orderId ? lines.map((l) => ({ ...l, sourceType: "order", sourceId: orderId })) : lines);
+
 async function createInvoice(input, actor) {
   const header = cleanHeader(input);
-  const lines = cleanLines(input.lines);
+  const orderId = input.orderId ? String(input.orderId) : null;
+  const lines = forOrder(cleanLines(input.lines), orderId);
   return prisma.$transaction(async (tx) => {
+    const order = orderId ? await orderBilling.attachInvoice(orderId, header.clientId, tx) : null;
     const seq = await nextSequence("invoiceSeq", tx);
     const invoiceNumber = `WMS-INV-${String(seq).padStart(6, "0")}`;
     const inv = await tx.invoice.create({
@@ -242,15 +271,17 @@ async function createInvoice(input, actor) {
         periodTo: toDate(header.periodTo),
         notes: header.notes,
         netTotal: netTotalOf(lines),
+        orderId,
         createdBy: actor,
         lines: { create: lines },
       },
       include: { lines: true },
     });
+    if (order) await orderBilling.invoiceCreated(order, inv, tx);
     await appendAdminEvent(
       "invoice_created",
       actor,
-      { entityType: "invoice", entityId: inv.id, summary: `Prepared invoice ${invoiceNumber} for ${header.clientName}` },
+      { entityType: "invoice", entityId: inv.id, summary: `Prepared invoice ${invoiceNumber} for ${header.clientName}${order ? ` (order ${order.orderNumber})` : ""}` },
       tx
     );
     return serializeInvoice(inv);
@@ -266,9 +297,10 @@ async function draftOrThrow(id, db) {
 
 async function updateInvoice(id, input) {
   const header = cleanHeader(input);
-  const lines = cleanLines(input.lines);
   return prisma.$transaction(async (tx) => {
-    await draftOrThrow(id, tx);
+    const current = await draftOrThrow(id, tx);
+    if (current.orderId && header.clientId !== current.clientId) throw httpError(400, "An order's invoice stays with the order's client");
+    const lines = forOrder(cleanLines(input.lines), current.orderId);
     await tx.invoiceLine.deleteMany({ where: { invoiceId: id } });
     // Only a draft is replaced -- the conditional update makes a parallel "send" win cleanly instead of racing.
     const changed = await tx.invoice.updateMany({
@@ -294,6 +326,7 @@ async function deleteInvoice(id, actor) {
   await prisma.$transaction(async (tx) => {
     const inv = await draftOrThrow(id, tx);
     await tx.invoice.delete({ where: { id } });
+    await orderBilling.invoiceDeleted(inv, tx); // the order needs a new invoice
     await appendAdminEvent(
       "invoice_deleted",
       actor,
@@ -339,10 +372,14 @@ async function markIssued(id, input, actor) {
         sageLink: input.sageLink ? String(input.sageLink).slice(0, 1000) : null,
         sageContactId: input.sageContactId ? String(input.sageContactId) : inv.sageContactId,
         sageBusinessId: input.sageBusinessId ? String(input.sageBusinessId) : inv.sageBusinessId,
+        grossTotal: grossTotalOf(input.grossTotal),
+        currency: input.currency ? String(input.currency).trim().toUpperCase().slice(0, 10) : null,
         issuedAt: new Date(),
         issuedBy: actor,
       },
     });
+    // An order's invoice: the customer can pay it now.
+    await orderBilling.invoiceIssued(await tx.invoice.findUnique({ where: { id } }), { stripeCustomerId: input.stripeCustomerId }, tx);
     await appendAdminEvent(
       "invoice_issued",
       actor,

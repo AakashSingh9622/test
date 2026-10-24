@@ -5,6 +5,8 @@
 //   POST /charges  { clientId, clientName, description, quantity, unitPrice, taxRateId, date? }     (manual "other" charge)
 //   POST /charges/:id/void  { reason }
 //   GET  /runs   GET /runs/:id   POST /runs { from, to }   POST /runs/:id/approve   DELETE /runs/:id
+//   GET  /accounts?from&to&q&page&pageSize       -> clients' standing accounts { items, total, totals, period }
+//   GET  /accounts/:clientId?from&to&clientName   -> one client's statement { summary, items, earlierUnpaid, drafts }
 const express = require("express");
 const { requireAuth } = require("../middleware/authMiddleware");
 const { requirePermission } = require("../middleware/requirePermission");
@@ -13,6 +15,7 @@ const { actorFromReq } = require("../utils/actor");
 const rateCards = require("../services/rateCardService");
 const charges = require("../services/chargeService");
 const runs = require("../services/billingRunService");
+const accounts = require("../services/accountService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -35,5 +38,13 @@ router.get("/runs/:id", view, asyncHandler(async (req, res) => res.json(await ru
 router.post("/runs", manage, asyncHandler(async (req, res) => res.status(201).json(await runs.createRun(req.body || {}, actorFromReq(req)))));
 router.post("/runs/:id/approve", manage, asyncHandler(async (req, res) => res.json(await runs.approveRun(req.params.id, actorFromReq(req)))));
 router.delete("/runs/:id", manage, asyncHandler(async (req, res) => res.json(await runs.discardRun(req.params.id, actorFromReq(req)))));
+
+router.get("/accounts", view, asyncHandler(async (req, res) => {
+  const q = req.query;
+  res.json(await accounts.listAccounts({ from: q.from, to: q.to, q: q.q, page: q.page, pageSize: q.pageSize }));
+}));
+router.get("/accounts/:clientId", view, asyncHandler(async (req, res) => {
+  res.json(await accounts.clientAccount(req.params.clientId, { from: req.query.from, to: req.query.to, clientName: req.query.clientName }));
+}));
 
 module.exports = router;

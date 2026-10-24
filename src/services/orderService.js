@@ -13,6 +13,7 @@ const { refuseAndRecord } = require("./exceptionService");
 const { assertNoLegalHold } = require("./legalHoldService");
 const { issueCertificate } = require("./certificateService");
 const { notifyOrderStatus, notifyClientAboutOrder, notifyStaff } = require("./notificationService");
+const { assertBillingSettled, freshBilling } = require("./orderBillingService");
 const { serializeOrder, serializeOrderLine, toDate } = require("../utils/serialize");
 const httpError = require("../utils/httpError");
 const { parsePagination } = require("../utils/pagination");
@@ -169,7 +170,7 @@ async function getOrderLines(orderId) {
   return lines.map(({ box, ...line }) => serializeOrderLine({ ...line, currentLocation: box?.locationPath ?? undefined }));
 }
 
-// Order + lines banata hai; staff-created orders seedha "approved" shuru hote hain, portal wale
+// Order + lines banata hai; staff-created orders seedha "billing" stage par shuru hote hain, portal wale
 // "requested" (spec §4). Boxes are claimed for the order: "reserved" for dispatch / destruction / digitize, and
 // "return_pending" for boxes coming back on a collection (they are still with the client until received).
 async function createOrder(input, actor) {
@@ -216,7 +217,7 @@ async function createOrder(input, actor) {
     // Legal hold always overrides (spec §4.4): a held box can't even be put on a destruction order.
     if (input.type === "destruction") await assertNoLegalHold(boxes, tx);
 
-    const status = input.requestedVia === "portal" ? "requested" : "approved";
+    const status = input.requestedVia === "portal" ? "requested" : "billing";
     const seq = await nextSequence(`orderSeq:${input.type}`, tx);
 
     const order = await tx.order.create({
@@ -241,6 +242,7 @@ async function createOrder(input, actor) {
         clientApprovalRequired: input.clientApprovalRequired === true,
         destruction: authorisation ?? undefined,
         digitization: digitization ?? undefined,
+        billing: status === "billing" ? freshBilling() : undefined,
       },
     });
 
@@ -309,7 +311,8 @@ async function approveOrder(orderId) {
     if (order.clientApprovalRequired && !order.clientApprovedAt) {
       throw httpError(409, `${order.orderNumber} is waiting for the client's main contact to approve it in the portal`);
     }
-    return serializeOrder(await setOrderStatus(order, "approved", tx));
+    // approved -> billing stage: an invoice is raised and paid (or billing waived) before it can be scheduled
+    return serializeOrder(await setOrderStatus(order, "billing", tx, { billing: freshBilling() }));
   }, TX_OPTIONS);
 }
 
@@ -342,6 +345,7 @@ async function rejectOrder(orderId, reason, actor) {
 async function scheduleOrder(orderId, scheduledFor) {
   return prisma.$transaction(async (tx) => {
     const order = await getOrderOrThrow(orderId, tx);
+    assertBillingSettled(order);
     return serializeOrder(await setOrderStatus(order, "scheduled", tx, { scheduledFor: toDate(scheduledFor) }));
   }, TX_OPTIONS);
 }
@@ -481,7 +485,7 @@ async function approveDestruction(orderId, actor) {
     if (order.type !== "destruction") throw httpError(400, "Not a destruction order");
     if (!order.destruction) throw httpError(409, "The client's authorisation must be recorded first");
     if (order.destruction.approvedBy) throw httpError(409, "This destruction is already approved");
-    if (!["approved", "scheduled", "in_progress", "ready"].includes(order.status)) {
+    if (!["approved", "billing", "scheduled", "in_progress", "ready"].includes(order.status)) {
       throw httpError(409, `${order.orderNumber} is ${order.status.replace(/_/g, " ")}`);
     }
     if (order.requestedBy?.side === "staff" && order.requestedBy.id === actor.id) {
@@ -683,13 +687,33 @@ async function getPickList(orderId) {
   const order = await getOrderOrThrow(orderId, prisma);
   const lines = await prisma.orderLine.findMany({
     where: { orderId, boxId: { not: null }, status: { not: "removed" } },
-    include: { box: { include: { slot: { include: { rack: { select: { code: true } }, warehouse: { select: { code: true } } } } } } },
+    include: {
+      box: {
+        include: {
+          slot: {
+            include: {
+              rack: { select: { code: true, zone: { select: { code: true } }, aisle: { select: { code: true } } } },
+              warehouse: { select: { code: true } },
+            },
+          },
+        },
+      },
+    },
   });
   const key = (l) => {
     const s = l.box?.slot;
-    // same slot -> by box number, so the list is always in the same order
+    // walking order: warehouse -> zone -> aisle -> rack -> shelf -> position; same slot -> by box number
     return s
-      ? [0, s.warehouse.code, s.rack.code, String(s.row).padStart(4, "0"), String(s.column).padStart(4, "0"), l.boxNumber || ""]
+      ? [
+          0,
+          s.warehouse.code,
+          s.rack.zone?.code ?? "",
+          s.rack.aisle?.code ?? "",
+          s.rack.code,
+          String(s.row).padStart(4, "0"),
+          String(s.column).padStart(4, "0"),
+          l.boxNumber || "",
+        ]
       : [1, l.boxNumber || ""];
   };
   lines.sort((a, b) => {

@@ -17,16 +17,31 @@ const httpError = require("../utils/httpError");
 const certificates = require("./certificateService");
 const notifications = require("./notificationService");
 const { listContents } = require("./boxContentService");
+const orderBilling = require("./orderBillingService");
 
-const OPEN_ORDER_STATUSES = ["requested", "approved", "scheduled", "in_progress", "ready", "on_hold"];
+const OPEN_ORDER_STATUSES = ["requested", "approved", "billing", "scheduled", "in_progress", "ready", "on_hold"];
 const BOX_STATUSES = [
   "unallocated", "stored", "reserved", "picked", "out", "pending_destruction", "destroyed", "missing", "digitized",
   "received", "return_pending", "quarantined", "permanently_withdrawn",
 ];
-const ORDER_STATUSES = ["requested", "approved", "scheduled", "in_progress", "ready", "on_hold", "completed", "cancelled", "rejected"];
+const ORDER_STATUSES = ["requested", "approved", "billing", "scheduled", "in_progress", "ready", "on_hold", "completed", "cancelled", "rejected"];
 const ORDER_TYPES = ["collection", "dispatch", "destruction", "digitize"];
 const MAX_BOXES_PER_ORDER = 500;
 const DESTRUCTION_METHODS = ["shred", "pulp", "incinerate"];
+
+// Orders whose invoice is in Sage and not paid yet (billing stage) -- the customer can pay by card on the order page.
+// (also "acknowledge" -- payment not required -- so the client sees every invoice that's waiting for them)
+const AWAITING_PAYMENT = {
+  status: "billing",
+  AND: [
+    {
+      OR: [
+        { billing: { path: ["status"], equals: orderBilling.BILLING.awaitingPayment } },
+        { billing: { path: ["status"], equals: orderBilling.BILLING.awaitingAcknowledgement } },
+      ],
+    },
+  ],
+};
 
 // Orders that need the client's sign-off and have not got it yet: destruction (method + name) and digitize (name + note).
 const WAITING_FOR_AUTHORISATION = {
@@ -47,12 +62,13 @@ const asArray = (v) => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
 
 async function summary(ctx) {
   const where = ownOrders(ctx);
-  const [boxGroups, orderGroups, needsAuthorisation, warehouses, recent] = await Promise.all([
+  const [boxGroups, orderGroups, needsAuthorisation, awaitingPayment, warehouses, recent] = await Promise.all([
     prisma.box.groupBy({ by: ["status"], where: { clientId: ctx.clientId }, _count: { _all: true } }),
     prisma.order.groupBy({ by: ["status"], where, _count: { _all: true } }),
     prisma.order.count({
       where: { ...where, ...WAITING_FOR_AUTHORISATION, status: { in: OPEN_ORDER_STATUSES } },
     }),
+    prisma.order.count({ where: { ...where, ...AWAITING_PAYMENT } }),
     prisma.$queryRaw`
       SELECT w."code" AS "code", w."name" AS "name", COUNT(b."id")::int AS "boxes"
       FROM "box" b
@@ -85,6 +101,7 @@ async function summary(ctx) {
       open: OPEN_ORDER_STATUSES.reduce((sum, s) => sum + orderByStatus[s], 0),
       byStatus: orderByStatus,
       needsAuthorisation, // destruction / digitize orders waiting for the client's authorisation
+      awaitingPayment, // orders whose invoice is waiting to be paid (billing stage)
       needsMyApproval: ctx.isMainContact
         ? await prisma.order.count({ where: { clientId: ctx.clientId, clientApprovalRequired: true, clientApprovedAt: null, status: "requested" } })
         : 0,
@@ -174,6 +191,11 @@ async function listOrders(ctx, q = {}) {
     Object.assign(where, WAITING_FOR_AUTHORISATION);
     delete where.type;
     where.status = { in: OPEN_ORDER_STATUSES };
+  }
+  // "To pay": orders at the billing stage whose invoice is in Sage and not paid yet.
+  if (q.awaitingPayment === "true") {
+    delete where.status;
+    Object.assign(where, AWAITING_PAYMENT);
   }
   // "Needs your approval" (main contact): destruction requests from the client's other contacts.
   if (q.needsMyApproval === "true") {
@@ -321,6 +343,24 @@ async function authoriseDigitization(ctx, orderId, body = {}) {
   );
 }
 
+// The customer paid the order's invoice by card in the portal (Stripe, through DocuSoft's proxy -- the browser did the
+// charge). We record it against the order; staff can check the payment in Stripe from the order page.
+async function payOrder(ctx, orderId, body = {}) {
+  const order = await findOwnOrder(ctx, orderId);
+  const updated = await orderBilling.recordPayment(
+    order.id,
+    { reference: clean(body.paymentIntentId, 200), amountMinor: body.amount, currency: body.currency },
+    actorOf(ctx),
+    { via: "portal" }
+  );
+  return portalOrder(updated);
+}
+
+async function acknowledgeInvoice(ctx, orderId) {
+  const order = await findOwnOrder(ctx, orderId);
+  return portalOrder(await orderBilling.acknowledgeInvoice(order.id, actorOf(ctx), { via: "portal" }));
+}
+
 // Main contact approves a destruction one of their contacts asked for (then the warehouse can approve it).
 async function clientApprove(ctx, orderId) {
   if (!ctx.isMainContact) throw httpError(403, "Only the client's main contact can approve this");
@@ -348,6 +388,8 @@ async function listNotifications(ctx, q = {}) {
 }
 
 module.exports = {
+  payOrder,
+  acknowledgeInvoice,
   clientApprove,
   orderCertificate,
   listCertificates,

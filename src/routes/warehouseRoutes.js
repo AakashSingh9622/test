@@ -5,6 +5,9 @@ const {
   getWarehouse,
   listRacks,
   createRack,
+  getWarehouseLayout,
+  createZone,
+  createAisle,
 } = require("../controllers/locationController");
 const { requireAuth } = require("../middleware/authMiddleware");
 const { requirePermission } = require("../middleware/requirePermission");
@@ -21,5 +24,9 @@ router.post("/", requirePermission("layout.manage"), asyncHandler(createWarehous
 router.get("/:warehouseId", asyncHandler(getWarehouse));
 router.get("/:warehouseId/racks", asyncHandler(listRacks));
 router.post("/:warehouseId/racks", requirePermission("layout.manage"), asyncHandler(createRack));
+// Zones -> aisles -> racks with capacity, in one call (browse picker + warehouse page). Zones / aisles are optional.
+router.get("/:warehouseId/layout", asyncHandler(getWarehouseLayout));
+router.post("/:warehouseId/zones", requirePermission("layout.manage"), asyncHandler(createZone));
+router.post("/:warehouseId/aisles", requirePermission("layout.manage"), asyncHandler(createAisle));
 
 module.exports = router;

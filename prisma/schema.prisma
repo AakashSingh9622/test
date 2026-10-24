@@ -67,7 +67,8 @@ enum OrderType {
 
 enum OrderStatus {
   requested
-  approved
+  approved // before the billing stage existed: old orders only, still schedulable
+  billing // approved; waiting for the invoice to be paid (or billing waived) before it can be scheduled
   scheduled
   in_progress
   ready // every box picked -- waiting to be dispatched / destroyed
@@ -172,6 +173,12 @@ enum AdminAction {
   rack_created
   rack_updated
   slot_updated
+  zone_created
+  zone_updated
+  zone_deleted
+  aisle_created
+  aisle_updated
+  aisle_deleted
   box_sizes_updated
   sage_settings_updated
   invoice_created
@@ -186,6 +193,12 @@ enum AdminAction {
   billing_run_created
   billing_run_approved
   billing_run_discarded
+  order_payment_recorded
+  order_billing_waived
+  order_payment_requirement_changed
+  order_invoice_acknowledged
+  invoice_payment_recorded
+  invoices_synced_from_sage
 }
 
 // Append-only history of admin / configuration changes (roles, warehouse layout, settings) -- audit_event sirf
@@ -214,14 +227,58 @@ model Warehouse {
   updatedAt DateTime @updatedAt
   racks     Rack[]
   slots     Slot[]
+  zones     Zone[]
+  aisles    Aisle[]
 
   @@map("warehouse")
+}
+
+// Optional layout levels above the rack (Sprint 10): warehouse -> zone -> aisle -> rack. Small warehouses can skip
+// them. Shelf = the rack's row, position = the cell (slot) -- slots are not touched. An aisle may sit in a zone or
+// directly in the warehouse; a rack in an aisle always carries that aisle's zone (locationService keeps it in step).
+model Zone {
+  id          String    @id @default(uuid())
+  warehouseId String
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  code        String
+  name        String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  aisles      Aisle[]
+  racks       Rack[]
+
+  @@unique([warehouseId, code])
+  @@map("zone")
+}
+
+model Aisle {
+  id          String    @id @default(uuid())
+  warehouseId String
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  zoneId      String?
+  zone        Zone?     @relation(fields: [zoneId], references: [id], onDelete: SetNull)
+  code        String // unique in the warehouse (not just the zone), so "Aisle 3" is never ambiguous
+  name        String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  racks       Rack[]
+
+  @@unique([warehouseId, code])
+  @@index([zoneId])
+  @@map("aisle")
 }
 
 model Rack {
   id          String    @id @default(uuid())
   warehouseId String
   warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  // Optional (Sprint 10). Deleting a zone / aisle that still has racks is refused in locationService.
+  zoneId      String?
+  zone        Zone?     @relation(fields: [zoneId], references: [id], onDelete: SetNull)
+  aisleId     String?
+  aisle       Aisle?    @relation(fields: [aisleId], references: [id], onDelete: SetNull)
+  // New / renamed racks: unique across ALL warehouses (checked in locationService), so "B04-3" finds a shelf on its
+  // own. The DB only enforces per warehouse because older racks may share a code across warehouses.
   code        String
   label       String
   rows        Int
@@ -234,6 +291,8 @@ model Rack {
   slots       Slot[]
 
   @@unique([warehouseId, code])
+  @@index([zoneId])
+  @@index([aisleId])
   @@map("rack")
 }
 
@@ -286,7 +345,7 @@ model Box {
   labelPrinted   Boolean   @default(false)
   slotId         String?
   slot           Slot?     @relation(fields: [slotId], references: [id], onDelete: SetNull)
-  locationPath   Json? // { warehouse, rack, slot } snapshot
+  locationPath   Json? // { warehouse, zone?, aisle?, rack, slot, shelf?, position? } snapshot (older rows: { warehouse, rack, slot })
   openOrderId    String? // open order ka id (filter ke liye)
   openOrder      Json? // { id, orderNumber, type, status } snapshot
   createdBy      Json // Actor
@@ -350,6 +409,7 @@ model Order {
   clientApprovedBy String?
   clientApprovedAt DateTime?
   delivery       Json? // dispatch: { courier?, trackingRef?, receivedBy?, proofReference?, deliveredAt? }
+  billing        Json? // billing stage: { status, paymentNotRequired?, invoiceId?, amount?, payment?, acknowledged?, waived? } -- orderBillingService.js
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
@@ -474,6 +534,13 @@ model Invoice {
   sendingSince  DateTime? // when the current "sending" attempt started
   lastError     String? // why the last attempt to create it in Sage failed
   billingRunId  String? // made by this billing run (Sprint 6); null = prepared by hand
+  orderId       String? // the order this invoice bills (billing stage); null = not for one order
+  grossTotal    Decimal?      @db.Decimal(19, 4) // total incl. VAT as Sage worked it out -- what the customer pays
+  currency      String? // Sage's currency id, e.g. GBP
+  amountPaid    Decimal       @default(0) @db.Decimal(19, 4) // paid so far (WMS payments, or what Sage says after a sync)
+  paidAt        DateTime? // when it became fully paid
+  payments      Json? // [{ amount, method, reference?, note?, via: portal|staff|sage, by, at }]
+  sageSyncedAt  DateTime? // last "Update from Sage" for this invoice
   sageContactId String?
   sageBusinessId String?
   sageInvoiceId String?
@@ -489,6 +556,7 @@ model Invoice {
   @@index([clientId, createdAt])
   @@index([status, createdAt])
   @@index([createdAt])
+  @@index([orderId])
   @@map("invoice")
 }
 

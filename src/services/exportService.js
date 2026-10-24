@@ -3,6 +3,7 @@
 const prisma = require("../config/prisma");
 const httpError = require("../utils/httpError");
 const { dateOnly, toDate } = require("../utils/serialize");
+const { locationText } = require("../utils/locationPath");
 
 const PAGE = 1000;
 
@@ -13,7 +14,6 @@ function cell(v) {
   return `"${(/^[=+\-@]/.test(s) ? `'${s}` : s).replace(/"/g, '""')}"`;
 }
 const line = (values) => values.map(cell).join(",") + "\r\n";
-const loc = (p) => (p ? `${p.warehouse} › ${p.rack} › ${p.slot}` : "");
 
 function period(params) {
   const where = {};
@@ -52,7 +52,7 @@ const SPECS = {
     return {
       header: ["Box number", "Barcode", "Client id", "Client", "Description", "Department", "Reference", "Filing from", "Filing to", "Destroy after", "Retention category", "Size", "Status", "On hold", "Location", "Registered"],
       fetch: (skip, take) => prisma.box.findMany({ where, orderBy: [{ clientName: "asc" }, { boxNumber: "asc" }], skip, take }),
-      row: (b) => [b.boxNumber, b.barcode, b.clientId, b.clientName, b.description, b.department, b.reference, dateOnly(b.filingDateFrom), dateOnly(b.filingDateTo), dateOnly(b.destroyAfter), b.retentionCategory, b.size, b.status, b.onHold ? "yes" : "no", loc(b.locationPath), dateOnly(b.createdAt)],
+      row: (b) => [b.boxNumber, b.barcode, b.clientId, b.clientName, b.description, b.department, b.reference, dateOnly(b.filingDateFrom), dateOnly(b.filingDateTo), dateOnly(b.destroyAfter), b.retentionCategory, b.size, b.status, b.onHold ? "yes" : "no", locationText(b.locationPath), dateOnly(b.createdAt)],
     };
   },
   movements: (params) => {
@@ -63,7 +63,7 @@ const SPECS = {
     return {
       header: ["When", "Box number", "Client id", "Type", "From", "To", "Order", "Reason", "By"],
       fetch: (skip, take) => prisma.movement.findMany({ where, orderBy: [{ at: "asc" }, { id: "asc" }], skip, take }),
-      row: (m) => [m.at, m.boxNumber, m.clientId, m.type, loc(m.fromLocation), loc(m.toLocation), m.orderNumber, m.reason, m.actor?.name],
+      row: (m) => [m.at, m.boxNumber, m.clientId, m.type, locationText(m.fromLocation), locationText(m.toLocation), m.orderNumber, m.reason, m.actor?.name],
     };
   },
   audit: (params) => {
@@ -74,7 +74,7 @@ const SPECS = {
     return {
       header: ["When", "Box number", "Client id", "Event", "Order", "From", "To", "Note", "By", "Shown to client"],
       fetch: (skip, take) => prisma.auditEvent.findMany({ where, orderBy: [{ at: "asc" }, { id: "asc" }], skip, take }),
-      row: (e) => [e.at, e.boxNumber, e.clientId, e.type, e.orderNumber, loc(e.fromLocation), loc(e.toLocation), e.note, e.actor?.name, e.visibleToClient ? "yes" : "no"],
+      row: (e) => [e.at, e.boxNumber, e.clientId, e.type, e.orderNumber, locationText(e.fromLocation), locationText(e.toLocation), e.note, e.actor?.name, e.visibleToClient ? "yes" : "no"],
     };
   },
   charges: (params) => {
