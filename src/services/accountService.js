@@ -125,4 +125,12 @@ async function sageInvoicesToSync({ clientId } = {}) {
   return rows.map((r) => ({ invoiceId: r.id, invoiceNumber: r.invoiceNumber, sageInvoiceId: r.sageInvoiceId, sageContactId: r.sageContactId ?? undefined, invoiceDate: dateOnly(r.invoiceDate) }));
 }
 
-module.exports = { listAccounts, clientAccount, sageInvoicesToSync };
+// Every client's balance (still owed on invoices in Sage) and the overdue part -- for the Clients list.
+async function balancesByClient() {
+  const invoices = await prisma.invoice.findMany({ where: { status: "issued" }, select: ISSUED_FIELDS });
+  const out = new Map();
+  for (const s of summarise(invoices, { from: null, to: null }).values()) out.set(s.clientId, { balance: s.balance, overdue: s.overdue });
+  return out;
+}
+
+module.exports = { listAccounts, clientAccount, sageInvoicesToSync, balancesByClient };
