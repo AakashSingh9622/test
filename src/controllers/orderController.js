@@ -1,6 +1,7 @@
 // HTTP layer for Orders -- response shapes match frontend ke frontend/src/api/orders.ts exactly.
 const orderService = require("../services/orderService");
 const { actorFromReq } = require("../utils/actor");
+const { can } = require("../auth/permissions");
 
 function parseStatusArray(q) {
   if (!q.status) return undefined;
@@ -36,6 +37,11 @@ async function createOrder(req, res) {
   const { type, clientId, clientName } = req.body || {};
   if (!type || !clientId || !clientName) {
     return res.status(400).json({ message: "type, clientId, and clientName are required" });
+  }
+  // Client ki authorisation create ke saath hi record karna = wahi kaam jo authorise-* endpoints karte hain.
+  const { destructionAuthorisation, digitizationAuthorisation } = req.body;
+  if ((destructionAuthorisation || digitizationAuthorisation) && !can(req.user.roles, "orders.authorise")) {
+    return res.status(403).json({ status: false, code: "forbidden", message: "You can't record a client's authorisation -- leave it for a records manager" });
   }
   const order = await orderService.createOrder({ ...req.body, requestedVia: "staff" }, actorFromReq(req));
   res.status(201).json(order);

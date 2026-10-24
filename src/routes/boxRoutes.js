@@ -1,6 +1,5 @@
-// Box routes -- app.js inhe "/api/boxes" par mount karta hai. Sab routes requireAuth (koi bhi
-// logged-in staff) -- mock ki tarah hi, koi role-specific restriction nahi (UI khud button
-// chhupati hai staff_admin-only actions ke liye, API khud nahi rokti).
+// Box routes -- app.js inhe "/api/boxes" par mount karta hai. Padhna: koi bhi logged-in staff. Badalna:
+// permission chahiye (src/auth/permissions.js) -- boxes.operate, aur hold ke liye boxes.hold.
 const express = require("express");
 const {
   listBoxes,
@@ -16,21 +15,24 @@ const {
   markBoxMissing,
 } = require("../controllers/boxController");
 const { requireAuth } = require("../middleware/authMiddleware");
+const { requirePermission } = require("../middleware/requirePermission");
 const asyncHandler = require("../utils/asyncHandler");
 
 const router = express.Router();
 router.use(requireAuth);
 
+const operate = requirePermission("boxes.operate");
+
 router.get("/", asyncHandler(listBoxes));
-router.post("/batch", asyncHandler(createBoxesBatch));
-router.post("/mark-label-printed", asyncHandler(markLabelsPrinted));
-router.post("/allocate-batch", asyncHandler(allocateBatch));
+router.post("/batch", operate, asyncHandler(createBoxesBatch));
+router.post("/mark-label-printed", operate, asyncHandler(markLabelsPrinted));
+router.post("/allocate-batch", operate, asyncHandler(allocateBatch));
 router.get("/:boxId", asyncHandler(getBox));
 router.get("/:boxId/orders", asyncHandler(getBoxOrders));
 router.get("/:boxId/movements", asyncHandler(getBoxMovements));
-router.patch("/:boxId", asyncHandler(updateBoxDetails));
-router.post("/:boxId/hold", asyncHandler(placeBoxHold));
-router.delete("/:boxId/hold", asyncHandler(releaseBoxHold));
-router.post("/:boxId/missing", asyncHandler(markBoxMissing));
+router.patch("/:boxId", operate, asyncHandler(updateBoxDetails));
+router.post("/:boxId/hold", requirePermission("boxes.hold"), asyncHandler(placeBoxHold));
+router.delete("/:boxId/hold", requirePermission("boxes.hold"), asyncHandler(releaseBoxHold));
+router.post("/:boxId/missing", operate, asyncHandler(markBoxMissing));
 
 module.exports = router;

@@ -13,9 +13,16 @@ datasource db {
   provider = "postgresql"
 }
 
+// Staff roles: staff_admin sirf DocuSoft ke admin flag (strIsAdmin) se aata hai; baaki staff roles user_role table me
+// locally assign hote hain. Kaunsa role kya kar sakta hai: src/auth/permissions.js. client_* sirf portal token me.
 enum Role {
   staff_admin
-  staff_operator
+  staff_operator // warehouse operator
+  warehouse_admin
+  operations_manager
+  records_manager // records / compliance manager
+  finance_manager // billing / finance manager
+  auditor // read-only
   client_admin
   client_user
 }
@@ -118,13 +125,53 @@ model WHUser {
   name           String
   docusoftUserId Int
   agreementNo    String
-  isAdmin        Boolean  @default(false)
-  role           Role     @default(staff_admin)
+  isAdmin        Boolean  @default(false) // DocuSoft strIsAdmin at the last login -> staff_admin
+  role           Role     @default(staff_admin) // legacy: main role at the last login; real roles = isAdmin + user_role
   lastLoginAt    DateTime @default(now())
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
   @@map("wh_user")
+}
+
+// Locally assigned staff roles (everything except staff_admin, which comes from DocuSoft). Keyed by e-mail, not by
+// wh_user id, so an admin can give someone a role before their first login. No rows (and not a DocuSoft admin) =
+// staff_operator, the default for every DocuSoft user of this agreement.
+model UserRole {
+  email      String // lower-case
+  role       Role
+  assignedBy Json // Actor
+  assignedAt DateTime @default(now())
+
+  @@id([email, role])
+  @@map("user_role")
+}
+
+enum AdminAction {
+  role_assigned
+  role_removed
+  warehouse_created
+  rack_created
+  rack_updated
+  slot_updated
+  box_sizes_updated
+}
+
+// Append-only history of admin / configuration changes (roles, warehouse layout, settings) -- audit_event sirf
+// boxes ke liye hai (boxId zaroori), isliye ye alag table.
+model AdminAuditEvent {
+  id         String      @id @default(uuid())
+  action     AdminAction
+  entityType String // "user" | "warehouse" | "rack" | "slot" | "settings"
+  entityId   String? // email for a user, id for a location
+  summary    String // one readable sentence, e.g. "Gave auditor to asha@x.com"
+  changes    Json? // [{ field, from?, to? }]
+  actor      Json
+  at         DateTime    @default(now())
+
+  @@index([at])
+  @@index([entityType, entityId])
+  @@map("admin_audit_event")
 }
 
 model Warehouse {

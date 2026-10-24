@@ -4,6 +4,7 @@
 const prisma = require("../config/prisma");
 const { BOX_LENGTH_CM } = require("../utils/dimensions");
 const httpError = require("../utils/httpError");
+const { appendAdminEvent } = require("./adminAuditService");
 
 const SIZES = Object.keys(BOX_LENGTH_CM); // ["standard", "large"]
 const MIN_CM = 1;
@@ -46,6 +47,12 @@ async function updateBoxSizes(input, actor) {
   }
   if (Object.keys(next).length === 0) throw httpError(400, "Send at least one of: " + SIZES.join(", "));
 
+  cache = null; // read the current values fresh, for the history entry
+  const before = await getBoxSizes();
+  const changes = Object.entries(next)
+    .filter(([size, lengthCm]) => before[size] !== lengthCm)
+    .map(([size, lengthCm]) => ({ field: size, from: before[size], to: lengthCm }));
+
   await prisma.$transaction(
     Object.entries(next).map(([size, lengthCm]) =>
       prisma.boxSizeConfig.upsert({
@@ -55,6 +62,14 @@ async function updateBoxSizes(input, actor) {
       })
     )
   );
+  if (changes.length) {
+    await appendAdminEvent("box_sizes_updated", actor, {
+      entityType: "settings",
+      entityId: "box-sizes",
+      summary: "Box sizes: " + changes.map((c) => `${c.field} ${c.from} → ${c.to} cm`).join(", "),
+      changes,
+    });
+  }
   cache = null; // (other server instances pick it up within CACHE_MS)
   return getBoxSizeSettings();
 }
