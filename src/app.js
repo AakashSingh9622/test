@@ -27,6 +27,7 @@ const recordsRoutes = require("./routes/recordsRoutes");
 const billingRoutes = require("./routes/billingRoutes");
 const exportRoutes = require("./routes/exportRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
+const meRoutes = require("./routes/meRoutes");
 const { notFound, errorHandler } = require("./middleware/errorMiddleware");
 
 const app = express();
@@ -82,6 +83,7 @@ app.use("/api/records", recordsRoutes);
 app.use("/api/billing", billingRoutes);
 app.use("/api/exports", exportRoutes);
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/me", meRoutes);
 // External scan-app API (email + base64 password + agrno in the body).
 app.use("/api/digitize", digitizeRoutes);
 // Client-side (portal) API: alag token (Bearer), har response us client/contact tak limited.

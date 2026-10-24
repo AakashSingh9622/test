@@ -66,14 +66,66 @@ async function listForClient(ctx, params = {}) {
   };
 }
 
-async function listForStaff(params = {}) {
-  const where = { audience: "staff" };
-  const { skip, take } = parsePagination(params, 20);
-  const [items, total] = await Promise.all([
-    prisma.notification.findMany({ where, orderBy: [{ createdAt: "desc" }, { id: "asc" }], skip, take }),
-    prisma.notification.count({ where }),
-  ]);
-  return { items: items.map(serializeSimple), total };
+// Staff notifications from before someone's first login count as read for them (a new user doesn't start with
+// hundreds of unread items).
+async function firstSeen(userId) {
+  const user = userId ? await prisma.wHUser.findUnique({ where: { id: userId }, select: { createdAt: true } }) : null;
+  return user?.createdAt ?? new Date(0);
 }
 
-module.exports = { notify, notifyClientAboutOrder, notifyOrderStatus, notifyStaff, listForClient, listForStaff };
+function unreadWhere(userId, since) {
+  return { audience: "staff", createdAt: { gte: since }, reads: { none: { userId } } };
+}
+
+// The bell / dashboard list for one staff member: newest first, each with `read`, plus how many are still unread.
+async function listForStaff(params = {}, userId) {
+  const since = await firstSeen(userId);
+  const where = params.unread === "true" || params.unread === true ? unreadWhere(userId, since) : { audience: "staff" };
+  const { skip, take } = parsePagination(params, 20);
+  const [items, total, unread] = await Promise.all([
+    prisma.notification.findMany({
+      where,
+      orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+      skip,
+      take,
+      include: { reads: { where: { userId: userId ?? "" }, select: { readAt: true } } },
+    }),
+    prisma.notification.count({ where }),
+    prisma.notification.count({ where: unreadWhere(userId, since) }),
+  ]);
+  return {
+    items: items.map(({ reads, ...n }) => ({ ...serializeSimple(n), read: reads.length > 0 || n.createdAt < since })),
+    total,
+    unread,
+  };
+}
+
+async function unreadCountForStaff(userId) {
+  return prisma.notification.count({ where: unreadWhere(userId, await firstSeen(userId)) });
+}
+
+async function markRead(notificationId, userId) {
+  const n = await prisma.notification.findFirst({ where: { id: notificationId, audience: "staff" }, select: { id: true } });
+  if (!n) return;
+  await prisma.notificationRead.createMany({ data: [{ notificationId, userId }], skipDuplicates: true });
+}
+
+async function markAllRead(userId) {
+  const unread = await prisma.notification.findMany({ where: unreadWhere(userId, await firstSeen(userId)), select: { id: true }, take: 5000 });
+  if (unread.length) {
+    await prisma.notificationRead.createMany({ data: unread.map((n) => ({ notificationId: n.id, userId })), skipDuplicates: true });
+  }
+  return unread.length;
+}
+
+module.exports = {
+  notify,
+  notifyClientAboutOrder,
+  notifyOrderStatus,
+  notifyStaff,
+  listForClient,
+  listForStaff,
+  unreadCountForStaff,
+  markRead,
+  markAllRead,
+};

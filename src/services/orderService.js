@@ -12,6 +12,7 @@ const { appendMovement } = require("./movementService");
 const { refuseAndRecord } = require("./exceptionService");
 const { assertNoLegalHold } = require("./legalHoldService");
 const { issueCertificate } = require("./certificateService");
+const { requireSignature } = require("./signatureService");
 const { notifyOrderStatus, notifyClientAboutOrder, notifyStaff } = require("./notificationService");
 const { assertBillingSettled, freshBilling } = require("./orderBillingService");
 const { serializeOrder, serializeOrderLine, toDate } = require("../utils/serialize");
@@ -363,6 +364,12 @@ async function cancelOrder(orderId, reason, actor) {
     const notes = order.notes ? `${order.notes}\nCancelled: ${reason}` : `Cancelled: ${reason}`;
     await setOrderStatus(order, "cancelled", tx, { notes });
     await releaseOrderBoxes(order, actor, tx);
+    if (actor?.side === "client") {
+      await notifyStaff(
+        { kind: "order_cancelled", title: `${order.clientName} cancelled ${order.orderNumber}`, body: reason, orderId, clientId: order.clientId },
+        tx
+      );
+    }
     return finish(orderId, tx);
   }, TX_OPTIONS);
 }
@@ -474,6 +481,12 @@ async function authoriseDestruction(orderId, input, actor) {
         tx
       );
     }
+    if (actor?.side === "client") {
+      await notifyStaff(
+        { kind: "destruction_authorised", title: `${order.clientName} authorised destruction ${order.orderNumber}`, body: `Signed by ${input.name}`, orderId, clientId: order.clientId },
+        tx
+      );
+    }
     return finish(orderId, tx);
   }, TX_OPTIONS);
 }
@@ -503,6 +516,7 @@ async function approveDestruction(orderId, actor) {
 }
 
 async function destroyOrder(orderId, witness, actor, { place } = {}) {
+  const signature = await requireSignature(actor.id); // 409 SIGNATURE_REQUIRED -- the screen asks for one
   return prisma.$transaction(async (tx) => {
     const order = await getOrderOrThrow(orderId, tx);
     if (order.type !== "destruction") throw httpError(400, "Not a destruction order");
@@ -549,7 +563,7 @@ async function destroyOrder(orderId, witness, actor, { place } = {}) {
     }
     await recomputeLineSummary(orderId, tx);
     await setOrderStatus(order, "completed", tx, { destruction });
-    const certificate = await issueCertificate({ order, boxes: destroyedBoxes, destruction, place, actor }, tx);
+    const certificate = await issueCertificate({ order, boxes: destroyedBoxes, destruction, place, actor, signature }, tx);
     await notifyClientAboutOrder(
       order,
       "certificate_issued",
@@ -579,6 +593,12 @@ async function authoriseDigitization(orderId, input, actor) {
         "digitization_authorised",
         actor,
         { orderId: order.id, orderNumber: order.orderNumber, note: digitization.note },
+        tx
+      );
+    }
+    if (actor?.side === "client") {
+      await notifyStaff(
+        { kind: "digitization_authorised", title: `${order.clientName} authorised digitising ${order.orderNumber}`, body: `Signed by ${digitization.name}`, orderId, clientId: order.clientId },
         tx
       );
     }

@@ -8,7 +8,7 @@ const { nextSequence } = require("./counterService");
 const { dateOnly } = require("../utils/serialize");
 const { parsePagination } = require("../utils/pagination");
 
-async function issueCertificate({ order, boxes, destruction, place, actor }, tx) {
+async function issueCertificate({ order, boxes, destruction, place, actor, signature }, tx) {
   const seq = await nextSequence("certificateSeq", tx);
   const certificateNumber = `COD-${String(seq).padStart(6, "0")}`;
   const content = {
@@ -21,6 +21,8 @@ async function issueCertificate({ order, boxes, destruction, place, actor }, tx)
     approvedBy: destruction.approvedBy?.name ?? destruction.approvedBy,
     approvedAt: destruction.approvedAt,
     destroyedBy: actor.name,
+    // the signer's signature as it was at this moment (a later change never alters an issued certificate)
+    destroyedBySignature: signature || undefined,
     destroyedAt: new Date().toISOString(),
     witness: destruction.witness || undefined,
     place: place || undefined,
@@ -41,7 +43,8 @@ async function issueCertificate({ order, boxes, destruction, place, actor }, tx)
 
 function serializeCertificate(c, { forClient = false } = {}) {
   const content = { ...c.content };
-  // The client sees who authorised it (that's them) and the method / date / place, not staff names.
+  // The client sees who authorised it (that's them) and the method / date / place, not staff names -- the destroyer's
+  // signature stays (a signed certificate), without the name.
   if (forClient) {
     delete content.approvedBy;
     delete content.destroyedBy;

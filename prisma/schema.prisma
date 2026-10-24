@@ -143,6 +143,9 @@ model WHUser {
   isAdmin        Boolean  @default(false) // DocuSoft strIsAdmin at the last login -> staff_admin
   role           Role     @default(staff_admin) // legacy: main role at the last login; real roles = isAdmin + user_role
   lastLoginAt    DateTime @default(now())
+  // { kind: drawn | typed | uploaded, image: PNG / JPEG data URL, text?, font?, updatedAt } -- copied onto every
+  // certificate of destruction this person signs (signatureService)
+  signature      Json?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
@@ -178,6 +181,7 @@ enum AdminAction {
   box_sizes_updated
   box_size_created
   box_size_deleted
+  signature_updated
   sage_settings_updated
   invoice_created
   invoice_deleted
@@ -692,7 +696,7 @@ model DestructionCertificate {
   orderId           String   @unique
   clientId          String
   clientName        String
-  content           Json // { orderNumber, boxes[], method, authorisedBy, authorisedAt, approvedBy, approvedAt, destroyedBy, destroyedAt, witness?, place? }
+  content           Json // { orderNumber, boxes[], method, authorisedBy, authorisedAt, approvedBy, approvedAt, destroyedBy, destroyedBySignature?, destroyedAt, witness?, place? }
   issuedBy          Json
   issuedAt          DateTime @default(now())
 
@@ -821,10 +825,23 @@ model Notification {
   title        String
   body         String?
   createdAt    DateTime @default(now())
+  reads        NotificationRead[]
 
   @@index([audience, clientId, createdAt])
   @@index([createdAt])
   @@map("notification")
+}
+
+// Which staff member has read which staff notification (the bell's unread count is per person, not per browser).
+model NotificationRead {
+  notificationId String
+  notification   Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  userId         String // wh_user.id
+  readAt         DateTime     @default(now())
+
+  @@id([notificationId, userId])
+  @@index([userId])
+  @@map("notification_read")
 }
 
 // Atomic auto-increment (box numbers, per-type order numbers).
