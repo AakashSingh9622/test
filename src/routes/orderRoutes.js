@@ -18,6 +18,7 @@ const {
   completeOrder,
   holdOrder,
   resumeOrder,
+  reopenOrder,
   approveDestruction,
   recordDelivery,
   getCertificate,
@@ -30,6 +31,8 @@ const { requirePermission } = require("../middleware/requirePermission");
 const asyncHandler = require("../utils/asyncHandler");
 const { actorFromReq } = require("../utils/actor");
 const orderBilling = require("../services/orderBillingService");
+const prisma = require("../config/prisma");
+const { serializeBox } = require("../utils/serialize");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -44,6 +47,16 @@ router.get("/", asyncHandler(listOrders));
 router.post("/", operate, asyncHandler(createOrder));
 router.get("/:orderId", asyncHandler(getOrder));
 router.get("/:orderId/lines", asyncHandler(getOrderLines));
+// The boxes behind an order's lines, in line order -- what a delivery note prints (description, pallet, client's own fields ...).
+router.get(
+  "/:orderId/boxes",
+  asyncHandler(async (req, res) => {
+    const lines = await prisma.orderLine.findMany({ where: { orderId: req.params.orderId, boxId: { not: null } }, orderBy: { createdAt: "asc" } });
+    const boxes = await prisma.box.findMany({ where: { id: { in: lines.map((l) => l.boxId) } } });
+    const byId = new Map(boxes.map((b) => [b.id, b]));
+    res.json(lines.map((l) => byId.get(l.boxId)).filter(Boolean).map(serializeBox));
+  })
+);
 router.post("/:orderId/approve", approve, asyncHandler(approveOrder));
 router.post("/:orderId/reject", approve, asyncHandler(rejectOrder));
 router.post("/:orderId/schedule", operate, asyncHandler(scheduleOrder));
@@ -67,6 +80,8 @@ router.get("/:orderId/certificate", asyncHandler(getCertificate));
 // Proof of delivery for a dispatched order.
 router.post("/:orderId/delivered", operate, asyncHandler(recordDelivery));
 router.post("/:orderId/resume", approve, asyncHandler(resumeOrder));
+// Correct a mistake: bring a cancelled / rejected order back to "requested" (supervisor; reason required).
+router.post("/:orderId/reopen", approve, asyncHandler(reopenOrder));
 // Billing stage (the invoice itself: POST /api/invoices with orderId). Paid or waived -> the order can be scheduled.
 //   POST /:orderId/billing/payment { method: bank_transfer|card|other, reference?, amount?, note? }
 //   POST /:orderId/billing/waive   { reason }

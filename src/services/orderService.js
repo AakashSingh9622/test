@@ -146,7 +146,7 @@ async function searchOrders(params) {
   if (params.contactEmail) where.contactEmail = { equals: normalizeEmail(params.contactEmail), mode: "insensitive" };
   if (params.q) {
     const contains = { contains: params.q, mode: "insensitive" };
-    where.OR = [{ orderNumber: contains }, { clientName: contains }];
+    where.OR = [{ orderNumber: contains }, { clientName: contains }, { contactEmail: contains }, { contactName: contains }];
   }
   const { skip, take } = parsePagination(params);
   const [orders, total] = await Promise.all([
@@ -203,6 +203,10 @@ async function createOrder(input, actor) {
     digitization = buildDigitization(input.digitizationAuthorisation, actor);
   }
 
+  const CHANNELS = ["email", "phone", "in_person", "post", "fax"];
+  const requestChannel = input.requestChannel ? String(input.requestChannel) : undefined;
+  if (requestChannel && !CHANNELS.includes(requestChannel)) throw httpError(400, `requestChannel must be one of ${CHANNELS.join(", ")}`);
+
   return prisma.$transaction(async (tx) => {
     const boxes = [];
     for (const boxId of new Set(input.boxIds || [])) {
@@ -240,6 +244,8 @@ async function createOrder(input, actor) {
         lineSummary: boxes.length > 0 ? { pending: boxes.length } : {},
         collectionInfo: input.type === "collection" ? { expectedNewBoxes: input.expectedNewBoxes || 0 } : undefined,
         permanentWithdrawal: input.type === "dispatch" && input.permanentWithdrawal === true,
+        urgent: input.urgent === true,
+        requestChannel,
         clientApprovalRequired: input.clientApprovalRequired === true,
         destruction: authorisation ?? undefined,
         digitization: digitization ?? undefined,
@@ -700,6 +706,42 @@ async function resumeOrder(orderId) {
   }, TX_OPTIONS);
 }
 
+// Correct a mistake: a cancelled / rejected order goes back to "requested" and its boxes are claimed again, provided
+// every one of them is still free. Nothing is changed unless all boxes can be re-reserved.
+async function reopenOrder(orderId, reason, actor) {
+  const text = String(reason || "").trim();
+  if (!text) throw httpError(400, "A reason is required to reopen an order");
+  return prisma.$transaction(async (tx) => {
+    const order = await getOrderOrThrow(orderId, tx);
+    if (!["cancelled", "rejected"].includes(order.status)) {
+      throw httpError(409, `Only cancelled or rejected orders can be reopened (${order.orderNumber} is ${order.status})`);
+    }
+    const lines = await tx.orderLine.findMany({ where: { orderId, boxId: { not: null }, status: "removed" }, include: { box: true } });
+    const isReturn = order.type === "collection";
+    for (const line of lines) {
+      const box = line.box;
+      const free = isReturn ? box.status === "out" : ["stored", "digitized"].includes(box.status) && !box.onHold;
+      if (!free || box.openOrderId) throw httpError(409, `${line.boxNumber} is not available any more — it can't be added back`);
+    }
+    const notes = order.notes ? `${order.notes}\nReopened: ${text}` : `Reopened: ${text}`;
+    const updated = await tx.order.update({ where: { id: orderId }, data: { status: "requested", notes, completedAt: null } });
+    for (const line of lines) {
+      await tx.box.update({
+        where: { id: line.box.id },
+        data: {
+          status: isReturn ? "return_pending" : "reserved",
+          openOrderId: orderId,
+          openOrder: { id: orderId, orderNumber: order.orderNumber, type: order.type, status: "requested" },
+        },
+      });
+      await tx.orderLine.update({ where: { id: line.id }, data: { status: "pending" } });
+      await appendAuditEvent(line.box, "added_to_order", actor, { orderId, orderNumber: order.orderNumber, note: `Reopened: ${text}` }, tx);
+    }
+    await recomputeLineSummary(orderId, tx);
+    return finish(orderId, tx);
+  }, TX_OPTIONS);
+}
+
 // --- Pick list, pick scan, receive scan ---------------------------------------------------------------------------
 
 // The order's boxes in walking order: warehouse, rack, row, column (spec §6.2). Boxes not on a shelf come last.
@@ -851,6 +893,7 @@ module.exports = {
   completeOrder,
   holdOrder,
   resumeOrder,
+  reopenOrder,
   clientApproveOrder,
   recordDelivery,
   approveDestruction,

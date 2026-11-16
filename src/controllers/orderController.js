@@ -122,6 +122,12 @@ async function holdOrder(req, res) {
   res.json(await orderService.holdOrder(req.params.orderId, (req.body || {}).reason, actorFromReq(req)));
 }
 
+async function reopenOrder(req, res) {
+  const { reason } = req.body || {};
+  if (!reason) return res.status(400).json({ message: "reason is required" });
+  res.json(await orderService.reopenOrder(req.params.orderId, reason, actorFromReq(req)));
+}
+
 async function resumeOrder(req, res) {
   res.json(await orderService.resumeOrder(req.params.orderId));
 }
@@ -157,6 +163,7 @@ module.exports = {
   completeOrder,
   holdOrder,
   resumeOrder,
+  reopenOrder,
   approveDestruction,
   recordDelivery,
   getCertificate,

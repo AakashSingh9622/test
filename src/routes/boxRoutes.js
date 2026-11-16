@@ -7,6 +7,9 @@ const {
   getBoxOrders,
   getBoxMovements,
   createBoxesBatch,
+  importBoxes,
+  resolveBoxes,
+  bulkMove,
   markLabelsPrinted,
   allocateBatch,
   updateBoxDetails,
@@ -36,6 +39,9 @@ const operate = requirePermission("boxes.operate");
 router.get("/", asyncHandler(listBoxes));
 router.get("/lookup", asyncHandler(lookupBox)); // before /:boxId
 router.post("/batch", operate, asyncHandler(createBoxesBatch));
+router.post("/import", operate, asyncHandler(importBoxes));
+router.post("/resolve", asyncHandler(resolveBoxes));
+router.post("/bulk-move", operate, asyncHandler(bulkMove));
 router.post("/mark-label-printed", operate, asyncHandler(markLabelsPrinted));
 router.post("/allocate-batch", operate, asyncHandler(allocateBatch));
 router.post("/correct-batch", operate, asyncHandler(correctRegisteredBoxes));

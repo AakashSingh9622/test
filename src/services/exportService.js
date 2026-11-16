@@ -1,6 +1,7 @@
 // CSV exports (spec §3 "search and export", pilot exit criteria): inventory, movements, audit history, charges.
 // Rows are read in pages of 1000 and written to the response as they come, so a big export never sits in memory.
 const prisma = require("../config/prisma");
+const { Prisma } = prisma;
 const httpError = require("../utils/httpError");
 const { dateOnly, toDate } = require("../utils/serialize");
 const { locationText } = require("../utils/locationPath");
@@ -51,13 +52,64 @@ const SPECS = {
     if (params.clientId) where.clientId = params.clientId;
     if (params.status) where.status = params.status;
     else where.status = { not: "destroyed" };
-    return {
-      header: ["Box number", "Barcode", "Client id", "Client", "Description", "Department", "Reference", "Filing from", "Filing to", "Destroy after", "Retention category", "Size", "Status", "On hold", "Location", "Registered"],
+    // Docbox "Exportar archivo": narrow the inventory to one warehouse / rack / shelf row.
+    if (params.warehouseId || params.rackId || params.row) {
+      const row = params.row ? Number(params.row) : undefined;
+      if (params.row && !Number.isInteger(row)) throw httpError(400, "row must be a whole number");
+      where.slot = {
+        ...(params.warehouseId && { warehouseId: String(params.warehouseId) }),
+        ...(params.rackId && { rackId: String(params.rackId) }),
+        ...(row && { row }),
+      };
+    }
+    let fields = []; // the client's own fields -- extra columns, only when one client is exported
+    const spec = {
+      header: ["Box number", "Barcode", "Client id", "Client", "Description", "Department", "Reference", "Filing from", "Filing to", "Destroy after", "Retention category", "Size", "Status", "On hold", "Location", "Pallet", "Registered"],
+      init: async () => {
+        if (!params.clientId) return;
+        fields = await prisma.customFieldDef.findMany({ where: { clientId: String(params.clientId), active: true }, orderBy: { position: "asc" } });
+        spec.header = [...spec.header, ...fields.map((f) => f.name)];
+      },
       fetch: async (skip, take) => {
         sizeNames = sizeNames ?? (await getBoxSizeNames());
         return prisma.box.findMany({ where, orderBy: [{ clientName: "asc" }, { boxNumber: "asc" }], skip, take });
       },
-      row: (b) => [b.boxNumber, b.barcode, b.clientId, b.clientName, b.description, b.department, b.reference, dateOnly(b.filingDateFrom), dateOnly(b.filingDateTo), dateOnly(b.destroyAfter), b.retentionCategory, sizeNames?.[b.size] ?? b.size, b.status, b.onHold ? "yes" : "no", locationText(b.locationPath), dateOnly(b.createdAt)],
+      row: (b) => [b.boxNumber, b.barcode, b.clientId, b.clientName, b.description, b.department, b.reference, dateOnly(b.filingDateFrom), dateOnly(b.filingDateTo), dateOnly(b.destroyAfter), b.retentionCategory, sizeNames?.[b.size] ?? b.size, b.status, b.onHold ? "yes" : "no", locationText(b.locationPath), b.palletNo, dateOnly(b.createdAt), ...fields.map((f) => b.customFields?.[f.code])],
+    };
+    return spec;
+  },
+  // Docbox "loan register" (Registro de prestamos): everything out with a client on a completed dispatch order, with
+  // who asked, when, and the original shelf -- what the driver takes when collecting returns.
+  loans: (params) => {
+    const where = { status: { in: ["picked", "dispatched"] }, box: { status: "out" }, order: { type: "dispatch", status: "completed", permanentWithdrawal: false } };
+    if (params.clientId) where.order.clientId = String(params.clientId);
+    const at = period(params);
+    if (at) where.order.completedAt = at;
+    return {
+      header: ["Client", "Box number", "Description", "Department", "Reference", "Order", "Urgent", "Requested via", "Requested by", "Requested on", "Issued on", "Original location"],
+      fetch: (skip, take) =>
+        prisma.orderLine.findMany({ where, include: { order: true, box: true }, orderBy: [{ order: { completedAt: "asc" } }, { id: "asc" }], skip, take }),
+      row: (l) => [l.order.clientName, l.box?.boxNumber ?? l.boxNumber, l.box?.description, l.box?.department, l.box?.reference, l.order.orderNumber, l.order.urgent ? "urgent" : "normal", l.order.requestChannel, l.order.contactEmail, dateOnly(l.order.createdAt), dateOnly(l.order.completedAt), locationText(l.fromLocation)],
+    };
+  },
+  // Docbox "returns" sheet: boxes that came back and wait at Goods-In, with the shelf they used to be on, so they can be shelved.
+  toshelve: (params) => {
+    const where = { status: "received" };
+    if (params.clientId) where.clientId = String(params.clientId);
+    let lastShelf = new Map(); // boxId -> where it was before
+    return {
+      header: ["Client", "Box number", "Barcode", "Description", "Goods-In", "Previous location"],
+      fetch: async (skip, take) => {
+        const boxes = await prisma.box.findMany({ where, orderBy: [{ clientName: "asc" }, { boxNumber: "asc" }], skip, take });
+        const moves = await prisma.movement.findMany({
+          where: { boxId: { in: boxes.map((b) => b.id) }, fromLocation: { not: Prisma.DbNull } },
+          orderBy: { at: "desc" },
+        });
+        lastShelf = new Map();
+        for (const m of moves) if (!lastShelf.has(m.boxId)) lastShelf.set(m.boxId, m.fromLocation);
+        return boxes;
+      },
+      row: (b) => [b.clientName, b.boxNumber, b.barcode, b.description, locationText(b.locationPath), locationText(lastShelf.get(b.id))],
     };
   },
   movements: (params) => {
@@ -100,6 +152,7 @@ async function exportCsv(kind, params, res) {
   const make = SPECS[kind];
   if (!make) throw httpError(404, "Unknown export");
   const spec = make(params);
+  if (spec.init) await spec.init();
   const stamp = new Date().toISOString().slice(0, 10);
   await stream(res, `${kind}-${stamp}.csv`, spec.header, spec.fetch, spec.row);
 }

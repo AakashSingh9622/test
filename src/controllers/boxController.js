@@ -4,6 +4,8 @@ const { allocateBoxes } = require("../services/boxAllocationService");
 const { suggestSlotsForBoxes } = require("../services/slotSuggestionService");
 const { listMovementsForBox } = require("../services/movementService");
 const contents = require("../services/boxContentService");
+const importService = require("../services/boxImportService");
+const bulkService = require("../services/boxBulkService");
 const { actorFromReq } = require("../utils/actor");
 
 function parseStatusArray(q) {
@@ -22,6 +24,9 @@ async function listBoxes(req, res) {
     rackId: q.rackId,
     row: q.row ? Number(q.row) : undefined,
     orderId: q.orderId,
+    cfCode: q.cfCode,
+    cfValue: q.cfValue,
+    cfMode: q.cfMode,
     page: q.page ? Number(q.page) : undefined,
     pageSize: q.pageSize ? Number(q.pageSize) : undefined,
   });
@@ -62,6 +67,22 @@ async function createBoxesBatch(req, res) {
   }
   const boxes = await boxService.createBoxesBatch(req.body, actorFromReq(req));
   res.status(201).json(boxes);
+}
+
+// POST /api/boxes/import { clientId, clientName, rows: [...], dryRun? } -- all-or-nothing bulk registration
+async function importBoxes(req, res) {
+  const result = await importService.importBoxes(req.body || {}, actorFromReq(req));
+  res.status(result.dryRun ? 200 : 201).json(result);
+}
+
+// POST /api/boxes/resolve { codes, clientId?, orderType? } -- which box is behind each code, and what stops it
+async function resolveBoxes(req, res) {
+  res.json(await bulkService.resolveBoxes(req.body || {}));
+}
+
+// POST /api/boxes/bulk-move { rows: [{ box, location }], dryRun?, reason? } -- all-or-nothing location change
+async function bulkMove(req, res) {
+  res.json(await bulkService.bulkMove(req.body || {}, actorFromReq(req)));
 }
 
 async function markLabelsPrinted(req, res) {
@@ -157,6 +178,9 @@ module.exports = {
   getBoxOrders,
   getBoxMovements,
   createBoxesBatch,
+  importBoxes,
+  resolveBoxes,
+  bulkMove,
   markLabelsPrinted,
   suggestSlots,
   allocateBatch,

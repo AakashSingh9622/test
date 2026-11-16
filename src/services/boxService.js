@@ -10,6 +10,7 @@ const { recomputeLineSummary, goodsInPath, findBoxByCode } = require("./orderSer
 const { recordException, refuseAndRecord } = require("./exceptionService");
 const { resolveLocation } = require("./locationService");
 const { boxLengthCm } = require("../utils/dimensions");
+const { cleanValuesOrThrow } = require("./customFieldService");
 const { serializeBox, serializeOrder, serializeSimple, dateOnly, toDate } = require("../utils/serialize");
 const httpError = require("../utils/httpError");
 const { parsePagination } = require("../utils/pagination");
@@ -33,6 +34,12 @@ async function searchBoxes(params) {
   else where.status = { not: "destroyed" }; // default: destroyed boxes hide rahte hain (spec §7)
   if (params.onHold !== undefined) where.onHold = params.onHold;
   if (params.orderId) where.openOrderId = params.orderId;
+  // Search a client's own field (Docbox "Campo / Dato", "Like" or "="): cfCode=C1&cfValue=Block 1&cfMode=exact
+  if (params.cfCode && params.cfValue) {
+    const path = [String(params.cfCode)];
+    const filter = params.cfMode === "exact" ? { path, equals: String(params.cfValue) } : { path, string_contains: String(params.cfValue) };
+    where.AND = [...(where.AND || []), { customFields: filter }];
+  }
   if (params.warehouseId || params.rackId || params.row) {
     where.slot = {
       ...(params.warehouseId && { warehouseId: params.warehouseId }),
@@ -98,6 +105,8 @@ async function createBoxesBatch(input, actor) {
   const retentionCategory = await checkRetentionCategory(input.retentionCategory);
   const sizeCode = input.size || "standard";
   await assertUsableSize(sizeCode); // a size from Settings → Box sizes that isn't retired
+  // The client's own fields (same values on every box of the batch); mandatory ones must be filled.
+  const customFields = await cleanValuesOrThrow(input.clientId, input.customFields);
   return prisma.$transaction(async (tx) => {
     // Collection order ke liye register ho rahe hain to order pehle hi validate karo (galat/band
     // order par boxes bana kar fail hone se behtar hai ki shuru me hi 4xx mile).
@@ -129,6 +138,7 @@ async function createBoxesBatch(input, actor) {
           filingDateTo: toDate(input.filingDateTo) || undefined,
           destroyAfter: toDate(input.destroyAfter) || undefined,
           retentionCategory: retentionCategory ?? undefined,
+          customFields: Object.keys(customFields).length ? customFields : undefined,
           size: sizeCode,
           lengthCm: sizes[sizeCode] ?? sizes.standard,
           status: "unallocated",
@@ -173,6 +183,7 @@ const FIELD_LABELS = {
   filingDateTo: "filing date to",
   destroyAfter: "destroy after",
   retentionCategory: "retention category",
+  palletNo: "pallet number",
 };
 const DATE_FIELDS = new Set(["filingDateFrom", "filingDateTo", "destroyAfter"]);
 
@@ -251,6 +262,22 @@ async function updateBoxDetails(boxId, patch, reason, actor) {
     if (nextValue === currentValue) continue;
     changes.push({ field: FIELD_LABELS[key], from: currentValue, to: nextValue });
     data[key] = DATE_FIELDS.has(key) ? toDate(nextValue) : nextValue;
+  }
+
+  // The client's own fields: only the codes sent change; the rest of the box's values stay.
+  if (patch.customFields !== undefined) {
+    const clean = await cleanValuesOrThrow(box.clientId, patch.customFields, { partial: true });
+    const current = box.customFields && typeof box.customFields === "object" ? box.customFields : {};
+    const defs = await prisma.customFieldDef.findMany({ where: { clientId: box.clientId } });
+    const merged = { ...current };
+    for (const code of Object.keys(patch.customFields || {})) {
+      const name = defs.find((d) => d.code === code)?.name ?? code;
+      const next = clean[code];
+      if (next === undefined) delete merged[code];
+      else merged[code] = next;
+      if (current[code] !== next) changes.push({ field: name, from: current[code], to: next });
+    }
+    data.customFields = Object.keys(merged).length ? merged : Prisma.DbNull;
   }
 
   if (changes.length === 0) return serializeBox(box);

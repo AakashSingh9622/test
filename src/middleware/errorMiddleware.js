@@ -35,6 +35,7 @@ function errorHandler(err, _req, res, _next) {
   res.status(err.status || 500).json({
     status: false,
     ...(err.errorCode && { code: err.errorCode }),
+    ...(Array.isArray(err.rowErrors) && { errors: err.rowErrors }), // bulk import: [{ row, message }]
     message: err.message || "Internal server error",
   });
 }

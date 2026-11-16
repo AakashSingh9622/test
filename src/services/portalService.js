@@ -19,6 +19,7 @@ const certificates = require("./certificateService");
 const notifications = require("./notificationService");
 const { listContents } = require("./boxContentService");
 const orderBilling = require("./orderBillingService");
+const { assertContactMay } = require("./clientProfileService");
 
 const OPEN_ORDER_STATUSES = ["requested", "approved", "billing", "scheduled", "in_progress", "ready", "on_hold"];
 const BOX_STATUSES = [
@@ -243,6 +244,8 @@ function clean(value, max) {
 async function createOrder(ctx, body = {}) {
   const type = body.type;
   if (!ORDER_TYPES.includes(type)) throw httpError(400, "type must be collection, dispatch, destruction or digitize");
+
+  await assertContactMay(ctx.clientId, ctx.email, type); // the contact may have been switched off for loans / destruction
 
   const boxIds = [...new Set(asArray(body.boxIds).map(String))];
   if (boxIds.length > MAX_BOXES_PER_ORDER) throw httpError(400, `At most ${MAX_BOXES_PER_ORDER} boxes per order`);

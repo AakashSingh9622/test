@@ -12,6 +12,8 @@ const csv = (kind) => asyncHandler(async (req, res) => exportCsv(kind, req.query
 
 router.get("/inventory.csv", csv("inventory"));
 router.get("/movements.csv", csv("movements"));
+router.get("/loans.csv", csv("loans"));
+router.get("/toshelve.csv", csv("toshelve"));
 router.get("/audit.csv", requirePermission("audit.read"), csv("audit"));
 router.get("/charges.csv", requirePermission("billing.view"), csv("charges"));
 

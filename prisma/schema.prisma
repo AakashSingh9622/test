@@ -181,6 +181,9 @@ enum AdminAction {
   box_sizes_updated
   box_size_created
   box_size_deleted
+  custom_field_saved
+  client_profile_saved
+  contact_permission_saved
   signature_updated
   sage_settings_updated
   invoice_created
@@ -344,6 +347,8 @@ model Box {
   quarantineReason String? // status "quarantined": why
   quarantinedAt  DateTime?
   retentionCategory String? // RetentionRule.code -- how long the box must be kept (spec §4.4)
+  palletNo       String? // pallet the box sits on (Docbox "Nº Palet"); free text, optional
+  customFields   Json? // { [CustomFieldDef.code]: value } -- the client's own fields (Docbox "Expedientes - Campos")
   labelPrinted   Boolean   @default(false)
   slotId         String?
   slot           Slot?     @relation(fields: [slotId], references: [id], onDelete: SetNull)
@@ -367,6 +372,61 @@ model Box {
   @@index([openOrderId])
   @@index([createdAt])
   @@map("box")
+}
+
+// Per-client custom fields (Docbox "Expedientes - Campos"): the extra columns a client's boxes carry (e.g. FOLDER,
+// SUBFOLDER, CONTENTS), each text / date / number and optionally mandatory. Values live in Box.customFields keyed by
+// `code` (C1, C2, ...). A field is never deleted once boxes may hold values -- it is switched off (active=false) instead.
+model CustomFieldDef {
+  id        String   @id @default(uuid())
+  clientId  String // DocuSoft ClientID
+  code      String // C1, C2 ... stable key inside Box.customFields
+  name      String
+  fieldType String // text | date | number
+  required  Boolean  @default(false)
+  position  Int
+  active    Boolean  @default(true)
+  createdBy Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([clientId, code])
+  @@index([clientId, active])
+  @@map("custom_field_def")
+}
+
+// Local details we keep about a client that DocuSoft doesn't hold the way the warehouse needs them (Docbox "Clientes"):
+// the SAP / accounting code and tax ID that must match the client's invoices, and a postal address. The client itself
+// still lives in DocuSoft -- this row only adds to it.
+model ClientProfile {
+  clientId  String   @id // DocuSoft ClientID
+  sapCode   String?
+  taxId     String? // NIF / VAT number
+  address   String?
+  postcode  String?
+  city      String?
+  province  String?
+  // Columns printed on this client's delivery note, in order (Docbox "Formato" / "Ordenacion C1,C2,C3"):
+  // ["description", "reference", "C1", ...] -- keys from the delivery-note column list, or custom field codes.
+  deliveryColumns Json?
+  updatedBy Json
+  updatedAt DateTime @updatedAt
+
+  @@map("client_profile")
+}
+
+// What one contact of a client may do (Docbox "Prestamo" / "Expurgo" flags on a contact). No row = allowed, as before.
+model ContactPermission {
+  id        String   @id @default(uuid())
+  clientId  String
+  email     String // lower-case, as on the order
+  canLoan   Boolean  @default(true) // may ask for boxes (dispatch) and scans (digitize)
+  canPurge  Boolean  @default(true) // may ask for destruction
+  updatedBy Json
+  updatedAt DateTime @updatedAt
+
+  @@unique([clientId, email])
+  @@map("contact_permission")
 }
 
 // Box sizes (Sprint 11): the two built-in ones (standard, large) plus any an admin adds -- a name and the length (cm)
@@ -409,6 +469,8 @@ model Order {
   digitization   Json? // { name, note?, authorisedBy, authorisedAt } -- the client's sign-off for a digitize order
   collectionInfo Json? // { expectedNewBoxes } -- API me "collection" naam se aata hai
   permanentWithdrawal Boolean @default(false) // dispatch only: the boxes go back to the client for good
+  urgent         Boolean      @default(false) // Docbox "Tipo Prestamo": urgent instead of normal loan
+  requestChannel String? // Docbox "Tipo Peticion": how the client asked -- email | phone | in_person | post | fax
   heldFromStatus OrderStatus? // status "on_hold": the status to go back to on resume
   holdReason     String?
   // Destruction asked for by an ordinary client contact waits for the client's main contact (portal) before the

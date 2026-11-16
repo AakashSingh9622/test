@@ -12,8 +12,31 @@ const { balancesByClient } = require("../services/accountService");
 const { rolesForUser } = require("../services/roleService");
 const { can } = require("../auth/permissions");
 
+const { requirePermission } = require("../middleware/requirePermission");
+const { actorFromReq } = require("../utils/actor");
+const profiles = require("../services/clientProfileService");
+
 const router = express.Router();
 router.use(requireAuth);
+
+// Client details we keep locally (SAP code, tax ID, address) and what each contact may do (loans / destruction).
+router.get("/:clientId/profile", asyncHandler(async (req, res) => res.json(await profiles.getProfile(req.params.clientId))));
+router.put(
+  "/:clientId/profile",
+  requirePermission("settings.manage"),
+  asyncHandler(async (req, res) => res.json(await profiles.saveProfile(req.params.clientId, req.body || {}, actorFromReq(req))))
+);
+router.get(
+  "/:clientId/contact-permissions",
+  asyncHandler(async (req, res) => res.json(await profiles.listContactPermissions(req.params.clientId)))
+);
+router.put(
+  "/:clientId/contact-permissions/:email",
+  requirePermission("settings.manage"),
+  asyncHandler(async (req, res) =>
+    res.json(await profiles.setContactPermission(req.params.clientId, req.params.email, req.body || {}, actorFromReq(req)))
+  )
+);
 
 // Box states that are in our warehouse (on a shelf, at Goods-In, on an order but not gone yet) vs. with the client.
 const IN_STORAGE = ["received", "stored", "reserved", "picked", "digitized", "quarantined", "missing"];
