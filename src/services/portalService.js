@@ -19,7 +19,7 @@ const certificates = require("./certificateService");
 const notifications = require("./notificationService");
 const { listContents } = require("./boxContentService");
 const orderBilling = require("./orderBillingService");
-const { assertContactMay } = require("./clientProfileService");
+const { assertContactMay, allowedExpedienteIds } = require("./clientProfileService");
 const { parseFieldConditions, boxIdsByFields } = require("./boxService");
 const { listExpedientes: listClientExpedientes } = require("./expedienteService");
 const { listFields: listClientFields } = require("./customFieldService");
@@ -60,6 +60,13 @@ const WAITING_FOR_AUTHORISATION = {
 const ownOrders = (ctx) =>
   visibleToContactWhere({ clientId: ctx.clientId, contactEmail: ctx.email, isMainContact: ctx.isMainContact });
 
+// The boxes this contact may see: all the client's, or only those in the files the contact was given (Docbox "Permisos Web").
+// A restricted contact does not see boxes that belong to no file.
+async function boxScope(ctx) {
+  const scope = await allowedExpedienteIds(ctx.clientId, ctx.email);
+  return { scope, where: scope ? { clientId: ctx.clientId, expedienteId: { in: scope } } : { clientId: ctx.clientId } };
+}
+
 const actorOf = (ctx) => ({ id: ctx.email, name: ctx.name || ctx.email, side: "client" });
 
 const asArray = (v) => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
@@ -69,7 +76,7 @@ const asArray = (v) => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
 async function summary(ctx) {
   const where = ownOrders(ctx);
   const [boxGroups, orderGroups, needsAuthorisation, awaitingPayment, warehouses, recent] = await Promise.all([
-    prisma.box.groupBy({ by: ["status"], where: { clientId: ctx.clientId }, _count: { _all: true } }),
+    boxScope(ctx).then(({ where: boxWhere }) => prisma.box.groupBy({ by: ["status"], where: boxWhere, _count: { _all: true } })),
     prisma.order.groupBy({ by: ["status"], where, _count: { _all: true } }),
     prisma.order.count({
       where: { ...where, ...WAITING_FOR_AUTHORISATION, status: { in: OPEN_ORDER_STATUSES } },
@@ -132,7 +139,8 @@ async function visibleOrderIds(ctx, orderIds) {
 }
 
 async function listBoxes(ctx, q = {}) {
-  const where = { clientId: ctx.clientId };
+  const { scope, where: scopeWhere } = await boxScope(ctx);
+  const where = { ...scopeWhere };
   const statuses = asArray(q.status).filter((s) => BOX_STATUSES.includes(s));
   if (statuses.length) where.status = { in: statuses };
   else if (q.includeDestroyed !== "true") where.status = { not: "destroyed" };
@@ -142,7 +150,10 @@ async function listBoxes(ctx, q = {}) {
   }
   // Docbox portal "Busquedas": one of the client's expedientes, up to three of its own fields (Contiene / Igual, all or
   // any), and the observations. The scope is always this client -- never an id from the request.
-  if (q.expedienteId) where.expedienteId = String(q.expedienteId);
+  if (q.expedienteId) {
+    // asking for a file outside the contact's files finds nothing
+    where.expedienteId = scope && !scope.includes(String(q.expedienteId)) ? "__none__" : String(q.expedienteId);
+  }
   if (q.comments) where.comments = { contains: String(q.comments).slice(0, 100), mode: "insensitive" };
   const conditions = parseFieldConditions(q);
   if (conditions.length > MAX_PORTAL_FIELDS) throw httpError(400, `Search by ${MAX_PORTAL_FIELDS} fields at most`);
@@ -165,16 +176,38 @@ async function listBoxes(ctx, q = {}) {
 
 // The client's expedientes and the fields of one of them (or all the shared ones) -- what the search is built from.
 async function listExpedientes(ctx) {
-  return (await listClientExpedientes(ctx.clientId)).map(({ id, code, description }) => ({ id, code, description }));
+  const scope = await allowedExpedienteIds(ctx.clientId, ctx.email);
+  const all = await listClientExpedientes(ctx.clientId);
+  return all.filter((e) => !scope || scope.includes(e.id)).map(({ id, code, description }) => ({ id, code, description }));
 }
 
 async function listFields(ctx, q = {}) {
-  const fields = await listClientFields(ctx.clientId, { expedienteId: q.expedienteId ? String(q.expedienteId) : undefined });
+  const scope = await allowedExpedienteIds(ctx.clientId, ctx.email);
+  if (q.expedienteId && scope && !scope.includes(String(q.expedienteId))) return [];
+  let fields = await listClientFields(ctx.clientId, { expedienteId: q.expedienteId ? String(q.expedienteId) : undefined });
+  // without a file chosen, a restricted contact gets the shared fields and those of its own files only
+  if (scope && !q.expedienteId) fields = fields.filter((f) => !f.expedienteId || scope.includes(f.expedienteId));
   return fields.map(({ code, name, fieldType, expedienteId }) => ({ code, name, fieldType, expedienteId }));
 }
 
+// Docbox portal "Mis Datos": who is logged in and the client / files (Permisos) they may use.
+async function myDetails(ctx) {
+  const [expedientes, perm] = await Promise.all([listExpedientes(ctx), prisma.contactPermission.findUnique({ where: { clientId_email: { clientId: ctx.clientId, email: String(ctx.email).trim().toLowerCase() } } })]);
+  const known = ctx.clientName ? null : await prisma.box.findFirst({ where: { clientId: ctx.clientId }, orderBy: { createdAt: "desc" }, select: { clientName: true } });
+  return {
+    email: ctx.email,
+    name: ctx.name ?? null,
+    isMainContact: ctx.isMainContact,
+    client: { id: ctx.clientId, name: ctx.clientName || known?.clientName || ctx.clientId },
+    files: expedientes,
+    canLoan: perm ? perm.canLoan : true,
+    canPurge: perm ? perm.canPurge : true,
+  };
+}
+
 async function findOwnBox(ctx, boxId) {
-  const box = await prisma.box.findFirst({ where: { id: String(boxId), clientId: ctx.clientId }, include: BOX_INCLUDE });
+  const { where: scopeWhere } = await boxScope(ctx);
+  const box = await prisma.box.findFirst({ where: { id: String(boxId), ...scopeWhere }, include: BOX_INCLUDE });
   if (!box) throw httpError(404, "Box not found");
   return box;
 }
@@ -273,6 +306,12 @@ async function createOrder(ctx, body = {}) {
   await assertContactMay(ctx.clientId, ctx.email, type); // the contact may have been switched off for loans / destruction
 
   const boxIds = [...new Set(asArray(body.boxIds).map(String))];
+  if (boxIds.length) {
+    // a contact can only ask for boxes it can see
+    const { where: scopeWhere } = await boxScope(ctx);
+    const visible = await prisma.box.count({ where: { id: { in: boxIds }, ...scopeWhere } });
+    if (visible !== boxIds.length) throw httpError(404, "Box not found");
+  }
   if (boxIds.length > MAX_BOXES_PER_ORDER) throw httpError(400, `At most ${MAX_BOXES_PER_ORDER} boxes per order`);
   const address = clean(body.address, 500);
   const expectedNewBoxes = body.expectedNewBoxes === undefined ? 0 : Number(body.expectedNewBoxes);
@@ -423,6 +462,7 @@ async function listNotifications(ctx, q = {}) {
 }
 
 module.exports = {
+  myDetails,
   listExpedientes,
   listFields,
   payOrder,

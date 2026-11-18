@@ -439,6 +439,7 @@ model ContactPermission {
   email     String // lower-case, as on the order
   canLoan   Boolean  @default(true) // may ask for boxes (dispatch) and scans (digitize)
   canPurge  Boolean  @default(true) // may ask for destruction
+  expedienteIds Json @default("[]") // the expedientes (files) the contact may see on the portal; empty = all of them
   updatedBy Json
   updatedAt DateTime @updatedAt
 
@@ -477,6 +478,8 @@ model Expediente {
   clientId    String // DocuSoft ClientID
   code        String // upper case, e.g. PLANOS; unique per client, never changes
   description String
+  format      String   @default("Albaran") // delivery-note template: Albaran, AlbaranApaisado, AlbaranCod, AlbaranCodApaisado, AlbaranAkte
+  deliveryColumns Json @default("[]") // the fields on the delivery note, in order (Docbox "Ordenacion C1,C2,C3"); empty = the client's own choice
   createdBy   Json
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

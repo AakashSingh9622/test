@@ -5,12 +5,13 @@
 const express = require("express");
 const { requireAuth } = require("../middleware/authMiddleware");
 const asyncHandler = require("../utils/asyncHandler");
-const { loansReport, archiveReport, interfilingReport } = require("../services/reportService");
+const { loansReport, archiveReport, interfilingReport, requestersReport } = require("../services/reportService");
 
 const router = express.Router();
 router.use(requireAuth);
 
 router.get("/loans", asyncHandler(async (req, res) => res.json(await loansReport(req.query))));
+router.get("/requesters", asyncHandler(async (req, res) => res.json(await requestersReport(req.query))));
 router.get("/interfiling", asyncHandler(async (req, res) => res.json(await interfilingReport(req.query))));
 router.get("/archive", asyncHandler(async (req, res) => res.json(await archiveReport(req.query))));
 

@@ -73,8 +73,15 @@ async function listContactPermissions(clientId) {
   const id = text(clientId);
   if (!id) throw httpError(400, "clientId is required");
   const rows = await prisma.contactPermission.findMany({ where: { clientId: id } });
-  return rows.map((r) => ({ email: r.email, canLoan: r.canLoan, canPurge: r.canPurge }));
+  return rows.map(serializePermission);
 }
+
+const serializePermission = (r) => ({
+  email: r.email,
+  canLoan: r.canLoan,
+  canPurge: r.canPurge,
+  expedienteIds: Array.isArray(r.expedienteIds) ? r.expedienteIds : [],
+});
 
 async function setContactPermission(clientId, email, body, actor) {
   const id = text(clientId);
@@ -83,7 +90,17 @@ async function setContactPermission(clientId, email, body, actor) {
   const data = {};
   if (body.canLoan !== undefined) data.canLoan = Boolean(body.canLoan);
   if (body.canPurge !== undefined) data.canPurge = Boolean(body.canPurge);
-  if (!Object.keys(data).length) throw httpError(400, "Send canLoan and / or canPurge");
+  // Docbox "Permisos Web": the files (expedientes) the contact may see on the portal; an empty list = all of them.
+  if (body.expedienteIds !== undefined) {
+    if (!Array.isArray(body.expedienteIds)) throw httpError(400, "expedienteIds must be a list");
+    const ids = [...new Set(body.expedienteIds.map((v) => text(v)).filter(Boolean))];
+    if (ids.length) {
+      const own = await prisma.expediente.findMany({ where: { clientId: id, id: { in: ids } }, select: { id: true } });
+      if (own.length !== ids.length) throw httpError(400, "One of those files doesn't belong to this client");
+    }
+    data.expedienteIds = ids;
+  }
+  if (!Object.keys(data).length) throw httpError(400, "Send canLoan, canPurge and / or expedienteIds");
   const row = await prisma.$transaction(async (tx) => {
     const saved = await tx.contactPermission.upsert({
       where: { clientId_email: { clientId: id, email: mail } },
@@ -98,7 +115,7 @@ async function setContactPermission(clientId, email, body, actor) {
     );
     return saved;
   });
-  return { email: row.email, canLoan: row.canLoan, canPurge: row.canPurge };
+  return serializePermission(row);
 }
 
 // The portal asks before creating an order: a contact switched off for loans / destruction can't request them.
@@ -112,4 +129,14 @@ async function assertContactMay(clientId, email, orderType) {
   }
 }
 
-module.exports = { getProfile, saveProfile, listContactPermissions, setContactPermission, assertContactMay };
+// The expedientes a contact may see on the portal: null = every file of the client, else the ids. (A file deleted since
+// is dropped; if none is left the contact sees nothing rather than everything.)
+async function allowedExpedienteIds(clientId, email) {
+  const row = await prisma.contactPermission.findUnique({ where: { clientId_email: { clientId: text(clientId), email: normEmail(email) } } });
+  const ids = row && Array.isArray(row.expedienteIds) ? row.expedienteIds : [];
+  if (!ids.length) return null;
+  const alive = await prisma.expediente.findMany({ where: { clientId: text(clientId), id: { in: ids } }, select: { id: true } });
+  return alive.map((e) => e.id);
+}
+
+module.exports = { allowedExpedienteIds, cleanDeliveryColumns, getProfile, saveProfile, listContactPermissions, setContactPermission, assertContactMay };
