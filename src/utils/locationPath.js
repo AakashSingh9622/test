@@ -7,6 +7,7 @@
 function pathFor(rack, slot) {
   return {
     warehouse: rack.warehouse?.code ?? slot.warehouseId,
+    ...(rack.warehouse?.site && { site: rack.warehouse.site }),
     ...(rack.zone && { zone: rack.zone.code }),
     ...(rack.aisle && { aisle: rack.aisle.code }),
     rack: rack.code,
@@ -18,7 +19,7 @@ function pathFor(rack, slot) {
 
 // The include that loads what pathFor needs.
 const RACK_PATH_INCLUDE = {
-  warehouse: { select: { code: true } },
+  warehouse: { select: { code: true, site: true } },
   zone: { select: { code: true } },
   aisle: { select: { code: true } },
 };
@@ -32,9 +33,9 @@ function locationText(p) {
   const position = p.position ?? column;
   return [
     p.warehouse,
-    p.zone && `Zone ${p.zone}`,
+    p.zone && `Floor ${p.zone}`,
     p.aisle && `Aisle ${p.aisle}`,
-    `Rack ${p.rack}`,
+    `Module ${p.rack}`,
     shelf != null ? `Shelf ${shelf} · Position ${position}` : `Slot ${p.slot}`,
   ]
     .filter(Boolean)

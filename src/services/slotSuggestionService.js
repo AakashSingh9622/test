@@ -54,7 +54,7 @@ async function suggestSlotsForBoxes({ clientId, boxSizes, warehouseId, preferSlo
     const zoneCount = (slot.rack.zoneId && clientBoxCountByZone.get(slot.rack.zoneId)) || 0;
     if (clientCount > 0) {
       score += 20;
-      reasons.push(`Same rack as ${boxes(clientCount)}`);
+      reasons.push(`Same module as ${boxes(clientCount)}`);
     } else if (aisleCount > 0) {
       score += 10;
       reasons.push(`Same aisle as ${boxes(aisleCount)}`);

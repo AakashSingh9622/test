@@ -8,12 +8,36 @@ async function listWarehouses(_req, res) {
 }
 
 async function createWarehouse(req, res) {
-  const { code, name, address } = req.body || {};
+  const { code, name, address, site } = req.body || {};
   if (!code || !name) {
     return res.status(400).json({ message: "code and name are required" });
   }
-  const warehouse = await locationService.createWarehouse({ code, name, address }, actorFromReq(req));
+  const warehouse = await locationService.createWarehouse({ code, name, address, site }, actorFromReq(req));
   res.status(201).json(warehouse);
+}
+
+async function patchWarehouse(req, res) {
+  const { name, address, site } = req.body || {};
+  if (name === undefined && address === undefined && site === undefined) {
+    return res.status(400).json({ message: "Send name, address or site" });
+  }
+  res.json(await locationService.updateWarehouse(req.params.warehouseId, { name, address, site }, actorFromReq(req)));
+}
+
+async function removeWarehouse(req, res) {
+  res.json(await locationService.deleteWarehouse(req.params.warehouseId, actorFromReq(req)));
+}
+
+async function addRackShelf(req, res) {
+  res.status(201).json(await locationService.addShelf(req.params.rackId, actorFromReq(req)));
+}
+
+async function removeRackShelf(req, res) {
+  res.json(await locationService.removeLastShelf(req.params.rackId, actorFromReq(req)));
+}
+
+async function removeRack(req, res) {
+  res.json(await locationService.deleteRack(req.params.rackId, actorFromReq(req)));
 }
 
 async function getWarehouse(req, res) {
@@ -55,7 +79,7 @@ async function createRack(req, res) {
 
 async function getRack(req, res) {
   const rack = await locationService.getRackById(req.params.rackId);
-  if (!rack) return res.status(404).json({ message: "Rack not found" });
+  if (!rack) return res.status(404).json({ message: "Module not found" });
   res.json(rack);
 }
 
@@ -78,7 +102,7 @@ async function patchRack(req, res) {
     zoneId,
     aisleId,
   }, actorFromReq(req));
-  if (!rack) return res.status(404).json({ message: "Rack not found" });
+  if (!rack) return res.status(404).json({ message: "Module not found" });
   res.json(rack);
 }
 
@@ -162,6 +186,11 @@ module.exports = {
   searchRacks,
   listWarehouses,
   createWarehouse,
+  patchWarehouse,
+  removeWarehouse,
+  addRackShelf,
+  removeRackShelf,
+  removeRack,
   getWarehouse,
   listRacks,
   createRack,

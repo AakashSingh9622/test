@@ -18,6 +18,11 @@ async function listOrders(req, res) {
       clientId: q.clientId,
       contactEmail: q.contactEmail,
       q: q.q,
+      loanType: q.loanType,
+      requestChannel: q.requestChannel,
+      requester: q.requester,
+      from: q.from,
+      to: q.to,
       page: q.page,
       pageSize: q.pageSize,
     })
@@ -128,6 +133,17 @@ async function reopenOrder(req, res) {
   res.json(await orderService.reopenOrder(req.params.orderId, reason, actorFromReq(req)));
 }
 
+async function editOrder(req, res) {
+  const b = req.body || {};
+  res.json(
+    await orderService.editOrderDetails(
+      req.params.orderId,
+      { loanType: b.loanType, requestChannel: b.requestChannel, contactEmail: b.contactEmail, contactName: b.contactName, remarks: b.remarks },
+      actorFromReq(req)
+    )
+  );
+}
+
 async function resumeOrder(req, res) {
   res.json(await orderService.resumeOrder(req.params.orderId));
 }
@@ -164,6 +180,7 @@ module.exports = {
   holdOrder,
   resumeOrder,
   reopenOrder,
+  editOrder,
   approveDestruction,
   recordDelivery,
   getCertificate,

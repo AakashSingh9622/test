@@ -29,6 +29,7 @@ const exportRoutes = require("./routes/exportRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
 const meRoutes = require("./routes/meRoutes");
 const customFieldRoutes = require("./routes/customFieldRoutes");
+const expedienteRoutes = require("./routes/expedienteRoutes");
 const reportRoutes = require("./routes/reportRoutes");
 const { notFound, errorHandler } = require("./middleware/errorMiddleware");
 
@@ -87,6 +88,7 @@ app.use("/api/exports", exportRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/me", meRoutes);
 app.use("/api/custom-fields", customFieldRoutes);
+app.use("/api/expedientes", expedienteRoutes);
 app.use("/api/reports", reportRoutes);
 // External scan-app API (email + base64 password + agrno in the body).
 app.use("/api/digitize", digitizeRoutes);

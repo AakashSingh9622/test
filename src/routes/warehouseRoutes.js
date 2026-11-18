@@ -2,6 +2,8 @@ const express = require("express");
 const {
   listWarehouses,
   createWarehouse,
+  patchWarehouse,
+  removeWarehouse,
   getWarehouse,
   listRacks,
   createRack,
@@ -29,6 +31,10 @@ router.post(
   requirePermission("layout.manage"),
   asyncHandler(async (req, res) => res.status(req.body?.dryRun ? 200 : 201).json(await importLayout(req.body || {}, actorFromReq(req))))
 );
+// The site (Docbox "Sede") a warehouse belongs to.
+router.patch("/:warehouseId", requirePermission("layout.manage"), asyncHandler(patchWarehouse));
+// A warehouse with no racks can be deleted.
+router.delete("/:warehouseId", requirePermission("layout.manage"), asyncHandler(removeWarehouse));
 router.get("/:warehouseId", asyncHandler(getWarehouse));
 router.get("/:warehouseId/racks", asyncHandler(listRacks));
 router.post("/:warehouseId/racks", requirePermission("layout.manage"), asyncHandler(createRack));

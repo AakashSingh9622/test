@@ -6,8 +6,10 @@ const prisma = require("../config/prisma");
 const { nextSequence } = require("./counterService");
 const { appendAuditEvent } = require("./auditService");
 const { listBoxSizes } = require("./boxSizeService");
-const { checkValues } = require("./customFieldService");
-const { TX_OPTIONS } = require("./boxAllocationService");
+const { checkValues, appliesTo } = require("./customFieldService");
+const { resolveForBox } = require("./expedienteService");
+const { TX_OPTIONS, allocateBoxes, isActiveSlot } = require("./boxAllocationService");
+const { resolveParts, hasLocationParts } = require("./locationParts");
 const { serializeBox, toDate } = require("../utils/serialize");
 const httpError = require("../utils/httpError");
 
@@ -29,11 +31,11 @@ function parseDate(value) {
   return Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== iso ? undefined : iso;
 }
 
-async function validateRows(rows, clientId) {
+async function validateRows(rows, clientId, expedienteId) {
   const [sizeList, rules, fieldDefs] = await Promise.all([
     listBoxSizes(),
     prisma.retentionRule.findMany({ where: { isCurrent: true }, select: { code: true } }),
-    prisma.customFieldDef.findMany({ where: { clientId, active: true }, orderBy: { position: "asc" } }),
+    prisma.customFieldDef.findMany({ where: { clientId, active: true, ...appliesTo(expedienteId) }, orderBy: { position: "asc" } }),
   ]);
   const sizes = new Map();
   for (const s of sizeList.items) {
@@ -44,7 +46,9 @@ async function validateRows(rows, clientId) {
 
   const errors = [];
   const clean = [];
-  rows.forEach((raw, i) => {
+  const used = new Map(); // slotId -> cm taken by earlier rows of this same file
+  for (let i = 0; i < rows.length; i++) {
+    const raw = rows[i];
     const rowNo = i + 2; // row 1 of the sheet is the header
     const problems = [];
     const r = raw && typeof raw === "object" ? raw : {};
@@ -53,6 +57,15 @@ async function validateRows(rows, clientId) {
     if (!description) problems.push("description is required");
     else if (description.length > 500) problems.push("description is too long (500 characters at most)");
 
+    const comments = text(r.comments);
+    if (comments.length > 1000) problems.push("comments are too long (1000 characters at most)");
+    const entryDate = parseDate(r.entryDate);
+    if (entryDate === undefined) problems.push("entryDate is not a date (use YYYY-MM-DD or DD/MM/YYYY)");
+
+    const containerNo = text(r.containerNo);
+    if (containerNo.length > 40) problems.push("container number is too long (40 characters at most)");
+    const containerType = text(r.containerType);
+    if (containerType.length > 40) problems.push("container type is too long (40 characters at most)");
     const palletNo = text(r.palletNo);
     if (palletNo.length > 40) problems.push("pallet number is too long (40 characters at most)");
 
@@ -77,15 +90,36 @@ async function validateRows(rows, clientId) {
     const custom = checkValues(fieldDefs, r.customFields);
     problems.push(...custom.problems);
 
+    // Optional location columns (Warehouse, Floor, Aisle, Module, Shelf): when present the box is put on that shelf.
+    let slotId;
+    if (hasLocationParts(r) && size) {
+      const placed = await resolveParts({ site: r.site, warehouse: r.warehouse, floor: r.floor, aisle: r.aisle, module: r.module, shelf: r.shelf }, { needCm: size.lengthCm });
+      if (placed.error) problems.push(placed.error);
+      else {
+        // The first position of the shelf with room, counting the boxes the earlier rows already claimed.
+        const slot = (placed.found.positions ?? []).find((s) => isActiveSlot(s) && s.capacity - s.used - (used.get(s.id) ?? 0) >= size.lengthCm);
+        if (!slot) problems.push(`shelf ${text(r.shelf)} of module ${text(r.module)} has no room for a ${size.name} box (${size.lengthCm} cm)`);
+        else {
+          slotId = slot.id;
+          used.set(slot.id, (used.get(slot.id) ?? 0) + size.lengthCm);
+        }
+      }
+    }
+
     if (problems.length) {
       errors.push({ row: rowNo, message: problems.join("; ") });
-      return;
+      continue;
     }
     clean.push({
+      slotId,
       description,
       department: text(r.department) || undefined,
       reference: text(r.reference) || undefined,
       palletNo: palletNo || undefined,
+      containerNo: containerNo || undefined,
+      containerType: containerType || undefined,
+      comments: comments || undefined,
+      entryDate: entryDate || undefined,
       filingDateFrom,
       filingDateTo: filingDateTo || undefined,
       destroyAfter: destroyAfter || undefined,
@@ -94,7 +128,7 @@ async function validateRows(rows, clientId) {
       size: size.code,
       lengthCm: size.lengthCm,
     });
-  });
+  }
   return { errors, clean };
 }
 
@@ -105,15 +139,25 @@ async function importBoxes(input, actor) {
   if (!Array.isArray(input.rows) || input.rows.length === 0) throw httpError(400, "rows (non-empty array) is required");
   if (input.rows.length > MAX_ROWS) throw httpError(400, `At most ${MAX_ROWS} rows per import — split the file`);
 
-  const { errors, clean } = await validateRows(input.rows, clientId);
+  // Docbox "Fecha Entrada": one entry date for the whole file (today when left out); a row can carry its own.
+  const fileEntry = input.entryDate ? parseDate(input.entryDate) : null;
+  if (input.entryDate && !fileEntry) throw httpError(400, "entryDate is not a date (use YYYY-MM-DD)");
+  const entryFallback = fileEntry || new Date().toISOString().slice(0, 10);
+
+  // Docbox: the file is imported into one expediente of the client (needed when the client has any).
+  const expediente = await resolveForBox(clientId, input.expedienteId);
+
+  const { errors, clean } = await validateRows(input.rows, clientId, expediente.id);
   if (errors.length) {
     const err = httpError(422, `${errors.length} row${errors.length === 1 ? " has" : "s have"} problems — nothing was imported`);
     err.errorCode = "IMPORT_INVALID";
     err.rowErrors = errors;
     throw err;
   }
-  if (input.dryRun) return { dryRun: true, count: clean.length, boxes: [] };
+  const toPlace = clean.filter((c) => c.slotId).length;
+  if (input.dryRun) return { dryRun: true, count: clean.length, placed: toPlace, boxes: [] };
 
+  const planned = []; // { boxId, slotId } for the rows that came with a location
   const boxes = await prisma.$transaction(async (tx) => {
     const created = [];
     for (const row of clean) {
@@ -129,6 +173,12 @@ async function importBoxes(input, actor) {
           department: row.department,
           reference: row.reference,
           palletNo: row.palletNo,
+          containerNo: row.containerNo,
+          containerType: row.containerType,
+          expedienteId: expediente.id ?? undefined,
+          expedienteCode: expediente.code ?? undefined,
+          comments: row.comments,
+          entryDate: toDate(row.entryDate || entryFallback),
           filingDateFrom: toDate(row.filingDateFrom),
           filingDateTo: row.filingDateTo ? toDate(row.filingDateTo) : undefined,
           destroyAfter: row.destroyAfter ? toDate(row.destroyAfter) : undefined,
@@ -143,11 +193,25 @@ async function importBoxes(input, actor) {
         },
       });
       await appendAuditEvent(box, "registered", actor, { note: "Bulk import" }, tx);
+      if (row.slotId) planned.push({ boxId: box.id, slotId: row.slotId });
       created.push(serializeBox(box));
     }
     return created;
   }, { ...TX_OPTIONS, timeout: 60_000 });
-  return { dryRun: false, count: boxes.length, boxes };
+
+  // Put the boxes that came with a location on their shelves (the normal allocation: capacity, ledger, history).
+  let placed = 0;
+  let placeProblem;
+  if (planned.length) {
+    try {
+      const moved = await allocateBoxes({ allocations: planned, reason: "Bulk import" }, actor);
+      placed = moved.length;
+    } catch (e) {
+      // The boxes ARE registered; only the shelving failed (e.g. someone filled the shelf a moment ago).
+      placeProblem = e.message;
+    }
+  }
+  return { dryRun: false, count: boxes.length, placed, ...(placeProblem && { placeProblem }), boxes };
 }
 
 module.exports = { importBoxes, MAX_ROWS };

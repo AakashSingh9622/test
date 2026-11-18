@@ -9,8 +9,10 @@ const { TX_OPTIONS, releaseBoxSlot, RELEASED_BOX_FIELDS, allocateBoxes, isActive
 const { recomputeLineSummary, goodsInPath, findBoxByCode } = require("./orderService");
 const { recordException, refuseAndRecord } = require("./exceptionService");
 const { resolveLocation } = require("./locationService");
+const { resolveParts, hasLocationParts } = require("./locationParts");
 const { boxLengthCm } = require("../utils/dimensions");
 const { cleanValuesOrThrow } = require("./customFieldService");
+const { resolveForBox } = require("./expedienteService");
 const { serializeBox, serializeOrder, serializeSimple, dateOnly, toDate } = require("../utils/serialize");
 const httpError = require("../utils/httpError");
 const { parsePagination } = require("../utils/pagination");
@@ -27,9 +29,12 @@ async function searchBoxes(params) {
       { clientName: contains },
       { reference: contains },
       { department: contains },
+      { comments: contains },
+      { containerNo: contains },
     ];
   }
   if (params.clientId) where.clientId = params.clientId;
+  if (params.expedienteId) where.expedienteId = String(params.expedienteId);
   if (params.status?.length) where.status = { in: params.status };
   else where.status = { not: "destroyed" }; // default: destroyed boxes hide rahte hain (spec §7)
   if (params.onHold !== undefined) where.onHold = params.onHold;
@@ -40,13 +45,27 @@ async function searchBoxes(params) {
     const filter = params.cfMode === "exact" ? { path, equals: String(params.cfValue) } : { path, string_contains: String(params.cfValue) };
     where.AND = [...(where.AND || []), { customFields: filter }];
   }
-  if (params.warehouseId || params.rackId || params.row) {
-    where.slot = {
-      ...(params.warehouseId && { warehouseId: params.warehouseId }),
-      ...(params.rackId && { rackId: params.rackId }),
-      ...(params.row && { row: params.row }),
-    };
-  }
+  // Where it is: ids (the module page) or what a person types / a location link carries (code or name, any letter case).
+  const t = (v) => String(v).trim();
+  const eq = (v) => ({ equals: t(v), mode: "insensitive" });
+  const codeOrName = (v) => ({ OR: [{ code: eq(v) }, { name: { contains: t(v), mode: "insensitive" } }] });
+  const place = {};
+  if (params.warehouseId) place.warehouseId = params.warehouseId;
+  if (params.rackId) place.rackId = params.rackId;
+  if (params.row) place.row = Number(params.row);
+  const warehouseWhere = {};
+  if (params.site) warehouseWhere.site = eq(params.site); // Sede
+  if (params.warehouse) warehouseWhere.OR = [{ code: eq(params.warehouse) }, { name: eq(params.warehouse) }]; // Almacen
+  if (Object.keys(warehouseWhere).length) place.warehouse = warehouseWhere;
+  const rackWhere = {};
+  if (params.zone) rackWhere.zone = codeOrName(params.zone); // Bloque / Planta
+  if (params.aisle) rackWhere.aisle = codeOrName(params.aisle); // Pasillo
+  if (params.module) rackWhere.OR = [{ code: eq(params.module) }, { label: { contains: t(params.module), mode: "insensitive" } }]; // Estanteria / Modulo
+  if (Object.keys(rackWhere).length) place.rack = rackWhere;
+  if (Object.keys(place).length) where.slot = place;
+  if (params.palletNo) where.palletNo = { contains: t(params.palletNo), mode: "insensitive" }; // Nº Palet
+  if (params.containerNo) where.containerNo = { contains: t(params.containerNo), mode: "insensitive" }; // Nº Contenedor
+  if (params.containerType) where.containerType = { contains: t(params.containerType), mode: "insensitive" }; // Tipo Contenedor
 
   const { skip, take } = parsePagination(params);
 
@@ -92,6 +111,33 @@ async function getOrdersForBox(boxId) {
 }
 
 // A retention category must be the code of a current retention rule (or empty).
+const MAX_COMMENTS = 1000;
+// Comments are free text (Docbox "Observaciones"); empty means none.
+function clampComments(value) {
+  const t = value === undefined || value === null ? "" : String(value).trim();
+  if (t.length > MAX_COMMENTS) throw httpError(400, `comments are too long (${MAX_COMMENTS} characters at most)`);
+  return t || undefined;
+}
+
+// Pallet number (Docbox "Nº Palet"): free text, optional.
+function cleanPallet(value) {
+  const t = value === undefined || value === null ? "" : String(value).trim();
+  if (t.length > 40) throw httpError(400, "pallet number is too long (40 characters at most)");
+  return t || undefined;
+}
+
+// Container number / type (Docbox "NºContenedor", "Tipo Contenedor"): free text, optional.
+function cleanContainer(value, label) {
+  const t = value === undefined || value === null ? "" : String(value).trim();
+  if (t.length > 40) throw httpError(400, `${label} is too long (40 characters at most)`);
+  return t || undefined;
+}
+
+// The filing period must run forwards (both are YYYY-MM-DD, so text order is date order).
+function assertFilingPeriod(from, to) {
+  if (from && to && String(to) < String(from)) throw httpError(400, "filing date to is before filing date from");
+}
+
 async function checkRetentionCategory(value) {
   if (value === undefined || value === null || value === "") return null;
   const code = String(value).trim().toUpperCase();
@@ -103,11 +149,41 @@ async function checkRetentionCategory(value) {
 // Naye boxes ek saath register karta hai (Register Boxes wizard, step 1) -- ek transaction me.
 async function createBoxesBatch(input, actor) {
   const retentionCategory = await checkRetentionCategory(input.retentionCategory);
+  assertFilingPeriod(input.filingDateFrom, input.filingDateTo);
+  const palletNo = cleanPallet(input.palletNo);
+  const containerNo = cleanContainer(input.containerNo, "container number");
+  const containerType = cleanContainer(input.containerType, "container type");
+  // A copy made with Duplicate: its History says which box it came from.
+  const duplicateOf = /^[A-Za-z0-9._-]{1,40}$/.test(String(input.duplicateOf ?? "")) ? String(input.duplicateOf) : undefined;
   const sizeCode = input.size || "standard";
   await assertUsableSize(sizeCode); // a size from Settings → Box sizes that isn't retired
   // The client's own fields (same values on every box of the batch); mandatory ones must be filled.
-  const customFields = await cleanValuesOrThrow(input.clientId, input.customFields);
-  return prisma.$transaction(async (tx) => {
+  // The expediente (Docbox: the client's file): needed when the client has any; its own fields are the ones checked.
+  const expediente = await resolveForBox(input.clientId, input.expedienteId);
+  const customFields = await cleanValuesOrThrow(input.clientId, input.customFields, { expedienteId: expediente.id });
+
+  // Docbox "New record" shows the location in the same form: when Module + Shelf (and optionally Site, Warehouse, Floor,
+  // Aisle) are given, the boxes go onto that shelf right after they are registered -- one position at a time, the first
+  // with room. Checked BEFORE anything is created, so a shelf with too little room registers nothing.
+  let plan = null; // slot id for each box, in order
+  const place = input.place && typeof input.place === "object" ? input.place : null;
+  if (place && hasLocationParts(place)) {
+    const lengths = await getBoxSizes();
+    const needCm = lengths[sizeCode] ?? lengths.standard;
+    const found = await resolveParts(place, { needCm });
+    if (found.error) throw httpError(400, found.error);
+    const positions = (found.found.positions ?? []).filter(isActiveSlot);
+    const used = new Map();
+    plan = [];
+    for (let i = 0; i < input.quantity; i++) {
+      const slot = positions.find((s) => s.capacity - s.used - (used.get(s.id) ?? 0) >= needCm);
+      if (!slot) throw httpError(400, `That shelf has room for only ${i} of the ${input.quantity} boxes (${needCm} cm each) — nothing was registered`);
+      used.set(slot.id, (used.get(slot.id) ?? 0) + needCm);
+      plan.push(slot.id);
+    }
+  }
+
+  const created = await prisma.$transaction(async (tx) => {
     // Collection order ke liye register ho rahe hain to order pehle hi validate karo (galat/band
     // order par boxes bana kar fail hone se behtar hai ki shuru me hi 4xx mile).
     const linkedOrder = input.orderId ? await tx.order.findUnique({ where: { id: input.orderId } }) : null;
@@ -134,6 +210,13 @@ async function createBoxesBatch(input, actor) {
           description: override?.description ?? input.description,
           department: input.department || undefined,
           reference: override?.reference ?? (input.reference || undefined),
+          palletNo,
+          containerNo,
+          containerType,
+          expedienteId: expediente.id ?? undefined,
+          expedienteCode: expediente.code ?? undefined,
+          comments: clampComments(input.comments),
+          entryDate: toDate(input.entryDate) || toDate(new Date().toISOString().slice(0, 10)),
           filingDateFrom: toDate(input.filingDateFrom),
           filingDateTo: toDate(input.filingDateTo) || undefined,
           destroyAfter: toDate(input.destroyAfter) || undefined,
@@ -147,7 +230,13 @@ async function createBoxesBatch(input, actor) {
           createdBy: actor,
         },
       });
-      await appendAuditEvent(box, "registered", actor, { orderId: input.orderId, orderNumber: input.orderNumber }, tx);
+      await appendAuditEvent(
+        box,
+        "registered",
+        actor,
+        { orderId: input.orderId, orderNumber: input.orderNumber, note: duplicateOf ? `Duplicate of ${duplicateOf}` : undefined },
+        tx
+      );
       created.push(serializeBox(box));
     }
 
@@ -162,6 +251,16 @@ async function createBoxesBatch(input, actor) {
     }
     return created;
   }, TX_OPTIONS);
+
+  if (!plan) return created;
+  try {
+    const moved = await allocateBoxes({ allocations: created.map((b, i) => ({ boxId: b.id, slotId: plan[i] })), reason: "Put on a shelf at registration" }, actor);
+    const byId = new Map(moved.map((b) => [b.id, b]));
+    return created.map((b) => byId.get(b.id) ?? b);
+  } catch {
+    // The boxes ARE registered; only the shelving failed (e.g. someone filled the shelf a moment ago): they stay unallocated.
+    return created;
+  }
 }
 
 async function markLabelsPrinted(boxIds, actor) {
@@ -184,8 +283,14 @@ const FIELD_LABELS = {
   destroyAfter: "destroy after",
   retentionCategory: "retention category",
   palletNo: "pallet number",
+  containerNo: "container number",
+  containerType: "container type",
+  comments: "comments",
+  entryDate: "entry date",
 };
-const DATE_FIELDS = new Set(["filingDateFrom", "filingDateTo", "destroyAfter"]);
+// Free-text fields that an empty value clears (stored as null).
+const TEXT_CLEARS_TO_NULL = new Set(["comments", "palletNo", "containerNo", "containerType"]);
+const DATE_FIELDS = new Set(["filingDateFrom", "filingDateTo", "destroyAfter", "entryDate"]);
 
 // Register wizard, back on step 1 after registering: the same correction applied to every box of the batch, in one
 // transaction (one "details_edited" history event per box that changed). Client and size can only change while a box is
@@ -201,6 +306,12 @@ async function correctRegisteredBoxes({ boxIds, patch }, actor) {
   if (patch.clientId !== undefined && !String(patch.clientId).trim()) throw httpError(400, "clientId can't be empty");
   if (patch.description !== undefined && !String(patch.description).trim()) throw httpError(400, "description can't be empty");
   if (patch.filingDateFrom !== undefined && !patch.filingDateFrom) throw httpError(400, "filing date from is required");
+  if (patch.comments !== undefined) patch = { ...patch, comments: clampComments(patch.comments) ?? "" };
+  if (patch.palletNo !== undefined) patch = { ...patch, palletNo: cleanPallet(patch.palletNo) ?? "" };
+  if (patch.containerNo !== undefined) patch = { ...patch, containerNo: cleanContainer(patch.containerNo, "container number") ?? "" };
+  if (patch.containerType !== undefined) patch = { ...patch, containerType: cleanContainer(patch.containerType, "container type") ?? "" };
+  if (patch.entryDate !== undefined && !patch.entryDate) throw httpError(400, "entry date can't be empty");
+  assertFilingPeriod(patch.filingDateFrom, patch.filingDateTo);
   const sizes = patch.size !== undefined ? await getBoxSizes() : null;
 
   return prisma.$transaction(async (tx) => {
@@ -252,21 +363,27 @@ async function updateBoxDetails(boxId, patch, reason, actor) {
   const box = await prisma.box.findUnique({ where: { id: boxId } });
   if (!box) throw httpError(404, "Box not found");
   if (patch.retentionCategory !== undefined) patch = { ...patch, retentionCategory: (await checkRetentionCategory(patch.retentionCategory)) ?? undefined };
+  if (patch.comments !== undefined) patch = { ...patch, comments: clampComments(patch.comments) ?? "" };
+  if (patch.palletNo !== undefined) patch = { ...patch, palletNo: cleanPallet(patch.palletNo) ?? "" };
+  if (patch.containerNo !== undefined) patch = { ...patch, containerNo: cleanContainer(patch.containerNo, "container number") ?? "" };
+  if (patch.containerType !== undefined) patch = { ...patch, containerType: cleanContainer(patch.containerType, "container type") ?? "" };
+  if (patch.entryDate !== undefined && !patch.entryDate) throw httpError(400, "entry date can't be empty");
+  assertFilingPeriod(patch.filingDateFrom ?? dateOnly(box.filingDateFrom), patch.filingDateTo !== undefined ? patch.filingDateTo : dateOnly(box.filingDateTo));
 
   const changes = [];
   const data = {};
   for (const key of Object.keys(FIELD_LABELS)) {
     const nextValue = patch[key];
     if (nextValue === undefined) continue;
-    const currentValue = (DATE_FIELDS.has(key) ? dateOnly(box[key]) : box[key]) ?? undefined;
+    const currentValue = (DATE_FIELDS.has(key) ? dateOnly(box[key]) : box[key]) ?? (TEXT_CLEARS_TO_NULL.has(key) ? "" : undefined);
     if (nextValue === currentValue) continue;
-    changes.push({ field: FIELD_LABELS[key], from: currentValue, to: nextValue });
-    data[key] = DATE_FIELDS.has(key) ? toDate(nextValue) : nextValue;
+    changes.push({ field: FIELD_LABELS[key], from: currentValue || undefined, to: nextValue || undefined });
+    data[key] = DATE_FIELDS.has(key) ? toDate(nextValue) : TEXT_CLEARS_TO_NULL.has(key) ? nextValue || null : nextValue;
   }
 
   // The client's own fields: only the codes sent change; the rest of the box's values stay.
   if (patch.customFields !== undefined) {
-    const clean = await cleanValuesOrThrow(box.clientId, patch.customFields, { partial: true });
+    const clean = await cleanValuesOrThrow(box.clientId, patch.customFields, { partial: true, expedienteId: box.expedienteId });
     const current = box.customFields && typeof box.customFields === "object" ? box.customFields : {};
     const defs = await prisma.customFieldDef.findMany({ where: { clientId: box.clientId } });
     const merged = { ...current };
@@ -299,12 +416,13 @@ async function placeBoxHold(boxId, reason, actor) {
   }, TX_OPTIONS);
 }
 
-async function releaseBoxHold(boxId, actor) {
+async function releaseBoxHold(boxId, actor, reason) {
   const box = await prisma.box.findUnique({ where: { id: boxId } });
   if (!box) throw httpError(404, "Box not found");
+  const note = String(reason ?? "").trim().slice(0, 500) || undefined;
   return prisma.$transaction(async (tx) => {
     const updated = await tx.box.update({ where: { id: boxId }, data: { onHold: false, holdReason: null } });
-    await appendAuditEvent(updated, "hold_released", actor, {}, tx);
+    await appendAuditEvent(updated, "hold_released", actor, { note }, tx);
     return serializeBox(updated);
   }, TX_OPTIONS);
 }

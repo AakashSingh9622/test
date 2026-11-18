@@ -6,6 +6,7 @@
 const prisma = require("../config/prisma");
 const { allocateBoxes, isActiveSlot } = require("./boxAllocationService");
 const { resolveLocation } = require("./locationService");
+const { resolveParts, hasLocationParts } = require("./locationParts");
 const { getBoxIneligibilityReason } = require("./boxEligibility");
 const { boxLengthCm } = require("../utils/dimensions");
 const { serializeBox } = require("../utils/serialize");
@@ -60,6 +61,7 @@ async function resolveBoxes({ codes, clientId, orderType }) {
 // POST /boxes/bulk-move { rows: [{ box, location }], dryRun?, reason? }
 //   box       barcode or box number
 //   location  a shelf or position code, e.g. "A-1" (rack A, shelf 1) or "A-1-3" (also position 3) or a position barcode
+//   -- or, instead of location, Docbox's columns: warehouse?, floor?, aisle?, module, shelf
 // Every row is checked first, counting the space the earlier rows of the same file take; any problem -> 422 with
 // [{ row, message }] and nothing moves.
 async function bulkMove({ rows, dryRun, reason }, actor) {
@@ -78,12 +80,15 @@ async function bulkMove({ rows, dryRun, reason }, actor) {
     const rowNo = i + 2; // row 1 of the sheet is the header
     const fail = (message) => errors.push({ row: rowNo, message });
     const code = codes[i];
+    // Either one "location" code (A-1, A-1-3), or Docbox's separate columns: warehouse / floor / aisle / module / shelf.
     const where = text(rows[i]?.location);
+    const byParts = !where && hasLocationParts(rows[i]);
+    const label = where || `module ${text(rows[i]?.module)} shelf ${text(rows[i]?.shelf)}`;
     if (!code) {
       fail("box is empty");
       continue;
     }
-    if (!where) {
+    if (!where && !byParts) {
       fail("location is empty");
       continue;
     }
@@ -104,13 +109,22 @@ async function bulkMove({ rows, dryRun, reason }, actor) {
 
     let found;
     try {
-      found = await resolveLocation(where, { needCm: need });
+      if (byParts) {
+        const p = await resolveParts(rows[i], { needCm: need });
+        if (p.error) {
+          fail(p.error);
+          continue;
+        }
+        found = p.found;
+      } else {
+        found = await resolveLocation(where, { needCm: need });
+      }
     } catch (e) {
       fail(e.message);
       continue;
     }
     if (found.kind === "ambiguous" || found.kind === "not_found" || found.kind === "rack") {
-      fail(found.kind === "rack" ? `${where}: give a shelf too, e.g. ${where}-1` : (found.message ?? `no location ${where}`));
+      fail(found.kind === "rack" ? `${label}: give a shelf too, e.g. ${label}-1` : (found.message ?? `no location ${label}`));
       continue;
     }
     // A position is used as it is; a shelf takes the first of its positions with enough room (counting this file's earlier rows).
@@ -122,7 +136,7 @@ async function bulkMove({ rows, dryRun, reason }, actor) {
     const candidates = found.positions ?? [];
     const slot = candidates.find((s) => isActiveSlot(s) && (box.slotId === s.id || free(s) >= need));
     if (!slot) {
-      fail(candidates.length && candidates.every((s) => !isActiveSlot(s)) ? `${where} is not available` : `${where} has no room for ${box.boxNumber} (${need} cm)`);
+      fail(candidates.length && candidates.every((s) => !isActiveSlot(s)) ? `${label} is not available` : `${label} has no room for ${box.boxNumber} (${need} cm)`);
       continue;
     }
     if (box.slotId !== slot.id) {

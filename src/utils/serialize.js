@@ -21,6 +21,7 @@ function serializeBox(b) {
     filingDateFrom: dateOnly(b.filingDateFrom),
     filingDateTo: dateOnly(b.filingDateTo),
     destroyAfter: dateOnly(b.destroyAfter),
+    entryDate: dateOnly(b.entryDate),
     createdAt: dateOnly(b.createdAt),
   });
 }

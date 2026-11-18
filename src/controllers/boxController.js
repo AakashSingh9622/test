@@ -18,11 +18,20 @@ async function listBoxes(req, res) {
   const result = await boxService.searchBoxes({
     q: q.q,
     clientId: q.clientId,
+    expedienteId: q.expedienteId,
     status: parseStatusArray(q),
     onHold: q.onHold === undefined ? undefined : q.onHold === "true",
     warehouseId: q.warehouseId,
     rackId: q.rackId,
     row: q.row ? Number(q.row) : undefined,
+    site: q.site,
+    warehouse: q.warehouse,
+    zone: q.zone,
+    aisle: q.aisle,
+    module: q.module,
+    palletNo: q.palletNo,
+    containerNo: q.containerNo,
+    containerType: q.containerType,
     orderId: q.orderId,
     cfCode: q.cfCode,
     cfValue: q.cfValue,
@@ -130,7 +139,7 @@ async function placeBoxHold(req, res) {
 }
 
 async function releaseBoxHold(req, res) {
-  res.json(await boxService.releaseBoxHold(req.params.boxId, actorFromReq(req)));
+  res.json(await boxService.releaseBoxHold(req.params.boxId, actorFromReq(req), req.query.reason));
 }
 
 async function receiveAtGoodsIn(req, res) {
@@ -156,6 +165,14 @@ async function listContents(req, res) {
 
 async function addContent(req, res) {
   res.status(201).json(await contents.addContent(req.params.boxId, req.body || {}, actorFromReq(req)));
+}
+
+async function updateContent(req, res) {
+  res.json(await contents.updateContent(req.params.boxId, req.params.contentId, req.body || {}, actorFromReq(req)));
+}
+
+async function moveContent(req, res) {
+  res.json(await contents.moveContent(req.params.boxId, req.params.contentId, req.body || {}, actorFromReq(req)));
 }
 
 async function removeContent(req, res) {
@@ -197,5 +214,7 @@ module.exports = {
   relabelBox,
   listContents,
   addContent,
+  updateContent,
+  moveContent,
   removeContent,
 };

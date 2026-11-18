@@ -14,7 +14,7 @@ router.use(requireAuth);
 const manage = requirePermission("settings.manage");
 
 router.get("/", asyncHandler(async (req, res) =>
-  res.json(await svc.listFields(req.query.clientId, { includeInactive: req.query.includeInactive === "true" }))
+  res.json(await svc.listFields(req.query.clientId, { includeInactive: req.query.includeInactive === "true", expedienteId: req.query.expedienteId }))
 ));
 router.post("/", manage, asyncHandler(async (req, res) => res.status(201).json(await svc.createField(req.body || {}, actorFromReq(req)))));
 router.patch("/:id", manage, asyncHandler(async (req, res) => res.json(await svc.updateField(req.params.id, req.body || {}, actorFromReq(req)))));

@@ -21,13 +21,19 @@ const serialize = (f) => ({
   required: f.required,
   position: f.position,
   active: f.active,
+  expedienteId: f.expedienteId ?? undefined,
 });
 
-async function listFields(clientId, { includeInactive = false } = {}) {
+// The fields that apply to a box of `expedienteId`: the client's shared ones (no expediente) and that expediente's own.
+// Without an expediente only the shared ones apply.
+const appliesTo = (expedienteId) => (expedienteId ? { OR: [{ expedienteId: null }, { expedienteId: String(expedienteId) }] } : { expedienteId: null });
+
+// `expedienteId` given: only the fields for that expediente. Not given: every field of the client (settings, history, names).
+async function listFields(clientId, { includeInactive = false, expedienteId } = {}) {
   const id = text(clientId);
   if (!id) throw httpError(400, "clientId is required");
   const rows = await prisma.customFieldDef.findMany({
-    where: { clientId: id, ...(includeInactive ? {} : { active: true }) },
+    where: { clientId: id, ...(includeInactive ? {} : { active: true }), ...(expedienteId ? appliesTo(expedienteId) : {}) },
     orderBy: { position: "asc" },
   });
   return rows.map(serialize);
@@ -47,6 +53,11 @@ async function createField(input, actor) {
   const fieldType = text(input.fieldType) || "text";
   if (!TYPES.includes(fieldType)) throw httpError(400, `fieldType must be one of ${TYPES.join(", ")}`);
 
+  const expedienteId = text(input.expedienteId) || null;
+  if (expedienteId) {
+    const e = await prisma.expediente.findUnique({ where: { id: expedienteId } });
+    if (!e || e.clientId !== clientId) throw httpError(400, "That expediente doesn't belong to this client");
+  }
   const existing = await prisma.customFieldDef.findMany({ where: { clientId } });
   if (existing.length >= MAX_FIELDS) throw httpError(409, `At most ${MAX_FIELDS} fields per client`);
   if (existing.some((f) => f.name.toLowerCase() === name.toLowerCase())) {
@@ -57,7 +68,7 @@ async function createField(input, actor) {
 
   const row = await prisma.$transaction(async (tx) => {
     const created = await tx.customFieldDef.create({
-      data: { clientId, code: `C${next}`, name, fieldType, required: Boolean(input.required), position, createdBy: actor },
+      data: { clientId, code: `C${next}`, name, fieldType, required: Boolean(input.required), position, expedienteId, createdBy: actor },
     });
     await appendAdminEvent(
       "custom_field_saved",
@@ -149,11 +160,12 @@ function checkValues(defs, values, { partial = false } = {}) {
 }
 
 // Same, but throws a 400 -- for the single-box endpoints.
-async function cleanValuesOrThrow(clientId, values, opts) {
-  const defs = await prisma.customFieldDef.findMany({ where: { clientId, active: true }, orderBy: { position: "asc" } });
-  const { clean, problems } = checkValues(defs, values, opts);
+async function cleanValuesOrThrow(clientId, values, opts = {}) {
+  const { expedienteId, ...checkOpts } = opts;
+  const defs = await prisma.customFieldDef.findMany({ where: { clientId, active: true, ...appliesTo(expedienteId) }, orderBy: { position: "asc" } });
+  const { clean, problems } = checkValues(defs, values, checkOpts);
   if (problems.length) throw httpError(400, problems.join("; "));
   return clean;
 }
 
-module.exports = { listFields, createField, updateField, checkValues, cleanValuesOrThrow, TYPES };
+module.exports = { listFields, createField, updateField, checkValues, cleanValuesOrThrow, appliesTo, TYPES };

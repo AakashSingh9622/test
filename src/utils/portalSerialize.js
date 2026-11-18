@@ -17,6 +17,7 @@ function portalBox(box, { showOrder = true } = {}) {
     description: box.description,
     department: box.department,
     reference: box.reference,
+    comments: box.comments,
     filingDateFrom: dateOnly(box.filingDateFrom),
     filingDateTo: dateOnly(box.filingDateTo),
     destroyAfter: dateOnly(box.destroyAfter),
@@ -26,7 +27,7 @@ function portalBox(box, { showOrder = true } = {}) {
     onHold: box.onHold,
     warehouse,
     openOrder: open ? { id: open.id, orderNumber: open.orderNumber, type: open.type, status: open.status } : undefined,
-    receivedAt: dateOnly(box.createdAt),
+    receivedAt: dateOnly(box.entryDate ?? box.createdAt),
   });
 }
 
@@ -44,6 +45,7 @@ function portalOrder(o) {
     clientId: o.clientId,
     clientName: o.clientName,
     requestedVia: o.requestedVia,
+    loanType: o.loanType ?? (o.urgent ? "urgent" : undefined),
     contactName: o.contactName,
     contactEmail: o.contactEmail,
     contactPhone: o.contactPhone,

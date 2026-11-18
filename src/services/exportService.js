@@ -62,10 +62,59 @@ const SPECS = {
         ...(row && { row }),
       };
     }
+    // Floor / aisle (Docbox "Bloque/Planta", "Pasillo"): by code, or part of the name, any letter case.
+    const nameOrCode = (v) => ({ OR: [{ code: { equals: String(v).trim(), mode: "insensitive" } }, { name: { contains: String(v).trim(), mode: "insensitive" } }] });
+    // Expediente (by its code, any letter case).
+    if (params.expediente) where.expedienteCode = { equals: String(params.expediente).trim(), mode: "insensitive" };
+    // Site (Docbox "Sede"): the site the warehouse belongs to.
+    if (params.site) {
+      where.slot = { ...(where.slot ?? {}), warehouse: { site: { equals: String(params.site).trim(), mode: "insensitive" } } };
+    }
+    if (params.zone || params.aisle) {
+      where.slot = {
+        ...(where.slot ?? {}),
+        rack: { ...(params.zone && { zone: nameOrCode(params.zone) }), ...(params.aisle && { aisle: nameOrCode(params.aisle) }) },
+      };
+    }
+    // Box number range ("Nº Caja desde / hasta"): "125" means BX00000125; a full number is used as it is.
+    const boxNo = (v) => {
+      const t = String(v).trim().toUpperCase();
+      return /^\d+$/.test(t) ? `BX${t.padStart(8, "0")}` : t;
+    };
+    if (params.boxFrom || params.boxTo) {
+      where.boxNumber = { ...(params.boxFrom && { gte: boxNo(params.boxFrom) }), ...(params.boxTo && { lte: boxNo(params.boxTo) }) };
+    }
+    // Pallet range ("Nº Palet desde / hasta"): whole numbers; a box whose pallet isn't a number is left out of a ranged export.
+    const whole = (v, name) => {
+      if (v === undefined || v === null || String(v).trim() === "") return undefined;
+      if (!/^\d{1,15}$/.test(String(v).trim())) throw httpError(400, `${name} must be a whole number`);
+      return BigInt(String(v).trim());
+    };
+    const palletFrom = whole(params.palletFrom, "palletFrom");
+    const palletTo = whole(params.palletTo, "palletTo");
+    if (palletFrom !== undefined && palletTo !== undefined && palletFrom > palletTo) throw httpError(400, "The pallet range ends before it starts");
+    // Container range ("Nº Contenedor desde / hasta"): same rule as the pallet range.
+    const containerFrom = whole(params.containerFrom, "containerFrom");
+    const containerTo = whole(params.containerTo, "containerTo");
+    if (containerFrom !== undefined && containerTo !== undefined && containerFrom > containerTo) throw httpError(400, "The container range ends before it starts");
     let fields = []; // the client's own fields -- extra columns, only when one client is exported
     const spec = {
-      header: ["Box number", "Barcode", "Client id", "Client", "Description", "Department", "Reference", "Filing from", "Filing to", "Destroy after", "Retention category", "Size", "Status", "On hold", "Location", "Pallet", "Registered"],
+      header: ["Box number", "Barcode", "Client id", "Client", "Expediente", "Description", "Department", "Reference", "Filing from", "Filing to", "Destroy after", "Retention category", "Size", "Status", "On hold", "Location", "Site", "Warehouse", "Floor", "Aisle", "Module", "Shelf", "Position", "Pallet", "Container number", "Container type", "Comments", "Entry date", "Registered"],
       init: async () => {
+        if (palletFrom !== undefined || palletTo !== undefined) {
+          const lo = palletFrom ?? 0n;
+          const hi = palletTo ?? 999999999999999n;
+          const ids = await prisma.$queryRaw`SELECT "id" FROM "box" WHERE "palletNo" ~ '^[0-9]{1,15}$' AND ("palletNo")::bigint BETWEEN ${lo} AND ${hi}`;
+          where.id = { in: ids.map((r) => r.id) };
+        }
+        if (containerFrom !== undefined || containerTo !== undefined) {
+          const lo = containerFrom ?? 0n;
+          const hi = containerTo ?? 999999999999999n;
+          const ids = await prisma.$queryRaw`SELECT "id" FROM "box" WHERE "containerNo" ~ '^[0-9]{1,15}$' AND ("containerNo")::bigint BETWEEN ${lo} AND ${hi}`;
+          const inContainers = new Set(ids.map((r) => r.id));
+          // both a pallet and a container range: the box must be in both
+          where.id = { in: where.id ? where.id.in.filter((id) => inContainers.has(id)) : [...inContainers] };
+        }
         if (!params.clientId) return;
         fields = await prisma.customFieldDef.findMany({ where: { clientId: String(params.clientId), active: true }, orderBy: { position: "asc" } });
         spec.header = [...spec.header, ...fields.map((f) => f.name)];
@@ -74,7 +123,7 @@ const SPECS = {
         sizeNames = sizeNames ?? (await getBoxSizeNames());
         return prisma.box.findMany({ where, orderBy: [{ clientName: "asc" }, { boxNumber: "asc" }], skip, take });
       },
-      row: (b) => [b.boxNumber, b.barcode, b.clientId, b.clientName, b.description, b.department, b.reference, dateOnly(b.filingDateFrom), dateOnly(b.filingDateTo), dateOnly(b.destroyAfter), b.retentionCategory, sizeNames?.[b.size] ?? b.size, b.status, b.onHold ? "yes" : "no", locationText(b.locationPath), b.palletNo, dateOnly(b.createdAt), ...fields.map((f) => b.customFields?.[f.code])],
+      row: (b) => [b.boxNumber, b.barcode, b.clientId, b.clientName, b.expedienteCode, b.description, b.department, b.reference, dateOnly(b.filingDateFrom), dateOnly(b.filingDateTo), dateOnly(b.destroyAfter), b.retentionCategory, sizeNames?.[b.size] ?? b.size, b.status, b.onHold ? "yes" : "no", locationText(b.locationPath), b.locationPath?.site, b.locationPath?.warehouse, b.locationPath?.zone, b.locationPath?.aisle, b.locationPath?.rack, b.locationPath?.shelf, b.locationPath?.position, b.palletNo, b.containerNo, b.containerType, b.comments, dateOnly(b.entryDate ?? b.createdAt), dateOnly(b.createdAt), ...fields.map((f) => b.customFields?.[f.code])],
     };
     return spec;
   },
@@ -89,7 +138,23 @@ const SPECS = {
       header: ["Client", "Box number", "Description", "Department", "Reference", "Order", "Urgent", "Requested via", "Requested by", "Requested on", "Issued on", "Original location"],
       fetch: (skip, take) =>
         prisma.orderLine.findMany({ where, include: { order: true, box: true }, orderBy: [{ order: { completedAt: "asc" } }, { id: "asc" }], skip, take }),
-      row: (l) => [l.order.clientName, l.box?.boxNumber ?? l.boxNumber, l.box?.description, l.box?.department, l.box?.reference, l.order.orderNumber, l.order.urgent ? "urgent" : "normal", l.order.requestChannel, l.order.contactEmail, dateOnly(l.order.createdAt), dateOnly(l.order.completedAt), locationText(l.fromLocation)],
+      row: (l) => [l.order.clientName, l.box?.boxNumber ?? l.boxNumber, l.box?.description, l.box?.department, l.box?.reference, l.order.orderNumber, l.order.loanType ?? (l.order.urgent ? "urgent" : "normal"), l.order.requestChannel, l.order.contactEmail, dateOnly(l.order.createdAt), dateOnly(l.order.completedAt), locationText(l.fromLocation)],
+    };
+  },
+  // Docbox "Intercalado por cliente": every box that holds recorded files, and how many.
+  interfiling: (params) => {
+    const { interfilingWhere } = require("./reportService");
+    const where = interfilingWhere(params);
+    let stats = new Map();
+    return {
+      header: ["Client id", "Client", "Box number", "Barcode", "Status", "Location", "Records", "Filed from", "Filed to"],
+      fetch: async (skip, take) => {
+        const boxes = await prisma.box.findMany({ where, orderBy: [{ clientName: "asc" }, { boxNumber: "asc" }], skip, take });
+        const g = await prisma.boxContent.groupBy({ by: ["boxId"], where: { boxId: { in: boxes.map((b) => b.id) } }, _count: { _all: true }, _min: { dateFrom: true }, _max: { dateTo: true } });
+        stats = new Map(g.map((s) => [s.boxId, s]));
+        return boxes;
+      },
+      row: (b) => [b.clientId, b.clientName, b.boxNumber, b.barcode, b.status, locationText(b.locationPath), stats.get(b.id)?._count._all ?? 0, dateOnly(stats.get(b.id)?._min.dateFrom), dateOnly(stats.get(b.id)?._max.dateTo)],
     };
   },
   // Docbox "returns" sheet: boxes that came back and wait at Goods-In, with the shelf they used to be on, so they can be shelved.

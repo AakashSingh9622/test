@@ -134,7 +134,7 @@ async function listBoxes(ctx, q = {}) {
   else if (q.includeDestroyed !== "true") where.status = { not: "destroyed" };
   if (q.q) {
     const contains = { contains: String(q.q).slice(0, 100), mode: "insensitive" };
-    where.OR = [{ boxNumber: contains }, { barcode: contains }, { description: contains }, { reference: contains }, { department: contains }];
+    where.OR = [{ boxNumber: contains }, { barcode: contains }, { description: contains }, { reference: contains }, { department: contains }, { comments: contains }];
   }
   const { skip, take } = parsePagination(q);
   const [items, total] = await Promise.all([
@@ -306,6 +306,8 @@ async function createOrder(ctx, body = {}) {
         scheduledFor: scheduledFor ? scheduledFor.toISOString().slice(0, 10) : undefined,
         notes: clean(body.notes, 2000) || undefined,
         requestedVia: "portal",
+        // Docbox "Tipo Prestamo" (normal / urgent / superior / fax): only for boxes sent out or scanned.
+        loanType: type === "dispatch" || type === "digitize" ? clean(body.loanType, 20) || undefined : undefined,
         // decided 24 Oct: destruction asked for by an ordinary contact needs the main contact's approval first
         clientApprovalRequired: type === "destruction" && !ctx.isMainContact,
         destructionAuthorisation,

@@ -19,6 +19,7 @@ const {
   holdOrder,
   resumeOrder,
   reopenOrder,
+  editOrder,
   approveDestruction,
   recordDelivery,
   getCertificate,
@@ -82,6 +83,8 @@ router.post("/:orderId/delivered", operate, asyncHandler(recordDelivery));
 router.post("/:orderId/resume", approve, asyncHandler(resumeOrder));
 // Correct a mistake: bring a cancelled / rejected order back to "requested" (supervisor; reason required).
 router.post("/:orderId/reopen", approve, asyncHandler(reopenOrder));
+// Docbox "Modificar Peticiones": correct the loan type / channel / requester of a request (supervisor).
+router.patch("/:orderId/details", approve, asyncHandler(editOrder));
 // Billing stage (the invoice itself: POST /api/invoices with orderId). Paid or waived -> the order can be scheduled.
 //   POST /:orderId/billing/payment { method: bank_transfer|card|other, reference?, amount?, note? }
 //   POST /:orderId/billing/waive   { reason }

@@ -137,8 +137,38 @@ function visibleToContactWhere({ clientId, contactEmail, isMainContact }) {
   return { clientId, contactEmail: { equals: email, mode: "insensitive" } };
 }
 
+// Docbox "Tipo Prestamo". Only physical (dispatch) and digital (digitize) loans have one. The old yes/no `urgent`
+// is kept in step (true for urgent and superior) so existing reports and exports keep working.
+const LOAN_TYPES = ["normal", "urgent", "superior", "fax"];
+function resolveLoanType(orderType, loanType, urgent) {
+  const loanOrder = orderType === "dispatch" || orderType === "digitize";
+  const wanted = loanType ? String(loanType) : urgent === true ? "urgent" : undefined;
+  if (wanted && !LOAN_TYPES.includes(wanted)) throw httpError(400, `loanType must be one of ${LOAN_TYPES.join(", ")}`);
+  if (!loanOrder) return { loanType: null, urgent: false };
+  return { loanType: wanted ?? "normal", urgent: wanted === "urgent" || wanted === "superior" };
+}
+
 async function searchOrders(params) {
   const where = {};
+  if (params.loanType) {
+    const lt = String(params.loanType);
+    if (!LOAN_TYPES.includes(lt)) throw httpError(400, `loanType must be one of ${LOAN_TYPES.join(", ")}`);
+    // Orders made before loan types existed have none: their old urgent flag decides normal / urgent.
+    const legacy = { normal: { urgent: false, type: { in: ["dispatch", "digitize"] } }, urgent: { urgent: true } }[lt];
+    where.AND = [{ OR: [{ loanType: lt }, ...(legacy ? [{ loanType: null, ...legacy }] : [])] }];
+  }
+  if (params.requestChannel) where.requestChannel = String(params.requestChannel);
+  // Docbox "Solicitado por": who asked -- part of the contact email or name.
+  if (params.requester) {
+    const c = { contains: String(params.requester).trim().slice(0, 100), mode: "insensitive" };
+    where.AND = [...(where.AND ?? []), { OR: [{ contactEmail: c }, { contactName: c }] }];
+  }
+  // Request date range (inclusive, YYYY-MM-DD).
+  const from = params.from ? toDate(params.from) : undefined;
+  const to = params.to ? toDate(params.to) : undefined;
+  if (from && Number.isNaN(from.getTime())) throw httpError(400, "from must be a date (YYYY-MM-DD)");
+  if (to && Number.isNaN(to.getTime())) throw httpError(400, "to must be a date (YYYY-MM-DD)");
+  if (from || to) where.createdAt = { ...(from && { gte: from }), ...(to && { lt: new Date(to.getTime() + 24 * 60 * 60 * 1000) }) };
   if (params.type) where.type = params.type;
   if (params.status?.length) where.status = { in: params.status };
   if (params.clientId) where.clientId = params.clientId;
@@ -207,6 +237,8 @@ async function createOrder(input, actor) {
   const requestChannel = input.requestChannel ? String(input.requestChannel) : undefined;
   if (requestChannel && !CHANNELS.includes(requestChannel)) throw httpError(400, `requestChannel must be one of ${CHANNELS.join(", ")}`);
 
+  const loan = resolveLoanType(input.type, input.loanType, input.urgent);
+
   return prisma.$transaction(async (tx) => {
     const boxes = [];
     for (const boxId of new Set(input.boxIds || [])) {
@@ -244,7 +276,8 @@ async function createOrder(input, actor) {
         lineSummary: boxes.length > 0 ? { pending: boxes.length } : {},
         collectionInfo: input.type === "collection" ? { expectedNewBoxes: input.expectedNewBoxes || 0 } : undefined,
         permanentWithdrawal: input.type === "dispatch" && input.permanentWithdrawal === true,
-        urgent: input.urgent === true,
+        urgent: loan.urgent,
+        loanType: loan.loanType,
         requestChannel,
         clientApprovalRequired: input.clientApprovalRequired === true,
         destruction: authorisation ?? undefined,
@@ -697,6 +730,45 @@ async function holdOrder(orderId, reason, actor) {
   }, TX_OPTIONS);
 }
 
+// Docbox "Modificar Peticiones": correct the details of a request after the fact (loan type, how the client asked,
+// who asked, remarks). The change is noted on the order. Status changes stay with the normal buttons (and Reopen).
+async function editOrderDetails(orderId, input, actor) {
+  const data = {};
+  const changes = [];
+  return prisma.$transaction(async (tx) => {
+    const order = await getOrderOrThrow(orderId, tx);
+    if (input.loanType !== undefined) {
+      if (order.type !== "dispatch" && order.type !== "digitize") throw httpError(400, "Only physical and digital loans have a loan type");
+      if (!LOAN_TYPES.includes(input.loanType)) throw httpError(400, `loanType must be one of ${LOAN_TYPES.join(", ")}`);
+      const r = resolveLoanType(order.type, input.loanType);
+      if (r.loanType !== (order.loanType ?? (order.urgent ? "urgent" : "normal"))) changes.push(`loan type ${order.loanType ?? (order.urgent ? "urgent" : "normal")} → ${r.loanType}`);
+      Object.assign(data, { loanType: r.loanType, urgent: r.urgent });
+    }
+    if (input.requestChannel !== undefined) {
+      const CH = ["email", "phone", "in_person", "post", "fax"];
+      const ch = input.requestChannel || null;
+      if (ch && !CH.includes(ch)) throw httpError(400, `requestChannel must be one of ${CH.join(", ")}`);
+      if (ch !== (order.requestChannel ?? null)) changes.push(`channel ${order.requestChannel ?? "none"} → ${ch ?? "none"}`);
+      data.requestChannel = ch;
+    }
+    if (input.contactEmail !== undefined) {
+      const e = normalizeEmail(input.contactEmail);
+      if (!e) throw httpError(400, "contactEmail can't be empty");
+      if (e !== order.contactEmail) changes.push(`requested by ${order.contactEmail ?? "none"} → ${e}`);
+      data.contactEmail = e;
+    }
+    if (input.contactName !== undefined) data.contactName = String(input.contactName || "").trim().slice(0, 200) || null;
+    if (input.remarks) changes.push(`remark: ${String(input.remarks).trim().slice(0, 500)}`);
+    if (changes.length === 0 && data.contactName === undefined) throw httpError(400, "Nothing to change");
+    if (changes.length) {
+      const line = `Edited by ${actor?.name ?? "staff"}: ${changes.join("; ")}`;
+      data.notes = order.notes ? `${order.notes}\n${line}` : line;
+    }
+    await tx.order.update({ where: { id: orderId }, data });
+    return finish(orderId, tx);
+  }, TX_OPTIONS);
+}
+
 async function resumeOrder(orderId) {
   return prisma.$transaction(async (tx) => {
     const order = await getOrderOrThrow(orderId, tx);
@@ -874,6 +946,8 @@ async function receiveReturnBox(orderId, rawCode, warehouseId, actor) {
 }
 
 module.exports = {
+  editOrderDetails,
+  LOAN_TYPES,
   visibleToContactWhere,
   recomputeLineSummary,
   searchOrders,

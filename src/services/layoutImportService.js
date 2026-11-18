@@ -33,15 +33,22 @@ async function importLayout(input, actor) {
   const errors = [];
   // warehouseName -> floor -> aisle -> module -> Set(shelf)
   const plan = new Map();
+  const siteOf = new Map(); // warehouseName -> site (Docbox "Sede", optional)
   rows.forEach((r, i) => {
     const rowNo = i + 2;
     const wh = text(r?.warehouse);
+    const site = text(r?.site);
     const floor = text(r?.floor);
     const aisle = text(r?.aisle);
     const mod = text(r?.module);
     const shelf = Number(text(r?.shelf));
     const problems = [];
     if (!wh) problems.push("warehouse is empty");
+    if (site.length > 80) problems.push("site is too long (80 characters at most)");
+    if (wh && site) {
+      if (siteOf.has(wh) && siteOf.get(wh) !== site) problems.push(`warehouse ${wh} is listed under two different sites (${siteOf.get(wh)} and ${site})`);
+      else siteOf.set(wh, site);
+    }
     if (!floor) problems.push("floor is empty");
     if (!aisle) problems.push("aisle is empty");
     if (!mod) problems.push("module is empty");
@@ -68,7 +75,7 @@ async function importLayout(input, actor) {
       for (const [aisle, modules] of aisles)
         for (const [mod, shelves] of modules) {
           const max = Math.max(...shelves);
-          if (shelves.size !== max) errors.push({ row: 0, message: `module ${mod} (${wh}, floor ${floor}) has shelves up to ${max} but only ${shelves.size} are listed — shelves must be 1…${max} with none missing` });
+          if (shelves.size !== max) errors.push({ row: 0, message: `module ${mod} (${wh}, floor ${floor}): the highest shelf number is ${max}, but only ${shelves.size} shelf row${shelves.size === 1 ? " is" : "s are"} listed. Give every shelf 1…${max} its own row (one row per shelf, e.g. ${max === 1 ? "shelf 1" : max === 2 ? "a row for shelf 1 and a row for shelf 2" : `rows for shelf 1, 2 … ${max}`}) — the Shelf column is the shelf number, not how many shelves there are` });
           racks.push({ wh, floor, aisle, module: mod, rows: max });
         }
 
@@ -80,7 +87,7 @@ async function importLayout(input, actor) {
     seen.set(code, true);
   }
   const existing = await prisma.rack.findMany({ where: { code: { in: racks.map((r) => `M${r.module}`), mode: "insensitive" } }, select: { code: true } });
-  for (const e of existing) errors.push({ row: 0, message: `rack ${e.code} already exists — remove those rows or use another module number` });
+  for (const e of existing) errors.push({ row: 0, message: `module ${e.code} already exists — remove those rows or use another module number (an empty module can be deleted from its page)` });
 
   if (errors.length) {
     const err = httpError(422, `${errors.length} problem${errors.length === 1 ? "" : "s"} — nothing was created`);
@@ -90,19 +97,29 @@ async function importLayout(input, actor) {
   }
 
   const summary = { warehouses: plan.size, zones: new Set(racks.map((r) => `${r.wh}|${r.floor}`)).size, aisles: new Set(racks.map((r) => `${r.wh}|${r.floor}|${r.aisle}`)).size, racks: racks.length, shelves: racks.reduce((n, r) => n + r.rows, 0) };
-  if (input.dryRun) return { dryRun: true, ...summary };
+  // Which warehouses the modules go into: an existing one (found by its code or name, as typed in the file) or a new one.
+  const allWarehouses = await prisma.warehouse.findMany();
+  const findWarehouse = (name) => allWarehouses.find((w) => w.code.toLowerCase() === name.toLowerCase() || w.name.toLowerCase() === name.toLowerCase());
+  const targets = [...plan.keys()].map((n) => {
+    const w = findWarehouse(n);
+    return { name: w?.name ?? n, code: w?.code, id: w?.id, isNew: !w };
+  });
+  if (input.dryRun) return { dryRun: true, ...summary, targets };
 
   // Create. Each step reuses what exists, so a half-finished run can simply be repeated after fixing the cause.
-  const allWarehouses = await prisma.warehouse.findMany();
   const takenCodes = new Set(allWarehouses.map((w) => w.code.toUpperCase()));
+  const used = [];
   for (const [whName, floors] of plan) {
-    const wanted = whName.toLowerCase();
-    let warehouse = allWarehouses.find((w) => w.code.toLowerCase() === wanted || w.name.toLowerCase() === wanted);
+    let warehouse = findWarehouse(whName);
     if (!warehouse) {
       const code = codeFromName(whName, takenCodes);
       takenCodes.add(code);
-      warehouse = await createWarehouse({ code, name: whName }, actor);
+      warehouse = await createWarehouse({ code, name: whName, site: siteOf.get(whName) }, actor);
+    } else if (siteOf.get(whName) && !warehouse.site) {
+      // An existing warehouse without a site takes the one in the file; one that already has a site keeps it.
+      await prisma.warehouse.update({ where: { id: warehouse.id }, data: { site: siteOf.get(whName) } });
     }
+    used.push({ name: warehouse.name, code: warehouse.code, id: warehouse.id, isNew: !findWarehouse(whName) });
     for (const [floor, aisles] of floors) {
       let zone = await prisma.zone.findFirst({ where: { warehouseId: warehouse.id, code: { equals: floor, mode: "insensitive" } } });
       if (!zone) zone = await createZone(warehouse.id, { code: floor, name: `Floor ${floor}` }, actor);
@@ -120,7 +137,7 @@ async function importLayout(input, actor) {
       }
     }
   }
-  return { dryRun: false, ...summary };
+  return { dryRun: false, ...summary, targets: used };
 }
 
 module.exports = { importLayout, MAX_ROWS };

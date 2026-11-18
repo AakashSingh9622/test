@@ -169,6 +169,10 @@ enum AdminAction {
   role_assigned
   role_removed
   warehouse_created
+  warehouse_updated
+  warehouse_deleted
+  rack_deleted
+  expediente_saved
   rack_created
   rack_updated
   slot_updated
@@ -228,6 +232,7 @@ model Warehouse {
   code      String   @unique
   name      String // unique (case-insensitive) is enforced in locationService.createWarehouse
   address   String?
+  site      String? // Docbox "Sede" (head office / site) the warehouse belongs to: a label that groups warehouses
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   racks     Rack[]
@@ -348,6 +353,14 @@ model Box {
   quarantinedAt  DateTime?
   retentionCategory String? // RetentionRule.code -- how long the box must be kept (spec §4.4)
   palletNo       String? // pallet the box sits on (Docbox "Nº Palet"); free text, optional
+  // Docbox "Expediente": the client's file / database this box belongs to (null when the client has none). The code is
+  // copied here so it survives; an expediente with boxes can't be deleted.
+  expedienteId   String?
+  expedienteCode String?
+  containerNo    String? // Docbox "NºContenedor" / template NCE: the container (installation unit) number; free text
+  containerType  String? // Docbox "Tipo Contenedor" / template TYPECE
+  comments       String? // Docbox "Observaciones" / the template's Comments field; free text, optional
+  entryDate      DateTime? @db.Date // Docbox "Fecha Entrada": the day the box came into the archive (null on older boxes: use createdAt)
   customFields   Json? // { [CustomFieldDef.code]: value } -- the client's own fields (Docbox "Expedientes - Campos")
   labelPrinted   Boolean   @default(false)
   slotId         String?
@@ -386,6 +399,8 @@ model CustomFieldDef {
   required  Boolean  @default(false)
   position  Int
   active    Boolean  @default(true)
+  // null = a field of every expediente of the client; set = only of that expediente (Docbox "Expedientes - Campos")
+  expedienteId String?
   createdBy Json
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -445,6 +460,21 @@ model BoxSizeConfig {
   @@map("box_size_config")
 }
 
+// Docbox "Expedientes - Clientes": a client's files (PLANOS, ...). Each has its own description and can have its own fields.
+model Expediente {
+  id          String   @id @default(uuid())
+  clientId    String // DocuSoft ClientID
+  code        String // upper case, e.g. PLANOS; unique per client, never changes
+  description String
+  createdBy   Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([clientId, code])
+  @@index([clientId])
+  @@map("expediente")
+}
+
 model Order {
   id             String       @id @default(uuid())
   orderNumber    String       @unique
@@ -470,6 +500,7 @@ model Order {
   collectionInfo Json? // { expectedNewBoxes } -- API me "collection" naam se aata hai
   permanentWithdrawal Boolean @default(false) // dispatch only: the boxes go back to the client for good
   urgent         Boolean      @default(false) // Docbox "Tipo Prestamo": urgent instead of normal loan
+  loanType       String? // Docbox "Tipo Prestamo": normal | urgent | superior | fax (urgent is kept true for urgent + superior)
   requestChannel String? // Docbox "Tipo Peticion": how the client asked -- email | phone | in_person | post | fax
   heldFromStatus OrderStatus? // status "on_hold": the status to go back to on resume
   holdReason     String?
