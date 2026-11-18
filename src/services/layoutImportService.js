@@ -49,11 +49,16 @@ async function importLayout(input, actor) {
       if (siteOf.has(wh) && siteOf.get(wh) !== site) problems.push(`warehouse ${wh} is listed under two different sites (${siteOf.get(wh)} and ${site})`);
       else siteOf.set(wh, site);
     }
-    if (!floor) problems.push("floor is empty");
-    if (!aisle) problems.push("aisle is empty");
-    if (!mod) problems.push("module is empty");
-    if (mod && `M${mod}`.length > 20) problems.push("module code is too long");
-    if (!Number.isInteger(shelf) || shelf < 1 || shelf > 100) problems.push("shelf must be a whole number from 1 to 100");
+    if (!floor && !aisle && !mod && !text(r?.shelf)) {
+      // one plain sentence instead of four complaints: nothing about a shelf is filled in on this row
+      problems.push("this row has no shelf: floor, aisle, module and shelf are all empty");
+    } else {
+      if (!floor) problems.push("floor is empty");
+      if (!aisle) problems.push("aisle is empty");
+      if (!mod) problems.push("module is empty");
+      if (mod && `M${mod}`.length > 20) problems.push("module code is too long");
+      if (!Number.isInteger(shelf) || shelf < 1 || shelf > 100) problems.push("shelf must be a whole number from 1 to 100");
+    }
     if (floor && `${floor}-${aisle}`.length > 20) problems.push("floor and aisle together are too long");
     if (problems.length) return errors.push({ row: rowNo, message: problems.join("; ") });
     const floors = plan.get(wh) ?? new Map();

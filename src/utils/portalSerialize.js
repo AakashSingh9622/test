@@ -18,6 +18,9 @@ function portalBox(box, { showOrder = true } = {}) {
     department: box.department,
     reference: box.reference,
     comments: box.comments,
+    expedienteId: box.expedienteId,
+    expedienteCode: box.expedienteCode,
+    customFields: box.customFields ?? undefined, // the client's own fields { C1: "..." }
     filingDateFrom: dateOnly(box.filingDateFrom),
     filingDateTo: dateOnly(box.filingDateTo),
     destroyAfter: dateOnly(box.destroyAfter),

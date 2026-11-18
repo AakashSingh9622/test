@@ -47,6 +47,8 @@ router.get("/summary", asyncHandler(async (req, res) => res.json(await portal.su
 router.get("/notifications", asyncHandler(async (req, res) => res.json(await portal.listNotifications(req.portal, req.query))));
 router.get("/certificates", asyncHandler(async (req, res) => res.json(await portal.listCertificates(req.portal, req.query))));
 
+router.get("/expedientes", asyncHandler(async (req, res) => res.json(await portal.listExpedientes(req.portal))));
+router.get("/fields", asyncHandler(async (req, res) => res.json(await portal.listFields(req.portal, req.query))));
 router.get("/boxes", asyncHandler(async (req, res) => res.json(await portal.listBoxes(req.portal, req.query))));
 router.get("/boxes/:boxId", asyncHandler(async (req, res) => res.json(await portal.getBox(req.portal, req.params.boxId))));
 router.get(

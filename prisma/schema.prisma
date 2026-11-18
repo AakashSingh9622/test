@@ -171,6 +171,8 @@ enum AdminAction {
   warehouse_created
   warehouse_updated
   warehouse_deleted
+  site_saved
+  site_deleted
   rack_deleted
   expediente_saved
   rack_created
@@ -458,6 +460,15 @@ model BoxSizeConfig {
   updatedBy Json?
 
   @@map("box_size_config")
+}
+
+// Docbox "Sedes": the sites (head offices) a warehouse can belong to. Warehouse.site keeps the name as text.
+model Site {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+
+  @@map("site")
 }
 
 // Docbox "Expedientes - Clientes": a client's files (PLANOS, ...). Each has its own description and can have its own fields.

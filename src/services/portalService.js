@@ -20,6 +20,9 @@ const notifications = require("./notificationService");
 const { listContents } = require("./boxContentService");
 const orderBilling = require("./orderBillingService");
 const { assertContactMay } = require("./clientProfileService");
+const { parseFieldConditions, boxIdsByFields } = require("./boxService");
+const { listExpedientes: listClientExpedientes } = require("./expedienteService");
+const { listFields: listClientFields } = require("./customFieldService");
 
 const OPEN_ORDER_STATUSES = ["requested", "approved", "billing", "scheduled", "in_progress", "ready", "on_hold"];
 const BOX_STATUSES = [
@@ -29,6 +32,7 @@ const BOX_STATUSES = [
 const ORDER_STATUSES = ["requested", "approved", "billing", "scheduled", "in_progress", "ready", "on_hold", "completed", "cancelled", "rejected"];
 const ORDER_TYPES = ["collection", "dispatch", "destruction", "digitize"];
 const MAX_BOXES_PER_ORDER = 500;
+const MAX_PORTAL_FIELDS = 3; // the portal search offers three fields
 const DESTRUCTION_METHODS = ["shred", "pulp", "incinerate"];
 
 // Orders whose invoice is in Sage and not paid yet (billing stage) -- the customer can pay by card on the order page.
@@ -136,6 +140,17 @@ async function listBoxes(ctx, q = {}) {
     const contains = { contains: String(q.q).slice(0, 100), mode: "insensitive" };
     where.OR = [{ boxNumber: contains }, { barcode: contains }, { description: contains }, { reference: contains }, { department: contains }, { comments: contains }];
   }
+  // Docbox portal "Busquedas": one of the client's expedientes, up to three of its own fields (Contiene / Igual, all or
+  // any), and the observations. The scope is always this client -- never an id from the request.
+  if (q.expedienteId) where.expedienteId = String(q.expedienteId);
+  if (q.comments) where.comments = { contains: String(q.comments).slice(0, 100), mode: "insensitive" };
+  const conditions = parseFieldConditions(q);
+  if (conditions.length > MAX_PORTAL_FIELDS) throw httpError(400, `Search by ${MAX_PORTAL_FIELDS} fields at most`);
+  if (conditions.length) {
+    const ids = await boxIdsByFields(conditions, q.cfJoin === "or" ? "or" : "and", { clientId: ctx.clientId, expedienteId: q.expedienteId });
+    if (ids.length > 30000) throw httpError(400, "Too many boxes match those fields. Add another filter.");
+    where.id = { in: ids };
+  }
   const { skip, take } = parsePagination(q);
   const [items, total] = await Promise.all([
     prisma.box.findMany({ where, include: BOX_INCLUDE, orderBy: [{ createdAt: "desc" }, { id: "asc" }], skip, take }),
@@ -146,6 +161,16 @@ async function listBoxes(ctx, q = {}) {
     items: items.map((b) => portalBox({ ...b, sizeName: sizeNames[b.size] }, { showOrder: visible.has(b.openOrderId) })),
     total,
   };
+}
+
+// The client's expedientes and the fields of one of them (or all the shared ones) -- what the search is built from.
+async function listExpedientes(ctx) {
+  return (await listClientExpedientes(ctx.clientId)).map(({ id, code, description }) => ({ id, code, description }));
+}
+
+async function listFields(ctx, q = {}) {
+  const fields = await listClientFields(ctx.clientId, { expedienteId: q.expedienteId ? String(q.expedienteId) : undefined });
+  return fields.map(({ code, name, fieldType, expedienteId }) => ({ code, name, fieldType, expedienteId }));
 }
 
 async function findOwnBox(ctx, boxId) {
@@ -398,6 +423,8 @@ async function listNotifications(ctx, q = {}) {
 }
 
 module.exports = {
+  listExpedientes,
+  listFields,
   payOrder,
   acknowledgeInvoice,
   clientApprove,

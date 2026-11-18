@@ -17,6 +17,77 @@ const { serializeBox, serializeOrder, serializeSimple, dateOnly, toDate } = requ
 const httpError = require("../utils/httpError");
 const { parsePagination } = require("../utils/pagination");
 
+const MAX_FIELD_CONDITIONS = 4; // Docbox Busqueda: "up to four search fields"
+const MAX_ID_MATCHES = 30000; // an id list this long is still safe to pass back to the database
+
+// "125" means BX00000125; a full number (BX00000125) is used as it is.
+function boxNumberBound(v) {
+  const t = String(v).trim().toUpperCase();
+  return /^\d+$/.test(t) ? `BX${t.padStart(8, "0")}` : t;
+}
+
+// The client's own field conditions: [{ code: "C1", value: "Block 1", mode: "exact" | "contains" }], up to four.
+// Accepts the JSON the screen sends in `cfs`, or the older single cfCode / cfValue / cfMode.
+function parseFieldConditions(params) {
+  let list = [];
+  if (params.cfs) {
+    try {
+      list = JSON.parse(String(params.cfs));
+    } catch {
+      throw httpError(400, "cfs must be a JSON list of field conditions");
+    }
+    if (!Array.isArray(list)) throw httpError(400, "cfs must be a list");
+  } else if (params.cfCode && params.cfValue) {
+    list = [{ code: params.cfCode, value: params.cfValue, mode: params.cfMode }];
+  }
+  const out = [];
+  for (const c of list) {
+    const code = String(c?.code ?? "").trim();
+    const value = String(c?.value ?? "").trim();
+    if (!code || !value) continue; // an empty row is simply ignored
+    if (!/^[A-Za-z0-9_]{1,20}$/.test(code)) throw httpError(400, `"${code}" is not a field code`);
+    out.push({ code, value, mode: c.mode === "exact" ? "exact" : "contains" });
+  }
+  if (out.length > MAX_FIELD_CONDITIONS) throw httpError(400, `Search by ${MAX_FIELD_CONDITIONS} fields at most`);
+  return out;
+}
+
+// Ids of the boxes whose own fields match (Like = contains, "=" = the whole value; letter case never matters).
+// `join` is "or" (Docbox "O": any field) or "and" ("Y": every field).
+async function boxIdsByFields(conditions, join, scope) {
+  const parts = conditions.map((c) => {
+    const text = Prisma.sql`("customFields" ->> ${c.code}::text)`;
+    if (c.mode === "exact") return Prisma.sql`lower(${text}) = lower(${c.value})`;
+    const like = `%${c.value.replace(/[\\%_]/g, (ch) => "\\" + ch)}%`;
+    return Prisma.sql`${text} ILIKE ${like}`;
+  });
+  const glue = join === "or" ? " OR " : " AND ";
+  const narrow = [];
+  if (scope.clientId) narrow.push(Prisma.sql`"clientId" = ${String(scope.clientId)}`);
+  if (scope.expedienteId) narrow.push(Prisma.sql`"expedienteId" = ${String(scope.expedienteId)}`);
+  const scoped = narrow.length ? Prisma.sql` AND ${Prisma.join(narrow, " AND ")}` : Prisma.empty;
+  const rows = await prisma.$queryRaw`SELECT "id" FROM "box" WHERE (${Prisma.join(parts, glue)})${scoped}`;
+  return rows.map((r) => r.id);
+}
+
+// Whole-number range on a text column (pallet / container): a box whose value is not a number is left out.
+function wholeNumber(v, name) {
+  if (v === undefined || v === null || String(v).trim() === "") return undefined;
+  if (!/^\d{1,15}$/.test(String(v).trim())) throw httpError(400, `${name} must be a whole number`);
+  return BigInt(String(v).trim());
+}
+async function boxIdsByNumberRange(column, fromRaw, toRaw, label) {
+  const from = wholeNumber(fromRaw, `${label} from`);
+  const to = wholeNumber(toRaw, `${label} to`);
+  if (from === undefined && to === undefined) return undefined;
+  if (from !== undefined && to !== undefined && from > to) throw httpError(400, `The ${label} range ends before it starts`);
+  const lo = from ?? 0n;
+  const hi = to ?? 999999999999999n;
+  const col = Prisma.raw(`"${column}"`);
+  const rows = await prisma.$queryRaw`SELECT "id" FROM "box" WHERE ${col} ~ '^[0-9]{1,15}$' AND (${col})::bigint BETWEEN ${lo} AND ${hi}`;
+  return rows.map((r) => r.id);
+}
+
 async function searchBoxes(params) {
   const where = {};
 
@@ -39,11 +110,26 @@ async function searchBoxes(params) {
   else where.status = { not: "destroyed" }; // default: destroyed boxes hide rahte hain (spec §7)
   if (params.onHold !== undefined) where.onHold = params.onHold;
   if (params.orderId) where.openOrderId = params.orderId;
-  // Search a client's own field (Docbox "Campo / Dato", "Like" or "="): cfCode=C1&cfValue=Block 1&cfMode=exact
-  if (params.cfCode && params.cfValue) {
-    const path = [String(params.cfCode)];
-    const filter = params.cfMode === "exact" ? { path, equals: String(params.cfValue) } : { path, string_contains: String(params.cfValue) };
-    where.AND = [...(where.AND || []), { customFields: filter }];
+  // Docbox "Campo / Dato": up to four of the client's own fields, each "Like" or "=", joined by "O" (or) / "Y" (and).
+  // Docbox "Num entre": a range of box, pallet or container numbers. Each of these narrows the same list of box ids.
+  let idSets = [];
+  const conditions = parseFieldConditions(params);
+  if (conditions.length) idSets.push(await boxIdsByFields(conditions, params.cfJoin === "or" ? "or" : "and", params));
+  const palletIds = await boxIdsByNumberRange("palletNo", params.palletFrom, params.palletTo, "pallet");
+  if (palletIds) idSets.push(palletIds);
+  const containerIds = await boxIdsByNumberRange("containerNo", params.containerFrom, params.containerTo, "container");
+  if (containerIds) idSets.push(containerIds);
+  if (idSets.length) {
+    let ids = idSets[0];
+    for (const next of idSets.slice(1)) {
+      const keep = new Set(next);
+      ids = ids.filter((id) => keep.has(id));
+    }
+    if (ids.length > MAX_ID_MATCHES) throw httpError(400, "Too many boxes match those fields. Pick a client or add another filter.");
+    where.id = { in: ids };
+  }
+  if (params.boxFrom || params.boxTo) {
+    where.boxNumber = { ...(params.boxFrom && { gte: boxNumberBound(params.boxFrom) }), ...(params.boxTo && { lte: boxNumberBound(params.boxTo) }) };
   }
   // Where it is: ids (the module page) or what a person types / a location link carries (code or name, any letter case).
   const t = (v) => String(v).trim();
@@ -604,6 +690,8 @@ async function relabelBox(boxId, rawReason, actor) {
 }
 
 module.exports = {
+  parseFieldConditions,
+  boxIdsByFields,
   receiveAtGoodsIn,
   putAwayByBarcode,
   correctRegisteredBoxes,
