@@ -120,4 +120,30 @@ async function moveContent(boxId, contentId, input, actor) {
   });
 }
 
-module.exports = { listContents, addContent, removeContent, updateContent, moveContent, serializeContent };
+// The documents themselves go to DocuSoft straight from the browser; this only writes the box history (and the
+// order's Activity, when it was uploaded from an order) so staff can see who attached what, and when.
+// input: { documents: [{ name, section? }], orderId? }
+async function recordDocumentUpload(boxId, input, actor) {
+  const docs = (Array.isArray(input.documents) ? input.documents : [])
+    .map((d) => ({ name: String(d?.name || "").trim().slice(0, 200), section: String(d?.section || "").trim().slice(0, 100) }))
+    .filter((d) => d.name)
+    .slice(0, 50);
+  if (docs.length === 0) throw httpError(400, "documents is required");
+  return prisma.$transaction(async (tx) => {
+    const box = await tx.box.findUnique({ where: { id: boxId } });
+    if (!box) throw httpError(404, "Box not found");
+    let order = null;
+    if (input.orderId) {
+      order = await tx.order.findUnique({ where: { id: String(input.orderId) } });
+      if (!order || order.clientId !== box.clientId) throw httpError(400, "That order does not belong to this box's client");
+    }
+    const sections = [...new Set(docs.map((d) => d.section).filter(Boolean))];
+    const note = `Uploaded ${docs.length === 1 ? "document" : `${docs.length} documents`}: ${docs.map((d) => d.name).join(", ")}${
+      sections.length ? ` (${sections.join(", ")})` : ""
+    }`.slice(0, 500);
+    await appendAuditEvent(box, "contents_changed", actor, { note, orderId: order?.id, orderNumber: order?.orderNumber }, tx);
+    return { ok: true };
+  });
+}
+
+module.exports = { recordDocumentUpload, listContents, addContent, removeContent, updateContent, moveContent, serializeContent };

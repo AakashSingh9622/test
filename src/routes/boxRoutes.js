@@ -23,6 +23,7 @@ const {
   relabelBox,
   listContents,
   addContent,
+  recordDocumentUpload,
   updateContent,
   moveContent,
   removeContent,
@@ -62,6 +63,8 @@ router.delete("/:boxId/quarantine", requirePermission("boxes.hold"), asyncHandle
 router.post("/:boxId/relabel", operate, asyncHandler(relabelBox));
 router.get("/:boxId/contents", asyncHandler(listContents));
 router.post("/:boxId/contents", operate, asyncHandler(addContent));
+// After documents were uploaded to DocuSoft for this box: { documents: [{ name, section? }], orderId? } -> box history + order Activity
+router.post("/:boxId/document-uploads", operate, asyncHandler(recordDocumentUpload));
 router.patch("/:boxId/contents/:contentId", operate, asyncHandler(updateContent));
 // A record goes into another box of the same client: { toBox: "<box number or barcode>", reason? }
 router.post("/:boxId/contents/:contentId/move", operate, asyncHandler(moveContent));

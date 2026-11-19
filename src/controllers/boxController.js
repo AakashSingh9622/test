@@ -175,6 +175,10 @@ async function addContent(req, res) {
   res.status(201).json(await contents.addContent(req.params.boxId, req.body || {}, actorFromReq(req)));
 }
 
+async function recordDocumentUpload(req, res) {
+  res.status(201).json(await contents.recordDocumentUpload(req.params.boxId, req.body || {}, actorFromReq(req)));
+}
+
 async function updateContent(req, res) {
   res.json(await contents.updateContent(req.params.boxId, req.params.contentId, req.body || {}, actorFromReq(req)));
 }
@@ -222,6 +226,7 @@ module.exports = {
   relabelBox,
   listContents,
   addContent,
+  recordDocumentUpload,
   updateContent,
   moveContent,
   removeContent,

@@ -378,6 +378,7 @@ model Box {
   auditEvents AuditEvent[]
   movements   Movement[]
   contents    BoxContent[]
+  archiveRecords ArchiveRecord[]
 
   // Portal lists a client's boxes (optionally by status), newest first -> composites cover filter + sort.
   @@index([clientId, status])
@@ -957,4 +958,49 @@ model Counter {
   seq Int    @default(0)
 
   @@map("counter")
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Docbox "records" (Phase 2, stage 1): one row inside a box -- a folder / subfolder / contents line with its own
+// internal code (Docbox COD_INTERNO). Requests, loans, returns and purges will work on these. Boxes and BoxContent
+// are untouched; a client that doesn't use records simply has none. The record keeps its home box when it is lent.
+//   status: archived (in its box) | on_loan (sent to the client) | in_transit | destroyed (purged)
+model ArchiveRecord {
+  id             String   @id @default(uuid())
+  internalCode   Int      @unique // system-given, global, never reused (recordSeq counter + RECORD_CODE_BASE)
+  clientId       String // DocuSoft ClientID (copied from the box)
+  clientName     String
+  expedienteId   String?
+  expedienteCode String?
+  boxId          String
+  box            Box      @relation(fields: [boxId], references: [id], onDelete: Restrict)
+  boxNumber      String // copied so lists don't need a join
+  status         String   @default("archived")
+  fields         Json? // { [CustomFieldDef.code]: value } -- the client's own fields (FOLDER, SUBFOLDER, CONTENTS ...)
+  comments       String?
+  createdBy      Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  events ArchiveRecordEvent[]
+
+  @@index([clientId, expedienteId])
+  @@index([boxId])
+  @@index([clientId, status])
+  @@index([status])
+  @@map("archive_record")
+}
+
+// History of one record. Only ever inserted. type: created | edited | duplicated | moved | status_changed | destroyed
+model ArchiveRecordEvent {
+  id         String        @id @default(uuid())
+  recordId   String
+  record     ArchiveRecord @relation(fields: [recordId], references: [id], onDelete: Cascade)
+  type       String
+  note       String?
+  actor      Json
+  at         DateTime      @default(now())
+
+  @@index([recordId, at])
+  @@map("archive_record_event")
 }
