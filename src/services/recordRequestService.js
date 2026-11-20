@@ -64,7 +64,9 @@ function summaryOf(record) {
 }
 
 //   input { clientId, recordIds: [..], loanType?, requestChannel?, contactName?, contactEmail?, notes? }
-async function createRequest(input, actor) {
+// `outerTx`: run inside the caller's transaction (the purge file lends some records and destroys others in one go).
+async function createRequest(input, actor, outerTx) {
+  const db = outerTx || prisma;
   const clientId = input.clientId == null ? "" : String(input.clientId); // exact: a stored id can have spaces
   if (!clientId.trim()) throw httpError(400, "clientId is required");
   if (!Array.isArray(input.recordIds)) throw httpError(400, "recordIds (non-empty array) is required");
@@ -81,7 +83,7 @@ async function createRequest(input, actor) {
   const contactEmail = text(input.contactEmail).toLowerCase();
   if (contactEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contactEmail)) throw httpError(400, "contactEmail is not a valid email");
 
-  const records = await prisma.archiveRecord.findMany({ where: { id: { in: ids } } });
+  const records = await db.archiveRecord.findMany({ where: { id: { in: ids } } });
   if (records.length !== ids.length) throw httpError(404, "One or more records were not found");
   const other = records.find((r) => r.clientId !== clientId);
   if (other) throw httpError(400, `Record ${other.internalCode} belongs to another client — one request is for one client`);
@@ -91,10 +93,9 @@ async function createRequest(input, actor) {
     throw httpError(409, `Not available to request: ${list}${notAvailable.length > 5 ? ` and ${notAvailable.length - 5} more` : ""} — only archived records can be requested`);
   }
 
-  const requestNumber = `REQ-${String(await nextSequence("recordRequestSeq")).padStart(6, "0")}`;
+  const requestNumber = `REQ-${String(await nextSequence("recordRequestSeq", db)).padStart(6, "0")}`;
   const sorted = records.slice().sort((a, b) => a.internalCode - b.internalCode);
-  const created = await prisma.$transaction(
-    async (tx) => {
+  const work = async (tx) => {
       // The status filter is the real guard: if anyone lent one of these records since we read it, the count is short -> nothing is saved.
       const changed = await tx.archiveRecord.updateMany({ where: { id: { in: ids }, status: "archived" }, data: { status: "on_loan" } });
       if (changed.count !== ids.length) throw httpError(409, "Some records were requested by someone else just now — search again");
@@ -118,9 +119,8 @@ async function createRequest(input, actor) {
         },
         include: { lines: true },
       });
-    },
-    { maxWait: 10_000, timeout: 60_000 },
-  );
+  };
+  const created = outerTx ? await work(outerTx) : await prisma.$transaction(work, { maxWait: 10_000, timeout: 60_000 });
   return serializeRequest(created, true);
 }
 
