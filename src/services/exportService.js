@@ -141,6 +141,64 @@ const SPECS = {
       row: (l) => [l.order.clientName, l.box?.boxNumber ?? l.boxNumber, l.box?.description, l.box?.department, l.box?.reference, l.order.orderNumber, l.order.loanType ?? (l.order.urgent ? "urgent" : "normal"), l.order.requestChannel, l.order.contactEmail, dateOnly(l.order.createdAt), dateOnly(l.order.completedAt), locationText(l.fromLocation)],
     };
   },
+  // Docbox "loan register" for RECORDS (Phase 2, item 10b): every record that is ON LOAN right now -- one row per record, from its ONE current
+  // physical loan (the open original request, accepted or delivered, not yet returned). Never listed: pending, returned and cancelled
+  // requests (history), digital requests (the paper never left), destroyed records. A record is in at most one open request (unique
+  // lockKey), so no record can appear twice. The client's own fields become columns (names, in order, only the ACTIVE ones); a
+  // per-file field is filled only for records of that file; a switched-off or unknown field is never shown. Without a client there is
+  // one "Fields" column ("Name: value; ...") using each record's own client's names. The box-level loans export above is untouched.
+  "record-loans": (params) => {
+    const clientId = params.clientId ? String(params.clientId) : "";
+    const at = period(params);
+    const REGISTER = ["Request date", "Requested by", "Internal code", "Issue date", "Request", "Urgency", "File", "Box number"];
+    const defsOf = new Map(); // clientId -> its ACTIVE field definitions in position order
+    const loadDefs = async (ids) => {
+      const need = ids.filter((id) => !defsOf.has(id));
+      if (!need.length) return;
+      const defs = await prisma.customFieldDef.findMany({ where: { clientId: { in: need }, active: true }, orderBy: [{ position: "asc" }, { code: "asc" }] });
+      for (const id of need) defsOf.set(id, defs.filter((d) => d.clientId === id));
+    };
+    const applies = (def, rec) => def.expedienteId == null || def.expedienteId === rec.expedienteId;
+    const value = (def, rec) => {
+      const v = rec.fields && typeof rec.fields === "object" ? rec.fields[def.code] : undefined;
+      return v === undefined || v === null ? "" : String(v);
+    };
+    const spec = { header: [] };
+    spec.init = async () => {
+      if (clientId) {
+        await loadDefs([clientId]);
+        spec.header = [...defsOf.get(clientId).map((d) => d.name), ...REGISTER, "Client"];
+      } else spec.header = ["Client", "Fields", ...REGISTER];
+    };
+    spec.fetch = async (skip, take) => {
+      const byClient = clientId ? Prisma.sql` AND q."clientId" = ${clientId}` : Prisma.empty;
+      const from = at && at.gte ? Prisma.sql` AND q."createdAt" >= ${at.gte}` : Prisma.empty;
+      const to = at && at.lt ? Prisma.sql` AND q."createdAt" < ${at.lt}` : Prisma.empty;
+      const rows = await prisma.$queryRaw(Prisma.sql`
+        SELECT l."internalCode", q."requestNumber", q."loanType", q."contactEmail", q."contactName", q."createdAt" AS "requestedAt", q."deliveredAt",
+               a."clientId", a."clientName", a."expedienteId", a."expedienteCode", a."boxNumber", a."fields"
+        FROM "record_request_line" l
+        JOIN "record_request" q ON q."id" = l."requestId"
+        JOIN "archive_record" a ON a."id" = l."recordId"
+        WHERE l."lockKey" IS NOT NULL AND l."returnedAt" IS NULL
+          AND q."kind" = 'original' AND q."status" IN ('requested', 'delivered')
+          AND a."status" = 'on_loan'${byClient}${from}${to}
+        ORDER BY q."createdAt" ASC, l."internalCode" ASC, l."id" ASC
+        LIMIT ${take} OFFSET ${skip}`);
+      if (!clientId) await loadDefs([...new Set(rows.map((r) => r.clientId))]);
+      return rows;
+    };
+    spec.row = (r) => {
+      const register = [dateOnly(r.requestedAt), r.contactEmail || r.contactName, r.internalCode, dateOnly(r.deliveredAt), r.requestNumber, r.loanType, r.expedienteCode, r.boxNumber];
+      if (clientId) return [...defsOf.get(clientId).map((d) => (applies(d, r) ? value(d, r) : "")), ...register, r.clientName];
+      const fields = (defsOf.get(r.clientId) || [])
+        .filter((d) => applies(d, r) && value(d, r) !== "")
+        .map((d) => `${d.name}: ${value(d, r)}`)
+        .join("; ");
+      return [r.clientName, fields, ...register];
+    };
+    return spec;
+  },
   // Docbox "Intercalado por cliente": every box that holds recorded files, and how many.
   interfiling: (params) => {
     const { interfilingWhere } = require("./reportService");

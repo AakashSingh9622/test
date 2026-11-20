@@ -98,8 +98,10 @@ async function notifyClient(db, req, what) {
   await notify({ audience: "client", clientId: req.clientId, contactEmail: req.contactEmail, kind: `record_request_${what}`, title: CLIENT_TEXT[what](req) }, db);
 }
 
-//   input { clientId, recordIds: [..], loanType?, requestChannel?, contactName?, contactEmail?, notes? }
-// A staff request for ORIGINAL records: the records go on loan now. `outerTx`: run inside the caller's transaction (the purge
+//   input { clientId, recordIds: [..], loanType?, requestChannel?, contactName?, contactEmail?, notes?, kind?, notifyContact?, via? }
+//   kind  original (default): the records go on loan now.  digital: a scan -- the paper never leaves its box, so no record is put on loan.
+//   notifyContact: tell the contact (portal Updates) that the warehouse made this request for them;  via: where it came from (history note).
+// A staff request: `outerTx`: run inside the caller's transaction (the purge
 // file lends some records and destroys others in one go).
 async function createRequest(input, actor, outerTx) {
   const db = outerTx || prisma;
@@ -116,6 +118,9 @@ async function createRequest(input, actor, outerTx) {
   if (requestChannel && !CHANNELS.includes(requestChannel)) throw httpError(400, `requestChannel must be one of ${CHANNELS.join(", ")}`);
   const notes = text(input.notes);
   if (notes.length > MAX_NOTES) throw httpError(400, `Notes are too long (${MAX_NOTES} characters at most)`);
+  const kind = input.kind ? String(input.kind) : "original";
+  if (!KINDS.includes(kind)) throw httpError(400, `kind must be one of ${KINDS.join(", ")}`);
+  const digital = kind === "digital";
   const contactEmail = text(input.contactEmail).toLowerCase();
   if (contactEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contactEmail)) throw httpError(400, "contactEmail is not a valid email");
 
@@ -134,18 +139,26 @@ async function createRequest(input, actor, outerTx) {
   const requestNumber = `REQ-${String(await nextSequence("recordRequestSeq", db)).padStart(6, "0")}`;
   const sorted = records.slice().sort((a, b) => a.internalCode - b.internalCode);
   const work = async (tx) => {
-    // The status filter is the real guard: if anyone lent one of these records since we read it, the count is short -> nothing is saved.
-    const changed = await tx.archiveRecord.updateMany({ where: { id: { in: ids }, status: "archived" }, data: { status: "on_loan" } });
-    if (changed.count !== ids.length) throw httpError(409, "Some records were requested by someone else just now — search again");
-    await tx.archiveRecordEvent.createMany({
-      data: sorted.map((r) => ({ recordId: r.id, type: "status_changed", note: `archived → on_loan: requested in ${requestNumber}`, actor })),
-    });
+    if (digital) {
+      // a digital copy never moves the paper: the physical status is NOT touched, the record is only locked in this request
+      await tx.archiveRecordEvent.createMany({
+        data: sorted.map((r) => ({ recordId: r.id, type: "requested", note: `${requestNumber}: digital copy requested by staff (the paper stays in the box)`, actor })),
+      });
+    } else {
+      // The status filter is the real guard: if anyone lent one of these records since we read it, the count is short -> nothing is saved.
+      const changed = await tx.archiveRecord.updateMany({ where: { id: { in: ids }, status: "archived" }, data: { status: "on_loan" } });
+      if (changed.count !== ids.length) throw httpError(409, "Some records were requested by someone else just now — search again");
+      await tx.archiveRecordEvent.createMany({
+        data: sorted.map((r) => ({ recordId: r.id, type: "status_changed", note: `archived → on_loan: requested in ${requestNumber}`, actor })),
+      });
+    }
     const created = await tx.recordRequest.create({
       data: {
         id: randomUUID(),
         requestNumber,
         clientId,
         clientName: sorted[0].clientName,
+        kind,
         loanType,
         requestChannel,
         contactName: text(input.contactName) || null,
@@ -157,7 +170,11 @@ async function createRequest(input, actor, outerTx) {
       },
       include: { lines: true },
     });
-    await addRequestEvent(tx, created.id, "created", actor, "Created by staff — the records are on loan");
+    const via = text(input.via) ? ` (${text(input.via)})` : "";
+    await addRequestEvent(tx, created.id, "created", actor, digital ? `Created by staff${via} — digital copy, nothing is lent` : `Created by staff${via} — the records are on loan`);
+    if (input.notifyContact && created.contactEmail) {
+      await notify({ audience: "client", clientId, contactEmail: created.contactEmail, kind: "record_request_created", title: `The warehouse created record request ${requestNumber} for you — ${sorted.length} record${sorted.length === 1 ? "" : "s"}, ${digital ? "digital copy" : "original"}` }, tx);
+    }
     return created;
   };
   let created;
