@@ -11,4 +11,14 @@ async function nextSequence(name, db = prisma) {
   return Number(rows[0].seq);
 }
 
-module.exports = { nextSequence };
+// Reserves `n` consecutive numbers in ONE atomic statement (a bulk import). Returns the LAST one: the range is
+// last - n + 1 .. last. Parallel callers never get overlapping ranges.
+async function nextSequenceRange(name, n, db = prisma) {
+  const rows = await db.$queryRaw`
+    INSERT INTO "counter" ("id", "seq") VALUES (${name}, ${n})
+    ON CONFLICT ("id") DO UPDATE SET "seq" = "counter"."seq" + ${n}
+    RETURNING "seq"`;
+  return Number(rows[0].seq);
+}
+
+module.exports = { nextSequence, nextSequenceRange };
