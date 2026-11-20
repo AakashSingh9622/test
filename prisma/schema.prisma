@@ -1021,6 +1021,10 @@ model RecordRequest {
   notes          String?
   recordCount    Int      @default(0)
   requestedBy    Json
+  deliveredAt    DateTime? // requested -> delivered
+  deliveredBy    Json?
+  closedAt       DateTime? // cancelled or returned
+  closedBy       Json?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
@@ -1039,6 +1043,7 @@ model RecordRequestLine {
   internalCode Int // copied so the request still reads the same later
   boxNumber    String
   summary      String? // the record's first field values, copied for printing
+  returnedAt   DateTime? // set when the record came back (stage 7 returns single records)
   createdAt    DateTime      @default(now())
 
   @@unique([requestId, recordId])

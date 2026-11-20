@@ -14,14 +14,28 @@ const MAX_RECORDS = 100;
 const MAX_NOTES = 500;
 const text = (v) => (v == null ? "" : String(v).trim());
 
-function serializeLine(l) {
-  const out = { id: l.id, recordId: l.recordId, internalCode: l.internalCode, boxNumber: l.boxNumber, summary: l.summary };
+// `extra` = what comes from the record itself (its own field values and the box's location now), for the printouts.
+function serializeLine(l, extra = {}) {
+  const out = {
+    id: l.id,
+    recordId: l.recordId,
+    internalCode: l.internalCode,
+    boxNumber: l.boxNumber,
+    summary: l.summary,
+    returnedAt: l.returnedAt ? l.returnedAt.toISOString() : null,
+    fields: extra.fields ?? null,
+    location: extra.location ?? null,
+  };
   for (const k of Object.keys(out)) if (out[k] == null) delete out[k];
   return out;
 }
 
-function serializeRequest(r, withLines) {
+function serializeRequest(r, withLines, extras = new Map()) {
   const out = {
+    deliveredAt: r.deliveredAt ? r.deliveredAt.toISOString() : null,
+    deliveredBy: r.deliveredBy,
+    closedAt: r.closedAt ? r.closedAt.toISOString() : null,
+    closedBy: r.closedBy,
     id: r.id,
     requestNumber: r.requestNumber,
     clientId: r.clientId,
@@ -37,7 +51,7 @@ function serializeRequest(r, withLines) {
     createdAt: r.createdAt.toISOString(),
     updatedAt: r.updatedAt.toISOString(),
   };
-  if (withLines) out.lines = (r.lines || []).slice().sort((a, b) => a.internalCode - b.internalCode).map(serializeLine);
+  if (withLines) out.lines = (r.lines || []).slice().sort((a, b) => a.internalCode - b.internalCode).map((l) => serializeLine(l, extras.get(l.recordId)));
   for (const k of Object.keys(out)) if (out[k] == null) delete out[k]; // the frontend schemas use .optional(), not .nullable()
   return out;
 }
@@ -113,7 +127,54 @@ async function createRequest(input, actor) {
 async function getRequest(id) {
   const r = await prisma.recordRequest.findUnique({ where: { id }, include: { lines: true } });
   if (!r) throw httpError(404, "Request not found");
-  return serializeRequest(r, true);
+  // The records' own values and the box's current place, for the delivery note and the witness slips.
+  const recs = await prisma.archiveRecord.findMany({ where: { id: { in: r.lines.map((l) => l.recordId) } }, select: { id: true, fields: true, box: { select: { locationPath: true } } } });
+  const extras = new Map(recs.map((x) => [x.id, { fields: x.fields, location: x.box?.locationPath }]));
+  return serializeRequest(r, true, extras);
+}
+
+// requested -> delivered (the records stay on loan) | cancelled (the records go back to archived)
+// delivered -> returned (all records not yet back return to archived). Returning single records is stage 7.
+const TRANSITIONS = { requested: ["delivered", "cancelled"], delivered: ["returned"], returned: [], cancelled: [] };
+
+//   input { to, note? }
+async function changeStatus(id, input, actor) {
+  const to = text(input.to);
+  if (!STATUSES.includes(to)) throw httpError(400, `status must be one of ${STATUSES.join(", ")}`);
+  const note = text(input.note);
+  if (note.length > MAX_NOTES) throw httpError(400, `The note is too long (${MAX_NOTES} characters at most)`);
+  const req = await prisma.recordRequest.findUnique({ where: { id }, include: { lines: true } });
+  if (!req) throw httpError(404, "Request not found");
+  if (req.status === to) throw httpError(409, `${req.requestNumber} is already ${to}`);
+  if (!TRANSITIONS[req.status].includes(to)) throw httpError(409, `${req.requestNumber} is ${req.status} and can't become ${to}`);
+
+  const now = new Date();
+  const tail = note ? `: ${note}` : "";
+  await prisma.$transaction(
+    async (tx) => {
+      const data = { status: to };
+      if (to === "delivered") Object.assign(data, { deliveredAt: now, deliveredBy: actor });
+      else Object.assign(data, { closedAt: now, closedBy: actor });
+      // Only succeeds if the request is still in the status we read.
+      const moved = await tx.recordRequest.updateMany({ where: { id, status: req.status }, data });
+      if (moved.count !== 1) throw httpError(409, `${req.requestNumber} was changed by someone else — reload`);
+
+      const open = req.lines.filter((l) => !l.returnedAt);
+      if (to === "delivered") {
+        await tx.archiveRecordEvent.createMany({ data: open.map((l) => ({ recordId: l.recordId, type: "status_changed", note: `${req.requestNumber} delivered to the client${tail}`, actor })) });
+        return;
+      }
+      // cancelled / returned: the records still out come back to the archive
+      const back = await tx.archiveRecord.updateMany({ where: { id: { in: open.map((l) => l.recordId) }, status: "on_loan" }, data: { status: "archived" } });
+      if (back.count !== open.length) throw httpError(409, `Some records of ${req.requestNumber} are no longer on loan — check them before closing the request`);
+      await tx.archiveRecordEvent.createMany({
+        data: open.map((l) => ({ recordId: l.recordId, type: "status_changed", note: `on_loan → archived: ${req.requestNumber} ${to}${tail}`, actor })),
+      });
+      if (to === "returned") await tx.recordRequestLine.updateMany({ where: { id: { in: open.map((l) => l.id) } }, data: { returnedAt: now } });
+    },
+    { maxWait: 10_000, timeout: 60_000 },
+  );
+  return getRequest(id);
 }
 
 // { items, total }, newest first. Filters: clientId, status (one or several), q (request number, client name, or an internal code on it).
@@ -139,4 +200,4 @@ async function listRequests(params = {}) {
   return { items: rows.map((r) => serializeRequest(r, false)), total };
 }
 
-module.exports = { createRequest, getRequest, listRequests, LOAN_TYPES, CHANNELS, STATUSES, MAX_RECORDS };
+module.exports = { createRequest, getRequest, listRequests, changeStatus, LOAN_TYPES, CHANNELS, STATUSES, MAX_RECORDS };

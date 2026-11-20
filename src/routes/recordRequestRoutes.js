@@ -1,6 +1,8 @@
 // Docbox "Peticiones" (Phase 2, stage 5) -- app.js mounts it at "/api/record-requests".
 //   GET  /?clientId=&status=&q=&page=&pageSize=   -> { items, total }   any staff
-//   GET  /:id                                      -> request with its lines
+//   GET  /:id                                      -> request with its lines (+ each record's fields and box location)
+//   POST /:id/status { to: delivered | cancelled | returned, note? } -> request. requested->delivered|cancelled, delivered->returned;
+//        cancelled / returned put the records back to archived (all or none)   boxes.operate
 //   POST / { clientId, recordIds: [..], loanType?, requestChannel?, contactName?, contactEmail?, notes? }
 //        -> 201 request; every record goes archived -> on_loan, all or none (409 if one isn't archived)   boxes.operate
 const express = require("express");
@@ -15,6 +17,7 @@ router.use(requireAuth);
 
 router.get("/", asyncHandler(async (req, res) => res.json(await svc.listRequests(req.query))));
 router.post("/", requirePermission("boxes.operate"), asyncHandler(async (req, res) => res.status(201).json(await svc.createRequest(req.body || {}, actorFromReq(req)))));
+router.post("/:id/status", requirePermission("boxes.operate"), asyncHandler(async (req, res) => res.json(await svc.changeStatus(req.params.id, req.body || {}, actorFromReq(req)))));
 router.get("/:id", asyncHandler(async (req, res) => res.json(await svc.getRequest(req.params.id))));
 
 module.exports = router;
