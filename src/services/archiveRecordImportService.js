@@ -79,8 +79,8 @@ async function validateRows(rows, clientId, clientName, expediente) {
 
 //   input { clientId, clientName?, expedienteId?, rows: [{ row?, boxNo, file?, customer?, comments?, customFields?: { C1: "..." } }], dryRun? }
 async function importRecords(input, actor) {
-  const clientId = text(input.clientId);
-  if (!clientId) throw httpError(400, "clientId is required");
+  const clientId = input.clientId == null ? "" : String(input.clientId); // exact: a stored id can have spaces
+  if (!clientId.trim()) throw httpError(400, "clientId is required");
   if (!Array.isArray(input.rows) || input.rows.length === 0) throw httpError(400, "rows (non-empty array) is required");
   if (input.rows.length > MAX_ROWS) throw httpError(400, `At most ${MAX_ROWS} rows per import — split the file`);
 

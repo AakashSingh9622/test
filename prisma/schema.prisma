@@ -1004,3 +1004,44 @@ model ArchiveRecordEvent {
   @@index([recordId, at])
   @@map("archive_record_event")
 }
+
+// Docbox "Peticiones" (Phase 2, stage 5): a client asks for some records. One request lists many records of ONE client.
+// Separate from Order (which moves whole boxes). Creating it puts the records on_loan; stage 6 moves the request on
+// (delivered / returned / cancelled).   status: requested | delivered | returned | cancelled
+model RecordRequest {
+  id             String   @id @default(uuid())
+  requestNumber  String   @unique // REQ-000001 (recordRequestSeq counter)
+  clientId       String
+  clientName     String
+  status         String   @default("requested")
+  loanType       String   @default("normal") // normal | urgent | superior | fax (same list as orders)
+  requestChannel String? // email | phone | in_person | post | fax
+  contactName    String?
+  contactEmail   String?
+  notes          String?
+  recordCount    Int      @default(0)
+  requestedBy    Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  lines RecordRequestLine[]
+
+  @@index([clientId, createdAt])
+  @@index([status, createdAt])
+  @@map("record_request")
+}
+
+model RecordRequestLine {
+  id           String        @id @default(uuid())
+  requestId    String
+  request      RecordRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  recordId     String
+  internalCode Int // copied so the request still reads the same later
+  boxNumber    String
+  summary      String? // the record's first field values, copied for printing
+  createdAt    DateTime      @default(now())
+
+  @@unique([requestId, recordId])
+  @@index([recordId])
+  @@map("record_request_line")
+}

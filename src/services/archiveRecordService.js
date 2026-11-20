@@ -218,6 +218,16 @@ async function listRecords(params = {}) {
     if (!/^\d{1,9}$/.test(q)) throw httpError(400, "q must be an internal code (digits only)");
     where.internalCode = Number(q);
   }
+  // `text`: words found in the record's own field values, its comments or its box number (any case). Narrowed by the
+  // other filters first (the request screen always sends the client), and capped, so it stays quick.
+  const text = String(params.text || "").trim();
+  if (text) {
+    if (text.length > 100) throw httpError(400, "text is too long");
+    const like = "%" + text.replace(/[\\%_]/g, (c) => "\\" + c) + "%";
+    const cid = where.clientId ?? null;
+    const hits = await prisma.$queryRaw`SELECT "id" FROM "archive_record" WHERE (comments ILIKE ${like} OR "boxNumber" ILIKE ${like} OR EXISTS (SELECT 1 FROM jsonb_each_text("fields") AS kv WHERE kv.value ILIKE ${like})) AND (${cid}::text IS NULL OR "clientId" = ${cid}) LIMIT 2000`;
+    where.id = { in: hits.map((r) => r.id) };
+  }
   const { skip, take } = parsePagination(params, 50);
   const [rows, total] = await Promise.all([
     prisma.archiveRecord.findMany({ where, orderBy: [{ internalCode: "desc" }], skip, take }),
