@@ -1013,7 +1013,10 @@ model RecordRequest {
   requestNumber  String   @unique // REQ-000001 (recordRequestSeq counter)
   clientId       String
   clientName     String
+  // pending (asked in the portal, staff have not accepted yet) | requested | delivered | returned | cancelled
   status         String   @default("requested")
+  kind           String   @default("original") // original (paper, record goes on loan) | digital (a scan, the paper never leaves the box)
+  source         String   @default("staff") // staff | portal
   loanType       String   @default("normal") // normal | urgent | superior | fax (same list as orders)
   requestChannel String? // email | phone | in_person | post | fax
   contactName    String?
@@ -1028,7 +1031,8 @@ model RecordRequest {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  lines RecordRequestLine[]
+  lines  RecordRequestLine[]
+  events RecordRequestEvent[]
 
   @@index([clientId, createdAt])
   @@index([status, createdAt])
@@ -1044,6 +1048,8 @@ model RecordRequestLine {
   boxNumber    String
   summary      String? // the record's first field values, copied for printing
   returnedAt   DateTime? // set when the record came back (stage 7 returns single records)
+  // = recordId while this line's request is open, NULL when closed. Unique: a record is in at most ONE open request.
+  lockKey      String?       @unique
   createdAt    DateTime      @default(now())
 
   @@unique([requestId, recordId])
@@ -1076,4 +1082,18 @@ model RecordPurgeRequest {
   @@index([status, createdAt])
   @@index([clientId, createdAt])
   @@map("record_purge_request")
+}
+
+// The request's own history (created, accepted, delivered, returned, cancelled) -- who and when. Only ever inserted.
+model RecordRequestEvent {
+  id        String        @id @default(uuid())
+  requestId String
+  request   RecordRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  type      String
+  note      String?
+  actor     Json
+  at        DateTime      @default(now())
+
+  @@index([requestId, at])
+  @@map("record_request_event")
 }

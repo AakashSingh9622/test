@@ -8,6 +8,7 @@ const { requirePortalAuth } = require("../middleware/portalAuth");
 const asyncHandler = require("../utils/asyncHandler");
 const portalAuthService = require("../services/portalAuthService");
 const portal = require("../services/portalService");
+const portalRecords = require("../services/portalRecordService");
 
 const router = express.Router();
 
@@ -57,6 +58,13 @@ router.get(
   asyncHandler(async (req, res) => res.json(await portal.boxHistory(req.portal, req.params.boxId, req.query)))
 );
 
+// Records (Phase 2, stage 11): the company's records, and asking for them. A request starts as "pending" until staff accept it.
+router.get("/records", asyncHandler(async (req, res) => res.json(await portalRecords.listRecords(req.portal, req.query))));
+router.get("/records/:id", asyncHandler(async (req, res) => res.json(await portalRecords.getRecord(req.portal, req.params.id))));
+router.get("/record-requests", asyncHandler(async (req, res) => res.json(await portalRecords.listRequests(req.portal, req.query))));
+router.post("/record-requests", asyncHandler(async (req, res) => res.status(201).json(await portalRecords.createRequest(req.portal, req.body || {}))));
+router.get("/record-requests/:id", asyncHandler(async (req, res) => res.json(await portalRecords.getRequest(req.portal, req.params.id))));
+router.post("/record-requests/:id/cancel", asyncHandler(async (req, res) => res.json(await portalRecords.cancelRequest(req.portal, req.params.id, (req.body || {}).reason))));
 router.get("/orders", asyncHandler(async (req, res) => res.json(await portal.listOrders(req.portal, req.query))));
 router.post(
   "/orders",

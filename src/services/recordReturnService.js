@@ -94,14 +94,17 @@ async function returnRecords(input, actor) {
         }),
       });
       const lineIds = lines.map((l) => l.id);
-      if (lineIds.length) await tx.recordRequestLine.updateMany({ where: { id: { in: lineIds }, returnedAt: null }, data: { returnedAt: now } });
+      if (lineIds.length) await tx.recordRequestLine.updateMany({ where: { id: { in: lineIds }, returnedAt: null }, data: { returnedAt: now, lockKey: null } }); // back: the record may be requested again
       // A delivered request with no record still out is finished.
       const closedNumbers = [];
       for (const requestId of new Set(lines.map((l) => l.requestId))) {
         const still = await tx.recordRequestLine.count({ where: { requestId, returnedAt: null } });
         if (still === 0) {
           const moved = await tx.recordRequest.updateMany({ where: { id: requestId, status: "delivered" }, data: { status: "returned", closedAt: now, closedBy: actor } });
-          if (moved.count === 1) closedNumbers.push(lines.find((l) => l.requestId === requestId).request.requestNumber);
+          if (moved.count === 1) {
+            closedNumbers.push(lines.find((l) => l.requestId === requestId).request.requestNumber);
+            await tx.recordRequestEvent.create({ data: { requestId, type: "returned", note: "The last record came back (returned by internal code)", actor } });
+          }
         }
       }
       return closedNumbers;

@@ -1,18 +1,28 @@
-// Docbox "Peticiones" (Phase 2, stage 5): a client asks for several records at once. One request = one client, many
-// records. Creating it puts every record on_loan (with a history row each) in the same transaction -- all or nothing.
-// Orders (whole boxes) are not touched. Stage 6 adds the status changes and the printouts.
+// Docbox "Peticiones" (Phase 2, stages 5, 6 and 11): a client asks for several records at once. One request = one client, many
+// records. Orders (whole boxes) are not touched.
+//   kind   original  the paper goes to the client: the records are put on_loan when the request is accepted
+//          digital   a scan: the paper NEVER leaves the box, so no record is ever put on loan
+//   source staff     made by staff: starts as "requested" and (original) puts the records on loan at once, all or nothing
+//          portal    asked by the client: starts as "pending" and changes nothing physical until staff accept it
+// A record is in at most ONE open request (record_request_line.lockKey is unique while the request is open), so two
+// people -- or a client and staff -- can't request the same record at the same time.
 const { randomUUID } = require("crypto");
 const prisma = require("../config/prisma");
 const httpError = require("../utils/httpError");
 const { parsePagination } = require("../utils/pagination");
 const { nextSequence } = require("./counterService");
+const { notify } = require("./notificationService");
 
 const LOAN_TYPES = ["normal", "urgent", "superior", "fax"];
 const CHANNELS = ["email", "phone", "in_person", "post", "fax"];
-const STATUSES = ["requested", "delivered", "returned", "cancelled"];
+const STATUSES = ["pending", "requested", "delivered", "returned", "cancelled"];
+const KINDS = ["original", "digital"];
 const MAX_RECORDS = 100;
 const MAX_NOTES = 500;
 const text = (v) => (v == null ? "" : String(v).trim());
+
+const ALREADY_OPEN = "One or more of these records are already in another open request — only one request at a time per record";
+const isUniqueViolation = (e) => e && e.code === "P2002";
 
 // `extra` = what comes from the record itself (its own field values and the box's location now), for the printouts.
 function serializeLine(l, extra = {}) {
@@ -41,6 +51,8 @@ function serializeRequest(r, withLines, extras = new Map()) {
     clientId: r.clientId,
     clientName: r.clientName,
     status: r.status,
+    kind: r.kind,
+    source: r.source,
     loanType: r.loanType,
     requestChannel: r.requestChannel,
     contactName: r.contactName,
@@ -63,8 +75,32 @@ function summaryOf(record) {
   return s ? s.slice(0, 300) : null;
 }
 
+// --- the request's own history, the lock, and the client's notifications (always inside the caller's transaction) ---------
+
+function addRequestEvent(db, requestId, type, actor, note) {
+  return db.recordRequestEvent.create({ data: { requestId, type, note: note ? String(note).slice(0, 500) : null, actor } });
+}
+
+// The request is closed: its records may be requested again.
+function releaseLocks(db, requestId) {
+  return db.recordRequestLine.updateMany({ where: { requestId, lockKey: { not: null } }, data: { lockKey: null } });
+}
+
+const KIND_WORD = { original: "records", digital: "digital copies" };
+const CLIENT_TEXT = {
+  accepted: (r) => `Your record request ${r.requestNumber} was accepted — we are preparing your ${KIND_WORD[r.kind]}`,
+  delivered: (r) => `${r.requestNumber}: your ${KIND_WORD[r.kind]} ${r.kind === "digital" ? "are ready" : "were delivered"}`,
+  cancelled: (r) => `Your record request ${r.requestNumber} was cancelled`,
+};
+// Tells the contact who asked (a main contact sees it too). Only requests with a contact are announced.
+async function notifyClient(db, req, what) {
+  if (!req.contactEmail || !CLIENT_TEXT[what]) return;
+  await notify({ audience: "client", clientId: req.clientId, contactEmail: req.contactEmail, kind: `record_request_${what}`, title: CLIENT_TEXT[what](req) }, db);
+}
+
 //   input { clientId, recordIds: [..], loanType?, requestChannel?, contactName?, contactEmail?, notes? }
-// `outerTx`: run inside the caller's transaction (the purge file lends some records and destroys others in one go).
+// A staff request for ORIGINAL records: the records go on loan now. `outerTx`: run inside the caller's transaction (the purge
+// file lends some records and destroys others in one go).
 async function createRequest(input, actor, outerTx) {
   const db = outerTx || prisma;
   const clientId = input.clientId == null ? "" : String(input.clientId); // exact: a stored id can have spaces
@@ -92,35 +128,45 @@ async function createRequest(input, actor, outerTx) {
     const list = notAvailable.slice(0, 5).map((r) => `${r.internalCode} (${r.status})`).join(", ");
     throw httpError(409, `Not available to request: ${list}${notAvailable.length > 5 ? ` and ${notAvailable.length - 5} more` : ""} — only archived records can be requested`);
   }
+  const taken = await db.recordRequestLine.findMany({ where: { lockKey: { in: ids } }, select: { internalCode: true } });
+  if (taken.length) throw httpError(409, `${ALREADY_OPEN}: ${taken.slice(0, 5).map((t) => t.internalCode).join(", ")}`);
 
   const requestNumber = `REQ-${String(await nextSequence("recordRequestSeq", db)).padStart(6, "0")}`;
   const sorted = records.slice().sort((a, b) => a.internalCode - b.internalCode);
   const work = async (tx) => {
-      // The status filter is the real guard: if anyone lent one of these records since we read it, the count is short -> nothing is saved.
-      const changed = await tx.archiveRecord.updateMany({ where: { id: { in: ids }, status: "archived" }, data: { status: "on_loan" } });
-      if (changed.count !== ids.length) throw httpError(409, "Some records were requested by someone else just now — search again");
-      await tx.archiveRecordEvent.createMany({
-        data: sorted.map((r) => ({ recordId: r.id, type: "status_changed", note: `archived → on_loan: requested in ${requestNumber}`, actor })),
-      });
-      return tx.recordRequest.create({
-        data: {
-          id: randomUUID(),
-          requestNumber,
-          clientId,
-          clientName: sorted[0].clientName,
-          loanType,
-          requestChannel,
-          contactName: text(input.contactName) || null,
-          contactEmail: contactEmail || null,
-          notes: notes || null,
-          recordCount: sorted.length,
-          requestedBy: actor,
-          lines: { create: sorted.map((r) => ({ recordId: r.id, internalCode: r.internalCode, boxNumber: r.boxNumber, summary: summaryOf(r) })) },
-        },
-        include: { lines: true },
-      });
+    // The status filter is the real guard: if anyone lent one of these records since we read it, the count is short -> nothing is saved.
+    const changed = await tx.archiveRecord.updateMany({ where: { id: { in: ids }, status: "archived" }, data: { status: "on_loan" } });
+    if (changed.count !== ids.length) throw httpError(409, "Some records were requested by someone else just now — search again");
+    await tx.archiveRecordEvent.createMany({
+      data: sorted.map((r) => ({ recordId: r.id, type: "status_changed", note: `archived → on_loan: requested in ${requestNumber}`, actor })),
+    });
+    const created = await tx.recordRequest.create({
+      data: {
+        id: randomUUID(),
+        requestNumber,
+        clientId,
+        clientName: sorted[0].clientName,
+        loanType,
+        requestChannel,
+        contactName: text(input.contactName) || null,
+        contactEmail: contactEmail || null,
+        notes: notes || null,
+        recordCount: sorted.length,
+        requestedBy: actor,
+        lines: { create: sorted.map((r) => ({ recordId: r.id, internalCode: r.internalCode, boxNumber: r.boxNumber, summary: summaryOf(r), lockKey: r.id })) },
+      },
+      include: { lines: true },
+    });
+    await addRequestEvent(tx, created.id, "created", actor, "Created by staff — the records are on loan");
+    return created;
   };
-  const created = outerTx ? await work(outerTx) : await prisma.$transaction(work, { maxWait: 10_000, timeout: 60_000 });
+  let created;
+  try {
+    created = outerTx ? await work(outerTx) : await prisma.$transaction(work, { maxWait: 10_000, timeout: 60_000 });
+  } catch (e) {
+    if (isUniqueViolation(e)) throw httpError(409, ALREADY_OPEN);
+    throw e;
+  }
   return serializeRequest(created, true);
 }
 
@@ -133,9 +179,19 @@ async function getRequest(id) {
   return serializeRequest(r, true, extras);
 }
 
-// requested -> delivered (the records stay on loan) | cancelled (the records go back to archived)
-// delivered -> returned (all records not yet back return to archived). Returning single records is stage 7.
-const TRANSITIONS = { requested: ["delivered", "cancelled"], delivered: ["returned"], returned: [], cancelled: [] };
+// The request's whole history, oldest first (staff see who did what).
+async function listRequestEvents(id) {
+  const exists = await prisma.recordRequest.findUnique({ where: { id }, select: { id: true } });
+  if (!exists) throw httpError(404, "Request not found");
+  const rows = await prisma.recordRequestEvent.findMany({ where: { requestId: id }, orderBy: [{ at: "asc" }, { id: "asc" }] });
+  return rows.map((e) => ({ id: e.id, type: e.type, note: e.note ?? undefined, actor: e.actor, at: e.at.toISOString() }));
+}
+
+// pending   -> requested (ACCEPT: an original's records go on loan; a digital request changes nothing physical) | cancelled
+// requested -> delivered (an original stays on loan; a digital request is finished) | cancelled (an original's records go back)
+// delivered -> returned (originals only: the records not yet back return to archived)
+const TRANSITIONS = { pending: ["requested", "cancelled"], requested: ["delivered", "cancelled"], delivered: ["returned"], returned: [], cancelled: [] };
+const EVENT_OF = { requested: "accepted", delivered: "delivered", returned: "returned", cancelled: "cancelled" };
 
 //   input { to, note? }
 async function changeStatus(id, input, actor) {
@@ -147,6 +203,8 @@ async function changeStatus(id, input, actor) {
   if (!req) throw httpError(404, "Request not found");
   if (req.status === to) throw httpError(409, `${req.requestNumber} is already ${to}`);
   if (!TRANSITIONS[req.status].includes(to)) throw httpError(409, `${req.requestNumber} is ${req.status} and can't become ${to}`);
+  const physical = req.kind === "original"; // a digital request never moves a record
+  if (!physical && to === "returned") throw httpError(409, `${req.requestNumber} is a digital request — there is nothing to return`);
 
   const now = new Date();
   const tail = note ? `: ${note}` : "";
@@ -154,30 +212,48 @@ async function changeStatus(id, input, actor) {
     async (tx) => {
       const data = { status: to };
       if (to === "delivered") Object.assign(data, { deliveredAt: now, deliveredBy: actor });
-      else Object.assign(data, { closedAt: now, closedBy: actor });
-      // Only succeeds if the request is still in the status we read.
+      else if (to !== "requested") Object.assign(data, { closedAt: now, closedBy: actor });
+      // Only succeeds if the request is still in the status we read (a client cancelling and staff accepting can't both win).
       const moved = await tx.recordRequest.updateMany({ where: { id, status: req.status }, data });
       if (moved.count !== 1) throw httpError(409, `${req.requestNumber} was changed by someone else — reload`);
 
       const open = req.lines.filter((l) => !l.returnedAt);
-      if (to === "delivered") {
-        await tx.archiveRecordEvent.createMany({ data: open.map((l) => ({ recordId: l.recordId, type: "status_changed", note: `${req.requestNumber} delivered to the client${tail}`, actor })) });
-        return;
+      const recordEvents = (type, noteOf) => tx.archiveRecordEvent.createMany({ data: open.map((l) => ({ recordId: l.recordId, type, note: noteOf, actor })) });
+
+      if (to === "requested") {
+        // ACCEPT
+        if (physical) {
+          const changed = await tx.archiveRecord.updateMany({ where: { id: { in: open.map((l) => l.recordId) }, status: "archived" }, data: { status: "on_loan" } });
+          if (changed.count !== open.length) throw httpError(409, `Some records of ${req.requestNumber} are no longer available (not archived any more) — cancel this request`);
+          await recordEvents("status_changed", `archived → on_loan: ${req.requestNumber} accepted${tail}`);
+        } else {
+          await recordEvents("requested", `${req.requestNumber} accepted — digital copy to be made (the paper stays in the box)${tail}`);
+        }
+      } else if (to === "delivered") {
+        await recordEvents(physical ? "status_changed" : "requested", physical ? `${req.requestNumber} delivered to the client${tail}` : `${req.requestNumber}: digital copy delivered${tail}`);
+        if (!physical) await releaseLocks(tx, id); // nothing to give back: the request is finished
+      } else {
+        // cancelled | returned
+        if (req.status === "pending" || !physical) {
+          // never on loan: the record's physical status is NOT touched
+          await recordEvents("requested", `${req.requestNumber} cancelled${req.status === "pending" ? " before it was accepted" : ""}${tail}`);
+        } else {
+          const back = await tx.archiveRecord.updateMany({ where: { id: { in: open.map((l) => l.recordId) }, status: "on_loan" }, data: { status: "archived" } });
+          if (back.count !== open.length) throw httpError(409, `Some records of ${req.requestNumber} are no longer on loan — check them before closing the request`);
+          await recordEvents("status_changed", `on_loan → archived: ${req.requestNumber} ${to}${tail}`);
+        }
+        if (to === "returned") await tx.recordRequestLine.updateMany({ where: { id: { in: open.map((l) => l.id) } }, data: { returnedAt: now } });
+        await releaseLocks(tx, id);
       }
-      // cancelled / returned: the records still out come back to the archive
-      const back = await tx.archiveRecord.updateMany({ where: { id: { in: open.map((l) => l.recordId) }, status: "on_loan" }, data: { status: "archived" } });
-      if (back.count !== open.length) throw httpError(409, `Some records of ${req.requestNumber} are no longer on loan — check them before closing the request`);
-      await tx.archiveRecordEvent.createMany({
-        data: open.map((l) => ({ recordId: l.recordId, type: "status_changed", note: `on_loan → archived: ${req.requestNumber} ${to}${tail}`, actor })),
-      });
-      if (to === "returned") await tx.recordRequestLine.updateMany({ where: { id: { in: open.map((l) => l.id) } }, data: { returnedAt: now } });
+      await addRequestEvent(tx, id, EVENT_OF[to], actor, note);
+      await notifyClient(tx, req, EVENT_OF[to]);
     },
     { maxWait: 10_000, timeout: 60_000 },
   );
   return getRequest(id);
 }
 
-// { items, total }, newest first. Filters: clientId, status (one or several), q (request number, client name, or an internal code on it).
+// { items, total }, newest first. Filters: clientId, status (one or several), kind, source, q (request number, client name, or an internal code on it).
 async function listRequests(params = {}) {
   const where = {};
   if (params.clientId) where.clientId = String(params.clientId);
@@ -185,6 +261,14 @@ async function listRequests(params = {}) {
     const list = (Array.isArray(params.status) ? params.status : [params.status]).map(String);
     if (list.some((s) => !STATUSES.includes(s))) throw httpError(400, `status must be one of ${STATUSES.join(", ")}`);
     where.status = { in: list };
+  }
+  if (params.kind) {
+    if (!KINDS.includes(String(params.kind))) throw httpError(400, `kind must be one of ${KINDS.join(", ")}`);
+    where.kind = String(params.kind);
+  }
+  if (params.source) {
+    if (!["staff", "portal"].includes(String(params.source))) throw httpError(400, "source must be staff or portal");
+    where.source = String(params.source);
   }
   const q = text(params.q);
   if (q) {
@@ -200,4 +284,23 @@ async function listRequests(params = {}) {
   return { items: rows.map((r) => serializeRequest(r, false)), total };
 }
 
-module.exports = { createRequest, getRequest, listRequests, changeStatus, LOAN_TYPES, CHANNELS, STATUSES, MAX_RECORDS };
+module.exports = {
+  createRequest,
+  getRequest,
+  listRequests,
+  listRequestEvents,
+  changeStatus,
+  // shared with the portal (portalRecordService.js)
+  serializeRequest,
+  summaryOf,
+  addRequestEvent,
+  releaseLocks,
+  isUniqueViolation,
+  ALREADY_OPEN,
+  LOAN_TYPES,
+  CHANNELS,
+  STATUSES,
+  KINDS,
+  MAX_RECORDS,
+  MAX_NOTES,
+};
