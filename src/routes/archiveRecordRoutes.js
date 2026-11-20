@@ -6,6 +6,9 @@
 //   POST /  { boxId, fields?: { C1: "...", ... }, comments? }  -> 201 record (the client and file come from the box)  boxes.operate
 //   POST /import  { clientId, clientName?, expedienteId?, dryRun?, rows: [{ row?, boxNo, file?, customer?, comments?, customFields? }] }
 //        -> { dryRun, count, firstCode?, lastCode? }; all rows or none (422 + errors: [{ row, message }])   boxes.operate
+//   POST /move  { clientId, clientName?, dryRun?, rows: [{ row?, internalCode, file?, customer?, newBox }] }
+//        -> { dryRun, count }; moves archived records to another box of the SAME client and file. All rows or none
+//        (422 + errors: [{ row, message }]); each move adds a "moved" history row "BX1 → BX2"   boxes.operate
 //   PATCH /:id  { fields?: { C1: "..." }, comments? }  -> record (only the codes sent change; "" clears)             boxes.operate
 //   POST /:id/duplicate  { boxId?, fields?, comments? }  -> 201 new record, a copy with the changes sent        boxes.operate
 const express = require("express");
@@ -15,6 +18,7 @@ const asyncHandler = require("../utils/asyncHandler");
 const { actorFromReq } = require("../utils/actor");
 const svc = require("../services/archiveRecordService");
 const importSvc = require("../services/archiveRecordImportService");
+const moveSvc = require("../services/recordMoveService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -23,6 +27,7 @@ router.get("/", asyncHandler(async (req, res) => res.json(await svc.listRecords(
 router.post("/", requirePermission("boxes.operate"), asyncHandler(async (req, res) => res.status(201).json(await svc.createRecord(req.body || {}, actorFromReq(req)))));
 const operate = requirePermission("boxes.operate");
 router.post("/import", operate, asyncHandler(async (req, res) => res.json(await importSvc.importRecords(req.body || {}, actorFromReq(req)))));
+router.post("/move", operate, asyncHandler(async (req, res) => res.json(await moveSvc.moveRecords(req.body || {}, actorFromReq(req)))));
 router.patch("/:id", operate, asyncHandler(async (req, res) => res.json(await svc.updateRecord(req.params.id, req.body || {}, actorFromReq(req)))));
 router.post("/:id/duplicate", operate, asyncHandler(async (req, res) => res.status(201).json(await svc.duplicateRecord(req.params.id, req.body || {}, actorFromReq(req)))));
 router.get("/:id", asyncHandler(async (req, res) => res.json(await svc.getRecord(req.params.id))));
