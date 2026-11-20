@@ -2,10 +2,13 @@
 // the record (destroyed for good -- who authorised it and on what date) or LENDS it (the rows marked "loan" become one
 // record request, exactly like the request screen). Like the imports it is all or nothing: every row is checked first
 // (`dryRun` only checks), and if any row is wrong nothing is saved and each bad row is reported by its row in the file.
+// A file with any PURGE row waits for a second person (RecordPurgeRequest): the preparer can never approve it.
 const prisma = require("../config/prisma");
 const httpError = require("../utils/httpError");
 const { activeHoldsForBoxes } = require("./legalHoldService");
 const { createRequest, MAX_RECORDS } = require("./recordRequestService");
+const { nextSequence } = require("./counterService");
+const { parsePagination } = require("../utils/pagination");
 
 const MAX_ROWS = 500;
 const MAX_WHO = 200;
@@ -111,9 +114,72 @@ async function validateRows(rows, clientId, clientName) {
   return { errors, purge, loan };
 }
 
+// What a run does, inside ONE transaction: destroy the purge rows, put the loan rows on one request. `tail` says who signed.
+async function runPlan(tx, { purge, loan, loanBlock, clientId, actor, tail }) {
+  // The status filter is the real guard against another change at the same moment: if one record moved, the count is short.
+  for (const { record, who, date } of purge) {
+    const done = await tx.archiveRecord.updateMany({ where: { id: record.id, status: "archived" }, data: { status: "destroyed" } });
+    if (done.count !== 1) throw httpError(409, `Record ${record.internalCode} was changed by someone else — check the file again`);
+    await tx.archiveRecordEvent.create({
+      data: { recordId: record.id, type: "destroyed", note: `archived → destroyed: purged by file, authorised by ${who} on ${dateText(date)}${tail || ""}`.slice(0, 500), actor },
+    });
+  }
+  let request = null;
+  if (loan.length) request = await createRequest({ ...(loanBlock || {}), clientId, recordIds: loan.map((r) => r.id) }, actor, tx);
+  return { purged: purge.length, lent: loan.length, requestNumber: request?.requestNumber, requestId: request?.id };
+}
+
+const TX = { maxWait: 10_000, timeout: 60_000 };
+const STATUSES = ["pending", "approved", "rejected", "cancelled"];
+
+// Only plain strings are kept from what was uploaded (this is stored and shown back to the approver).
+function cleanRows(rows) {
+  return rows.map((r, i) => {
+    const o = r && typeof r === "object" ? r : {};
+    return {
+      row: Number.isInteger(o.row) && o.row > 1 ? o.row : i + 2,
+      internalCode: text(o.internalCode).slice(0, 20),
+      file: text(o.file).slice(0, 100),
+      customer: text(o.customer).slice(0, 200),
+      action: text(o.action).slice(0, 20),
+      authorisedBy: text(o.authorisedBy).slice(0, MAX_WHO + 1),
+      date: text(o.date).slice(0, 20),
+    };
+  });
+}
+function cleanLoan(loan) {
+  if (!loan || typeof loan !== "object") return null;
+  const out = {};
+  for (const k of ["loanType", "requestChannel", "contactName", "contactEmail", "notes"]) if (text(loan[k])) out[k] = text(loan[k]).slice(0, 500);
+  return Object.keys(out).length ? out : null;
+}
+
+function serialize(r, withRows) {
+  const out = {
+    id: r.id,
+    requestNumber: r.requestNumber,
+    clientId: r.clientId,
+    clientName: r.clientName,
+    status: r.status,
+    purgeCount: r.purgeCount,
+    loanCount: r.loanCount,
+    preparedBy: r.preparedBy,
+    decidedBy: r.decidedBy,
+    decidedAt: r.decidedAt ? r.decidedAt.toISOString() : null,
+    decisionNote: r.decisionNote,
+    result: r.result,
+    createdAt: r.createdAt.toISOString(),
+    updatedAt: r.updatedAt.toISOString(),
+  };
+  if (withRows) out.rows = r.rows;
+  for (const k of Object.keys(out)) if (out[k] == null) delete out[k]; // the frontend schemas use .optional(), not .nullable()
+  return out;
+}
+
 //   input { clientId, clientName?, dryRun?, rows: [{ row?, internalCode, file?, customer?, action: "purge"|"loan", authorisedBy?, date? }],
-//           loan?: { loanType?, requestChannel?, contactName?, contactEmail?, notes? } }   (the `loan` block describes the one request
-//   made for the rows marked loan)
+//           loan?: { loanType?, requestChannel?, contactName?, contactEmail?, notes? } }
+// Every row is checked first. A file with NO purge row (only loans) runs at once. A file with ANY purge row is saved as a
+// pending request (PRG-nnnnnn) and nothing is changed until a different person approves it.
 async function purgeByFile(input, actor) {
   const clientId = input.clientId == null ? "" : String(input.clientId); // exact: a stored id can have spaces
   if (!clientId.trim()) throw httpError(400, "clientId is required");
@@ -129,27 +195,109 @@ async function purgeByFile(input, actor) {
     err.rowErrors = errors;
     throw err;
   }
-  if (input.dryRun) return { dryRun: true, purgeCount: purge.length, loanCount: loan.length };
+  const needsApproval = purge.length > 0;
+  if (input.dryRun) return { dryRun: true, purgeCount: purge.length, loanCount: loan.length, needsApproval };
 
-  const result = await prisma.$transaction(
-    async (tx) => {
-      // The status filter is the real guard against another change at the same moment: if one record moved, the count is short.
-      for (const { record, who, date } of purge) {
-        const done = await tx.archiveRecord.updateMany({ where: { id: record.id, status: "archived" }, data: { status: "destroyed" } });
-        if (done.count !== 1) throw httpError(409, `Record ${record.internalCode} was changed by someone else — check the file again`);
-        await tx.archiveRecordEvent.create({
-          data: { recordId: record.id, type: "destroyed", note: `archived → destroyed: purged by file, authorised by ${who} on ${dateText(date)}`.slice(0, 500), actor },
-        });
-      }
-      let request = null;
-      if (loan.length) {
-        request = await createRequest({ ...(input.loan || {}), clientId, recordIds: loan.map((r) => r.id) }, actor, tx);
-      }
-      return { purged: purge.length, lent: loan.length, requestNumber: request?.requestNumber, requestId: request?.id };
+  if (!needsApproval) {
+    const result = await prisma.$transaction((tx) => runPlan(tx, { purge, loan, loanBlock: input.loan, clientId, actor }), TX);
+    return { dryRun: false, pending: false, ...result };
+  }
+
+  const requestNumber = `PRG-${String(await nextSequence("purgeRequestSeq")).padStart(6, "0")}`;
+  const created = await prisma.recordPurgeRequest.create({
+    data: {
+      requestNumber,
+      clientId,
+      clientName: text(input.clientName) || clientId,
+      purgeCount: purge.length,
+      loanCount: loan.length,
+      rows: cleanRows(input.rows),
+      loan: cleanLoan(input.loan),
+      preparedBy: actor,
     },
-    { maxWait: 10_000, timeout: 60_000 },
-  );
-  return { dryRun: false, ...result };
+  });
+  return { dryRun: false, pending: true, requestId: created.id, requestNumber, purgeCount: purge.length, loanCount: loan.length };
 }
 
-module.exports = { purgeByFile, MAX_ROWS };
+async function getPurgeRequest(id) {
+  const r = await prisma.recordPurgeRequest.findUnique({ where: { id } });
+  if (!r) throw httpError(404, "Purge request not found");
+  return serialize(r, true);
+}
+
+async function listPurgeRequests(params = {}) {
+  const where = {};
+  if (params.clientId) where.clientId = String(params.clientId);
+  if (params.status) {
+    const list = (Array.isArray(params.status) ? params.status : [params.status]).map(String);
+    if (list.some((s) => !STATUSES.includes(s))) throw httpError(400, `status must be one of ${STATUSES.join(", ")}`);
+    where.status = { in: list };
+  }
+  const q = text(params.q);
+  if (q) where.OR = [{ requestNumber: { contains: q, mode: "insensitive" } }, { clientName: { contains: q, mode: "insensitive" } }];
+  const { skip, take } = parsePagination(params, 25);
+  const [rows, total] = await Promise.all([
+    prisma.recordPurgeRequest.findMany({ where, orderBy: [{ createdAt: "desc" }, { id: "asc" }], skip, take }),
+    prisma.recordPurgeRequest.count({ where }),
+  ]);
+  return { items: rows.map((r) => serialize(r, false)), total };
+}
+
+const samePerson = (a, b) => !!a?.id && !!b?.id && a.id === b.id;
+
+// The second signature. A DIFFERENT person than the one who prepared it. Every row is checked again first (the world may have
+// changed since the upload: a record lent, a legal hold placed): if any row is wrong nothing runs and the request stays pending.
+async function approvePurgeRequest(id, actor) {
+  const req = await prisma.recordPurgeRequest.findUnique({ where: { id } });
+  if (!req) throw httpError(404, "Purge request not found");
+  if (req.status !== "pending") throw httpError(409, `${req.requestNumber} is already ${req.status}`);
+  if (!actor?.id) throw httpError(403, "Can't tell who you are — sign in again");
+  if (samePerson(req.preparedBy, actor)) throw httpError(403, "You prepared this purge — a different person must approve it");
+
+  const { errors, purge, loan } = await validateRows(req.rows, req.clientId, req.clientName);
+  if (errors.length) {
+    errors.sort((a, b) => a.row - b.row);
+    const err = httpError(422, `${errors.length} row${errors.length === 1 ? " is" : "s are"} no longer valid — nothing was purged. Reject this request and upload a corrected file`);
+    err.errorCode = "PURGE_INVALID";
+    err.rowErrors = errors;
+    throw err;
+  }
+  const tail = `; prepared by ${req.preparedBy?.name || "?"}, approved by ${actor.name || "?"} (${req.requestNumber})`;
+  const result = await prisma.$transaction(async (tx) => {
+    // Only one approval can win: the request must still be pending.
+    const claimed = await tx.recordPurgeRequest.updateMany({ where: { id, status: "pending" }, data: { status: "approved", decidedBy: actor, decidedAt: new Date() } });
+    if (claimed.count !== 1) throw httpError(409, `${req.requestNumber} was decided by someone else`);
+    const done = await runPlan(tx, { purge, loan, loanBlock: req.loan, clientId: req.clientId, actor, tail });
+    await tx.recordPurgeRequest.update({ where: { id }, data: { result: done } });
+    return done;
+  }, TX);
+  void result;
+  return getPurgeRequest(id);
+}
+
+// Another person says no (a reason is required). The records are not touched.
+async function rejectPurgeRequest(id, input, actor) {
+  const note = text(input.note);
+  if (!note) throw httpError(400, "A reason is required");
+  if (note.length > 500) throw httpError(400, "The reason is too long (500 characters at most)");
+  const req = await prisma.recordPurgeRequest.findUnique({ where: { id } });
+  if (!req) throw httpError(404, "Purge request not found");
+  if (req.status !== "pending") throw httpError(409, `${req.requestNumber} is already ${req.status}`);
+  if (samePerson(req.preparedBy, actor)) throw httpError(403, "You prepared this purge — use Cancel to withdraw it");
+  const done = await prisma.recordPurgeRequest.updateMany({ where: { id, status: "pending" }, data: { status: "rejected", decidedBy: actor, decidedAt: new Date(), decisionNote: note } });
+  if (done.count !== 1) throw httpError(409, `${req.requestNumber} was decided by someone else`);
+  return getPurgeRequest(id);
+}
+
+// The person who prepared it withdraws it (a mistake in the file). The records are not touched.
+async function cancelPurgeRequest(id, actor) {
+  const req = await prisma.recordPurgeRequest.findUnique({ where: { id } });
+  if (!req) throw httpError(404, "Purge request not found");
+  if (req.status !== "pending") throw httpError(409, `${req.requestNumber} is already ${req.status}`);
+  if (!samePerson(req.preparedBy, actor)) throw httpError(403, "Only the person who prepared this purge can cancel it (anyone else can reject it)");
+  const done = await prisma.recordPurgeRequest.updateMany({ where: { id, status: "pending" }, data: { status: "cancelled", decidedBy: actor, decidedAt: new Date() } });
+  if (done.count !== 1) throw httpError(409, `${req.requestNumber} was decided by someone else`);
+  return getPurgeRequest(id);
+}
+
+module.exports = { purgeByFile, getPurgeRequest, listPurgeRequests, approvePurgeRequest, rejectPurgeRequest, cancelPurgeRequest, MAX_ROWS };

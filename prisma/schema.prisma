@@ -1050,3 +1050,30 @@ model RecordRequestLine {
   @@index([recordId])
   @@map("record_request_line")
 }
+
+// Docbox "Expurgo" by file, second signature (Phase 2, stage 8b): a file with any purge row does NOT run when it is
+// uploaded. It waits here as "pending" until a DIFFERENT person with records.approve approves it (the same rule as the
+// destruction orders). The rows are kept as uploaded and checked again at approval time.
+//   status: pending | approved | rejected | cancelled (cancelled = the preparer withdrew it)
+model RecordPurgeRequest {
+  id            String    @id @default(uuid())
+  requestNumber String    @unique // PRG-000001 (purgeRequestSeq counter)
+  clientId      String
+  clientName    String
+  status        String    @default("pending")
+  purgeCount    Int
+  loanCount     Int       @default(0)
+  rows          Json // the uploaded rows: [{ row, internalCode, file, customer, action, authorisedBy, date }]
+  loan          Json? // { loanType, requestChannel, contactName, contactEmail, notes } for the loan rows
+  preparedBy    Json // Actor -- the person who uploaded it; may NOT approve it
+  decidedBy     Json?
+  decidedAt     DateTime?
+  decisionNote  String?
+  result        Json? // after approval: { purged, lent, requestNumber?, requestId? }
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([status, createdAt])
+  @@index([clientId, createdAt])
+  @@map("record_purge_request")
+}
