@@ -199,6 +199,102 @@ const SPECS = {
     };
     return spec;
   },
+  // Docbox "returns shelving sheet" for RECORDS (Phase 2, item 10c): the records that came back, with the physical location of their box,
+  // so they can be shelved. Two ways to ask: ids=<record ids> (exactly the records just returned, at most 500) or a return period
+  // (from / to, optionally one client). Only records that are BACK IN STORAGE are listed -- one that was lent out again is not -- and each
+  // record appears ONCE, from its LATEST return (issue date = when that loan was delivered). Order = the pick list's walking order (warehouse,
+  // zone, aisle, rack, shelf, position, box; Site is NOT in the order; a box with no location LAST) -- the same as the Return Records list and
+  // the printed list. The location is split into columns (Site is only shown); a missing part is blank. With one client the client's own
+  // ACTIVE field names are columns; with several, one "Fields" column. loans / toshelve / record-loans are untouched.
+  "record-shelving": (params) => {
+    const { locationColumns, placeParts, compareByPlace } = require("../utils/locationPath");
+    const byIds = params.ids !== undefined;
+    let ids = [];
+    if (byIds) {
+      ids = String(params.ids).split(",").map((x) => x.trim()).filter(Boolean);
+      if (ids.length === 0) throw httpError(400, "ids is empty");
+      if (ids.length > 500) throw httpError(400, "At most 500 records at a time");
+    }
+    const clientId = params.clientId ? String(params.clientId) : "";
+    const at = period(params);
+    const MAX = 20000;
+    const LOCATION = ["Site", "Warehouse", "Block/Floor", "Aisle", "Shelving unit/Module", "Row/Shelf", "Position", "Box No."];
+    const TAIL = ["Issue date", "Internal code", "Returned on", "Request", "Client"];
+    const defsOf = new Map(); // clientId -> its ACTIVE field definitions in position order
+    const loadDefs = async (clientIds) => {
+      const need = clientIds.filter((id) => !defsOf.has(id));
+      if (!need.length) return;
+      const defs = await prisma.customFieldDef.findMany({ where: { clientId: { in: need }, active: true }, orderBy: [{ position: "asc" }, { code: "asc" }] });
+      for (const id of need) defsOf.set(id, defs.filter((d) => d.clientId === id));
+    };
+    const applies = (def, rec) => def.expedienteId == null || def.expedienteId === rec.expedienteId;
+    const value = (def, rec) => {
+      const v = rec.fields && typeof rec.fields === "object" ? rec.fields[def.code] : undefined;
+      return v === undefined || v === null ? "" : String(v);
+    };
+    let rows = null; // every row, sorted in walking order (loaded once)
+    let oneClient = ""; // the client whose field names are columns ("" = several, so one Fields column)
+    const spec = { header: [] };
+    const load = async () => {
+      if (rows) return;
+      const byId = byIds ? Prisma.sql` AND a."id" IN (${Prisma.join(ids)})` : Prisma.empty;
+      const byClient = clientId ? Prisma.sql` AND a."clientId" = ${clientId}` : Prisma.empty;
+      const needReturn = byIds ? Prisma.empty : Prisma.sql` AND l."returnedAt" IS NOT NULL`;
+      const from = !byIds && at && at.gte ? Prisma.sql` AND l."returnedAt" >= ${at.gte}` : Prisma.empty;
+      const to = !byIds && at && at.lt ? Prisma.sql` AND l."returnedAt" < ${at.lt}` : Prisma.empty;
+      const got = await prisma.$queryRaw(Prisma.sql`
+        SELECT a."internalCode", a."clientId", a."clientName", a."expedienteId", a."boxNumber", a."fields", b."locationPath",
+               s."row" AS "slotRow", s."column" AS "slotColumn", w."code" AS "slotWarehouse", rk."code" AS "slotRack", z."code" AS "slotZone", ai."code" AS "slotAisle",
+               l."returnedAt", q."requestNumber", q."deliveredAt"
+        FROM "archive_record" a
+        JOIN "box" b ON b."id" = a."boxId"
+        LEFT JOIN "slot" s ON s."id" = b."slotId"
+        LEFT JOIN "rack" rk ON rk."id" = s."rackId"
+        LEFT JOIN "zone" z ON z."id" = rk."zoneId"
+        LEFT JOIN "aisle" ai ON ai."id" = rk."aisleId"
+        LEFT JOIN "warehouse" w ON w."id" = s."warehouseId"
+        LEFT JOIN LATERAL (
+          SELECT l2."returnedAt", l2."requestId" FROM "record_request_line" l2
+          WHERE l2."recordId" = a."id" AND l2."returnedAt" IS NOT NULL
+          ORDER BY l2."returnedAt" DESC, l2."id" DESC LIMIT 1
+        ) l ON TRUE
+        LEFT JOIN "record_request" q ON q."id" = l."requestId"
+        WHERE a."status" = 'archived'${byId}${byClient}${needReturn}${from}${to}
+        LIMIT ${MAX + 1}`);
+      if (got.length > MAX) throw httpError(400, `More than ${MAX} records -- narrow the dates or choose a client`);
+      for (const r of got) {
+        const live = r.slotRow !== null && r.slotRow !== undefined ? { row: r.slotRow, column: r.slotColumn, warehouse: { code: r.slotWarehouse }, rack: { code: r.slotRack, zone: r.slotZone ? { code: r.slotZone } : null, aisle: r.slotAisle ? { code: r.slotAisle } : null } } : null;
+        r._parts = placeParts({ slot: live, locationPath: r.locationPath });
+      }
+      got.sort((x, y) => compareByPlace(x._parts, y._parts) || x.boxNumber.localeCompare(y.boxNumber) || x.internalCode - y.internalCode);
+      rows = got;
+      const clients = [...new Set(rows.map((r) => r.clientId))];
+      oneClient = clientId || (clients.length === 1 ? clients[0] : "");
+    };
+    spec.init = async () => {
+      await load();
+      if (oneClient) {
+        await loadDefs([oneClient]);
+        spec.header = [...LOCATION, ...defsOf.get(oneClient).map((d) => d.name), ...TAIL];
+      } else {
+        await loadDefs([...new Set(rows.map((r) => r.clientId))]);
+        spec.header = [...LOCATION, "Fields", ...TAIL];
+      }
+    };
+    spec.fetch = async (skip, take) => rows.slice(skip, skip + take);
+    spec.row = (r) => {
+      const c = locationColumns(r.locationPath);
+      const place = [c.site, c.warehouse, c.zone, c.aisle, c.rack, c.shelf, c.position, r.boxNumber];
+      const tail = [dateOnly(r.deliveredAt), r.internalCode, dateOnly(r.returnedAt), r.requestNumber, r.clientName];
+      if (oneClient) return [...place, ...defsOf.get(oneClient).map((d) => (applies(d, r) ? value(d, r) : "")), ...tail];
+      const fields = (defsOf.get(r.clientId) || [])
+        .filter((d) => applies(d, r) && value(d, r) !== "")
+        .map((d) => `${d.name}: ${value(d, r)}`)
+        .join("; ");
+      return [...place, fields, ...tail];
+    };
+    return spec;
+  },
   // Docbox "Intercalado por cliente": every box that holds recorded files, and how many.
   interfiling: (params) => {
     const { interfilingWhere } = require("./reportService");

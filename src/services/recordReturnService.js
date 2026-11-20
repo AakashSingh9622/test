@@ -4,17 +4,11 @@
 // last record is back becomes "returned". The shelving list is the same records sorted by where their box is.
 const prisma = require("../config/prisma");
 const httpError = require("../utils/httpError");
+const { placeParts, compareByPlace, BOX_ORDER_SELECT } = require("../utils/locationPath");
 
 const MAX_CODES = 200;
 const MAX_NOTE = 500;
 const text = (v) => (v == null ? "" : String(v).trim());
-
-// Where to put a record back: a sortable key from its box's location, so a list reads in walking order.
-function placeKey(p) {
-  const loc = p && typeof p === "object" ? p : {};
-  const num = (n) => String(Number.isFinite(Number(n)) ? Number(n) : 0).padStart(4, "0");
-  return [loc.site || "", loc.warehouse || "", loc.zone || "", loc.aisle || "", loc.rack || "", num(loc.shelf), num(loc.position)].join("|");
-}
 
 function shelvingItem(rec, extra = {}) {
   const out = {
@@ -31,7 +25,14 @@ function shelvingItem(rec, extra = {}) {
   for (const k of Object.keys(out)) if (out[k] == null) delete out[k];
   return out;
 }
-const byPlace = (a, b) => placeKey(a.location).localeCompare(placeKey(b.location)) || a.boxNumber.localeCompare(b.boxNumber) || a.internalCode - b.internalCode;
+// The shelving list in walking order -- the pick list's order (src/utils/locationPath.js): warehouse, zone, aisle, rack, shelf, position, box;
+// a box with no location LAST. The Return Records screen, the printed list and the shelving Excel all use it.
+function orderedItems(rows, extraOf) {
+  return rows
+    .map((r) => ({ parts: placeParts(r.box), item: shelvingItem(r, extraOf ? extraOf(r) : {}) }))
+    .sort((x, y) => compareByPlace(x.parts, y.parts) || x.item.boxNumber.localeCompare(y.item.boxNumber) || x.item.internalCode - y.item.internalCode)
+    .map((x) => x.item);
+}
 
 //   input { codes: [1000003, ...] (internal codes), note? }
 async function returnRecords(input, actor) {
@@ -112,8 +113,8 @@ async function returnRecords(input, actor) {
     { maxWait: 10_000, timeout: 60_000 },
   );
 
-  const withBox = await prisma.archiveRecord.findMany({ where: { id: { in: ids } }, include: { box: { select: { locationPath: true } } } });
-  const items = withBox.map((r) => shelvingItem(r, { requestNumber: openLine.get(r.id)?.request.requestNumber })).sort(byPlace);
+  const withBox = await prisma.archiveRecord.findMany({ where: { id: { in: ids } }, include: { box: { select: BOX_ORDER_SELECT } } });
+  const items = orderedItems(withBox, (r) => ({ requestNumber: openLine.get(r.id)?.request.requestNumber }));
   return { count: items.length, closedRequests: closed.sort(), items };
 }
 
@@ -122,8 +123,8 @@ async function shelvingList(idsParam) {
   const ids = String(idsParam || "").split(",").map((s) => s.trim()).filter(Boolean);
   if (ids.length === 0) throw httpError(400, "ids is required");
   if (ids.length > 500) throw httpError(400, "Too many ids");
-  const rows = await prisma.archiveRecord.findMany({ where: { id: { in: ids } }, include: { box: { select: { locationPath: true } } } });
-  return { items: rows.map((r) => shelvingItem(r)).sort(byPlace) };
+  const rows = await prisma.archiveRecord.findMany({ where: { id: { in: ids } }, include: { box: { select: BOX_ORDER_SELECT } } });
+  return { items: orderedItems(rows) };
 }
 
 module.exports = { returnRecords, shelvingList, MAX_CODES };
