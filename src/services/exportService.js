@@ -45,6 +45,69 @@ async function stream(res, filename, header, fetchPage, toRow) {
   res.end();
 }
 
+// --- Docbox "Exportar Archivo a Excel" (Phase 2, Item 2): the RECORDS inventory --------------------------------------------------------
+// One row per archive record (not per box), with the internal code the purge / move files need. The filters are the form of the PDF's step 10:
+// client, file, site, warehouse, floor/block (zone), aisle, module (rack), row, box / container / pallet ranges -- plus the record's status.
+// The location filters look at the record's box's slot (a box with no slot has no warehouse, so it drops out as soon as one is used).
+// Default status = everything except destroyed (Docbox only knows archived / on loan / in transit); destroyed only with status=destroyed.
+const RECORD_EXPORT_STATUSES = ["archived", "on_loan", "in_transit", "destroyed"];
+const RECORDS_FROM = Prisma.sql`FROM "archive_record" a JOIN "box" b ON b."id" = a."boxId"
+  LEFT JOIN "slot" s ON s."id" = b."slotId" LEFT JOIN "rack" rk ON rk."id" = s."rackId" LEFT JOIN "zone" z ON z."id" = rk."zoneId"
+  LEFT JOIN "aisle" ai ON ai."id" = rk."aisleId" LEFT JOIN "warehouse" w ON w."id" = s."warehouseId"`;
+
+function recordsFilter(params) {
+  const conds = [];
+  const t = (v) => String(v).trim();
+  const like = (v) => `%${t(v).replace(/[\\%_]/g, (c) => "\\" + c)}%`;
+  if (params.clientId) conds.push(Prisma.sql`a."clientId" = ${String(params.clientId)}`);
+  if (params.expediente) conds.push(Prisma.sql`lower(a."expedienteCode") = lower(${t(params.expediente)})`);
+  if (params.status) {
+    const st = t(params.status);
+    if (!RECORD_EXPORT_STATUSES.includes(st)) throw httpError(400, `status must be one of ${RECORD_EXPORT_STATUSES.join(", ")}`);
+    conds.push(Prisma.sql`a."status" = ${st}`);
+  } else conds.push(Prisma.sql`a."status" <> 'destroyed'`);
+  if (params.site) conds.push(Prisma.sql`lower(w."site") = lower(${t(params.site)})`);
+  if (params.warehouse) conds.push(Prisma.sql`(lower(w."code") = lower(${t(params.warehouse)}) OR lower(w."name") = lower(${t(params.warehouse)}))`);
+  if (params.warehouseId) conds.push(Prisma.sql`w."id" = ${String(params.warehouseId)}`);
+  if (params.zone) conds.push(Prisma.sql`(lower(z."code") = lower(${t(params.zone)}) OR z."name" ILIKE ${like(params.zone)})`);
+  if (params.aisle) conds.push(Prisma.sql`(lower(ai."code") = lower(${t(params.aisle)}) OR ai."name" ILIKE ${like(params.aisle)})`);
+  if (params.rack) conds.push(Prisma.sql`lower(rk."code") = lower(${t(params.rack)})`);
+  if (params.rackId) conds.push(Prisma.sql`rk."id" = ${String(params.rackId)}`);
+  if (params.row !== undefined && t(params.row) !== "") {
+    if (!/^\d{1,9}$/.test(t(params.row))) throw httpError(400, "row must be a whole number");
+    conds.push(Prisma.sql`s."row" = ${Number(t(params.row))}`);
+  }
+  // Box range ("Nº Caja desde / hasta"): "125" means BX00000125; a full number is used as it is.
+  const boxNo = (v) => (/^\d+$/.test(t(v)) ? `BX${t(v).padStart(8, "0")}` : t(v).toUpperCase());
+  if (params.boxFrom && t(params.boxFrom)) conds.push(Prisma.sql`b."boxNumber" >= ${boxNo(params.boxFrom)}`);
+  if (params.boxTo && t(params.boxTo)) conds.push(Prisma.sql`b."boxNumber" <= ${boxNo(params.boxTo)}`);
+  // Container / pallet ranges: whole numbers; a box whose value is not a number is left out of a ranged export. The cast is guarded (CASE) so a
+  // text value can never make the query fail.
+  const range = (from, to, col, name) => {
+    const whole = (v, n) => {
+      if (v === undefined || v === null || t(v) === "") return undefined;
+      if (!/^\d{1,15}$/.test(t(v))) throw httpError(400, `${n} must be a whole number`);
+      return BigInt(t(v));
+    };
+    const lo = whole(from, name + "From");
+    const hi = whole(to, name + "To");
+    if (lo !== undefined && hi !== undefined && lo > hi) throw httpError(400, `The ${name} range ends before it starts`);
+    const num = Prisma.sql`(CASE WHEN ${Prisma.raw(col)} ~ '^[0-9]{1,15}$' THEN (${Prisma.raw(col)})::bigint END)`;
+    if (lo !== undefined) conds.push(Prisma.sql`${num} >= ${lo}`);
+    if (hi !== undefined) conds.push(Prisma.sql`${num} <= ${hi}`);
+  };
+  range(params.containerFrom, params.containerTo, 'b."containerNo"', "container");
+  range(params.palletFrom, params.palletTo, 'b."palletNo"', "pallet");
+  return Prisma.join(conds, " AND ");
+}
+
+// How many rows the same filters give (the Excel screen checks it before it builds a file, and again against what it received).
+async function countRecords(params) {
+  const where = recordsFilter(params);
+  const [r] = await prisma.$queryRaw(Prisma.sql`SELECT COUNT(*)::int AS n ${RECORDS_FROM} WHERE ${where}`);
+  return r.n;
+}
+
 const SPECS = {
   inventory: (params) => {
     let sizeNames = null; // { code: name }, loaded with the first page
@@ -295,6 +358,70 @@ const SPECS = {
     };
     return spec;
   },
+  // Docbox "Exportar Archivo a Excel" (Item 2): the records inventory. One row per RECORD. Columns: the client's own ACTIVE fields (one client: a
+  // column each; several clients: one "Fields" column "Name: value; ..."; a per-file field only for that file's records), then Internal code, Status
+  // and the template's Docbox columns (the same names as the import template, so the file also feeds Purge / Move, which read Internal code, File and
+  // Customer). Order = internal code ascending, read with KEYSET paging (internalCode > last): unique, never reused and indexed, so no record is
+  // skipped or sent twice however the table changes while the file is written. The location comes from the box's live slot, else its stored snapshot.
+  records: (params) => {
+    const { locationColumns } = require("../utils/locationPath");
+    const where = recordsFilter(params);
+    const TAIL = ["Internal code", "Status", "Block/Floor", "Aisle", "Shelving unit/Module", "Row/Shelf", "Pallet No.", "Site", "Warehouse", "NCE", "TYPECE", "Box No.", "Box Type", "File", "Customer", "Comments"];
+    const defsOf = new Map(); // clientId -> its ACTIVE field definitions in position order
+    const loadDefs = async (ids) => {
+      const need = ids.filter((id) => !defsOf.has(id));
+      if (!need.length) return;
+      const defs = await prisma.customFieldDef.findMany({ where: { clientId: { in: need }, active: true }, orderBy: [{ position: "asc" }, { code: "asc" }] });
+      for (const id of need) defsOf.set(id, defs.filter((d) => d.clientId === id));
+    };
+    const applies = (def, rec) => def.expedienteId == null || def.expedienteId === rec.expedienteId;
+    const value = (def, rec) => {
+      const v = rec.fields && typeof rec.fields === "object" ? rec.fields[def.code] : undefined;
+      return v === undefined || v === null ? "" : String(v);
+    };
+    let oneClient = ""; // "" = several clients (one Fields column)
+    let sizeNames = null;
+    let last = 0; // the keyset cursor: the highest internal code sent so far
+    const spec = { header: [] };
+    spec.init = async () => {
+      sizeNames = await getBoxSizeNames();
+      if (params.clientId) oneClient = String(params.clientId);
+      else {
+        const some = await prisma.$queryRaw(Prisma.sql`SELECT DISTINCT a."clientId" AS "clientId" ${RECORDS_FROM} WHERE ${where} LIMIT 2`);
+        if (some.length === 1) oneClient = some[0].clientId;
+      }
+      if (oneClient) {
+        await loadDefs([oneClient]);
+        spec.header = [...defsOf.get(oneClient).map((d) => d.name), ...TAIL];
+      } else spec.header = ["Fields", ...TAIL];
+    };
+    spec.fetch = async (_skip, take) => {
+      const rows = await prisma.$queryRaw(Prisma.sql`
+        SELECT a."internalCode", a."status", a."clientId", a."clientName", a."expedienteId", a."expedienteCode", a."boxNumber", a."fields", a."comments",
+               b."locationPath", b."palletNo", b."containerNo", b."containerType", b."size",
+               s."id" AS "slotId", s."row" AS "slotRow", rk."code" AS "rackCode", z."code" AS "zoneCode", ai."code" AS "aisleCode", w."code" AS "whCode", w."site" AS "whSite"
+        ${RECORDS_FROM}
+        WHERE ${where} AND a."internalCode" > ${last}
+        ORDER BY a."internalCode" ASC
+        LIMIT ${take}`);
+      if (rows.length) last = rows[rows.length - 1].internalCode;
+      if (!oneClient) await loadDefs([...new Set(rows.map((r) => r.clientId))]);
+      return rows;
+    };
+    spec.row = (r) => {
+      const loc = r.slotId
+        ? { site: r.whSite ?? "", warehouse: r.whCode ?? "", zone: r.zoneCode ?? "", aisle: r.aisleCode ?? "", rack: r.rackCode ?? "", shelf: String(r.slotRow ?? "") }
+        : locationColumns(r.locationPath);
+      const tail = [r.internalCode, r.status, loc.zone, loc.aisle, loc.rack, loc.shelf, r.palletNo, loc.site, loc.warehouse, r.containerNo, r.containerType, r.boxNumber, sizeNames?.[r.size] ?? r.size, r.expedienteCode, r.clientId, r.comments];
+      if (oneClient) return [...defsOf.get(oneClient).map((d) => (applies(d, r) ? value(d, r) : "")), ...tail];
+      const fields = (defsOf.get(r.clientId) || [])
+        .filter((d) => applies(d, r) && value(d, r) !== "")
+        .map((d) => `${d.name}: ${value(d, r)}`)
+        .join("; ");
+      return [fields, ...tail];
+    };
+    return spec;
+  },
   // Docbox "Intercalado por cliente": every box that holds recorded files, and how many.
   interfiling: (params) => {
     const { interfilingWhere } = require("./reportService");
@@ -376,4 +503,4 @@ async function exportCsv(kind, params, res) {
   await stream(res, `${kind}-${stamp}.csv`, spec.header, spec.fetch, spec.row);
 }
 
-module.exports = { exportCsv, cell };
+module.exports = { exportCsv, cell, countRecords };
