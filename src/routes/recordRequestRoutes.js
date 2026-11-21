@@ -6,6 +6,10 @@
 //        pending->requested (ACCEPT a portal request: an original goes on loan, a digital one changes nothing physical) | cancelled;
 //        requested->delivered (digital: finished) | cancelled; delivered->returned (originals only). Cancelled / returned originals
 //        go back to archived (all or none). The client is notified of accept / deliver / cancel.
+//   PATCH /:id { contactName?, contactEmail?, loanType?, requestChannel?, notes?, addRecordIds?, removeRecordIds?, note? } -> request.   boxes.operate
+//        Edit a PENDING or REQUESTED request (all or nothing): header and/or add/remove records. Client and kind never change; a portal
+//        request keeps its contact. A requested original request puts added records on loan / gives removed ones back; pending and digital
+//        only lock / unlock. History on the request and on each record; the client is told once about contact / urgency / records changes.
 //   POST /import { clientId, clientName?, dryRun?, contacts: [{ email, name? }], rows: [{ row?, internalCode, file?, customer?, type, urgency, requestedBy }] }   boxes.operate
 //        -> { dryRun, count, requests: [{ kind, loanType, contactEmail, recordCount, (real run) id, requestNumber }] }. Rows are grouped by type + urgency
 //        + contact and split into requests of at most 100 records; physical -> records on loan, digital -> never. `contacts` = the client's DocuSoft
@@ -28,6 +32,7 @@ router.get("/", asyncHandler(async (req, res) => res.json(await svc.listRequests
 router.post("/", requirePermission("boxes.operate"), asyncHandler(async (req, res) => res.status(201).json(await svc.createRequest(req.body || {}, actorFromReq(req)))));
 router.post("/import", requirePermission("boxes.operate"), asyncHandler(async (req, res) => res.json(await importSvc.importRequests(req.body || {}, actorFromReq(req)))));
 router.post("/:id/status", requirePermission("boxes.operate"), asyncHandler(async (req, res) => res.json(await svc.changeStatus(req.params.id, req.body || {}, actorFromReq(req)))));
+router.patch("/:id", requirePermission("boxes.operate"), asyncHandler(async (req, res) => res.json(await svc.editRequest(req.params.id, req.body || {}, actorFromReq(req)))));
 router.get("/:id/events", asyncHandler(async (req, res) => res.json(await svc.listRequestEvents(req.params.id))));
 router.get("/:id", asyncHandler(async (req, res) => res.json(await svc.getRequest(req.params.id))));
 

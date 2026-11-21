@@ -270,6 +270,157 @@ async function changeStatus(id, input, actor) {
   return getRequest(id);
 }
 
+// --- editing an OPEN request (pending | requested) ------------------------------------------------------------------
+// input { contactName?, contactEmail?, loanType?, requestChannel?, notes?, addRecordIds?, removeRecordIds?, note? (the reason), clientId?/kind? (only if equal) }
+// ALL OR NOTHING in one transaction. The client and the kind never change. A PORTAL request keeps its contact (the client sees it through it).
+// Records: a requested ORIGINAL request holds its records on loan, so an added one goes on loan and a removed one goes back; a pending
+// or digital request only locks / unlocks them (their status is untouched) -- the same rules as create / cancel.
+// The client is told ONCE per edit, and only about what concerns them: contact, loan type, records added/removed (not notes / channel).
+const EDIT_STATUSES = ["pending", "requested"];
+const codeList = (rs) => {
+  const c = rs.map((r) => r.internalCode).sort((a, b) => a - b);
+  return c.length > 15 ? `${c.slice(0, 15).join(", ")} and ${c.length - 15} more` : c.join(", ");
+};
+const show = (v) => (v == null || v === "" ? "(none)" : String(v));
+
+async function editRequest(id, input, actor) {
+  const req = await prisma.recordRequest.findUnique({ where: { id }, include: { lines: true } });
+  if (!req) throw httpError(404, "Request not found");
+  if (!EDIT_STATUSES.includes(req.status)) throw httpError(409, `${req.requestNumber} is ${req.status} — only a pending or requested request can be edited`);
+  if (input.clientId != null && String(input.clientId) !== req.clientId) throw httpError(400, "The client of a request can't be changed");
+  if (input.kind != null && String(input.kind) !== req.kind) throw httpError(400, "The kind (original / digital) of a request can't be changed");
+  const reason = text(input.note);
+  if (reason.length > MAX_NOTES) throw httpError(400, `The note is too long (${MAX_NOTES} characters at most)`);
+
+  // ---- the header ----
+  const changes = [];
+  const data = {};
+  const setField = (key, label, value) => {
+    if ((req[key] ?? null) === (value ?? null)) return;
+    data[key] = value;
+    changes.push({ key, label, from: req[key], to: value });
+  };
+  if (input.loanType !== undefined) {
+    const loanType = String(input.loanType);
+    if (!LOAN_TYPES.includes(loanType)) throw httpError(400, `loanType must be one of ${LOAN_TYPES.join(", ")}`);
+    setField("loanType", "loan type", loanType);
+  }
+  if (input.requestChannel !== undefined) {
+    const ch = input.requestChannel ? String(input.requestChannel) : null;
+    if (ch && !CHANNELS.includes(ch)) throw httpError(400, `requestChannel must be one of ${CHANNELS.join(", ")}`);
+    setField("requestChannel", "request channel", ch);
+  }
+  if (input.notes !== undefined) {
+    const notes = text(input.notes);
+    if (notes.length > MAX_NOTES) throw httpError(400, `Notes are too long (${MAX_NOTES} characters at most)`);
+    setField("notes", "notes", notes || null);
+  }
+  const portalLocked = "The contact of a request made in the portal can't be changed";
+  if (input.contactName !== undefined) {
+    const name = text(input.contactName) || null;
+    if (req.source === "portal" && name !== (req.contactName ?? null)) throw httpError(409, portalLocked);
+    setField("contactName", "contact name", name);
+  }
+  if (input.contactEmail !== undefined) {
+    const email = text(input.contactEmail).toLowerCase();
+    if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw httpError(400, "contactEmail is not a valid email");
+    if (req.source === "portal" && (email || null) !== (req.contactEmail ?? null)) throw httpError(409, portalLocked);
+    setField("contactEmail", "contact email", email || null);
+  }
+
+  // ---- the records ----
+  const idList = (v, label) => {
+    if (v === undefined) return [];
+    if (!Array.isArray(v)) throw httpError(400, `${label} must be an array`);
+    return [...new Set(v.map((x) => text(x)).filter(Boolean))];
+  };
+  const addIds = idList(input.addRecordIds, "addRecordIds");
+  const removeIds = idList(input.removeRecordIds, "removeRecordIds");
+  if (addIds.length > MAX_RECORDS) throw httpError(400, `At most ${MAX_RECORDS} records per request`);
+  if (addIds.some((x) => removeIds.includes(x))) throw httpError(400, "A record can't be added and removed in the same edit");
+  if (!changes.length && !addIds.length && !removeIds.length) throw httpError(400, "Nothing to change");
+
+  const onRequest = new Map(req.lines.map((l) => [l.recordId, l]));
+  if (addIds.some((x) => onRequest.has(x))) throw httpError(400, "One or more records are already on this request");
+  if (removeIds.some((x) => !onRequest.has(x))) throw httpError(400, "One or more records to remove are not on this request");
+  const total = req.lines.length + addIds.length - removeIds.length;
+  if (total < 1) throw httpError(400, "A request needs at least one record — cancel the request instead");
+  if (total > MAX_RECORDS) throw httpError(400, `At most ${MAX_RECORDS} records per request`);
+
+  const holdsLoan = req.kind === "original" && req.status === "requested"; // this request's records are on loan right now
+  let toAdd = [];
+  if (addIds.length) {
+    toAdd = await prisma.archiveRecord.findMany({ where: { id: { in: addIds } } });
+    if (toAdd.length !== addIds.length) throw httpError(404, "One or more records were not found");
+    const other = toAdd.find((r) => r.clientId !== req.clientId);
+    if (other) throw httpError(400, `Record ${other.internalCode} belongs to another client — one request is for one client`);
+    const notAvailable = toAdd.filter((r) => r.status !== "archived");
+    if (notAvailable.length) throw httpError(409, `Not available to add: ${notAvailable.slice(0, 5).map((r) => `${r.internalCode} (${r.status})`).join(", ")} — only archived records can be requested`);
+    const taken = await prisma.recordRequestLine.findMany({ where: { lockKey: { in: addIds } }, select: { internalCode: true } });
+    if (taken.length) throw httpError(409, `${ALREADY_OPEN}: ${taken.slice(0, 5).map((t) => t.internalCode).join(", ")}`);
+  }
+  const toRemove = removeIds.map((x) => onRequest.get(x));
+  if (toRemove.some((l) => l.returnedAt)) throw httpError(409, "A record that already came back can't be removed");
+
+  const tail = reason ? `: ${reason}` : "";
+  const num = req.requestNumber;
+  const work = async (tx) => {
+    // Only succeeds if the request is still open and as we read it (a cancel / accept / another edit racing us loses or wins cleanly).
+    const stamp = await tx.recordRequest.updateMany({ where: { id, status: req.status, recordCount: req.recordCount }, data: { ...data, recordCount: total } });
+    if (stamp.count !== 1) throw httpError(409, `${num} was changed by someone else — reload`);
+
+    if (toRemove.length) {
+      if (holdsLoan) {
+        const back = await tx.archiveRecord.updateMany({ where: { id: { in: removeIds }, status: "on_loan" }, data: { status: "archived" } });
+        if (back.count !== removeIds.length) throw httpError(409, "Some records to remove are no longer on loan — check them first");
+        await tx.archiveRecordEvent.createMany({ data: toRemove.map((l) => ({ recordId: l.recordId, type: "status_changed", note: `on_loan → archived: removed from ${num}${tail}`, actor })) });
+      } else {
+        await tx.archiveRecordEvent.createMany({ data: toRemove.map((l) => ({ recordId: l.recordId, type: "requested", note: `removed from ${num}${tail}`, actor })) });
+      }
+      await tx.recordRequestLine.deleteMany({ where: { id: { in: toRemove.map((l) => l.id) }, requestId: id } }); // frees the lock: the record may be requested again
+      await addRequestEvent(tx, id, "records_removed", actor, `Removed ${toRemove.length}: ${codeList(toRemove)}${tail}`);
+    }
+    if (toAdd.length) {
+      const sorted = toAdd.slice().sort((a, b) => a.internalCode - b.internalCode);
+      if (holdsLoan) {
+        const changed = await tx.archiveRecord.updateMany({ where: { id: { in: addIds }, status: "archived" }, data: { status: "on_loan" } });
+        if (changed.count !== addIds.length) throw httpError(409, "Some records were requested by someone else just now — search again");
+        await tx.archiveRecordEvent.createMany({ data: sorted.map((r) => ({ recordId: r.id, type: "status_changed", note: `archived → on_loan: added to ${num}${tail}`, actor })) });
+      } else {
+        const how = req.kind === "digital" ? " (digital copy — the paper stays in the box)" : " (not on loan until the request is accepted)";
+        await tx.archiveRecordEvent.createMany({ data: sorted.map((r) => ({ recordId: r.id, type: "requested", note: `added to ${num}${how}${tail}`, actor })) });
+      }
+      await tx.recordRequestLine.createMany({ data: sorted.map((r) => ({ requestId: id, recordId: r.id, internalCode: r.internalCode, boxNumber: r.boxNumber, summary: summaryOf(r), lockKey: r.id })) });
+      await addRequestEvent(tx, id, "records_added", actor, `Added ${sorted.length}: ${codeList(sorted)}${tail}`);
+    }
+    if (changes.length) {
+      await addRequestEvent(tx, id, "edited", actor, changes.map((c) => `${c.label}: ${show(c.from)} → ${show(c.to)}`).join("; ") + tail);
+    }
+
+    // ONE notification per edit, only for what the client cares about (not notes / channel).
+    const meaningful = changes.some((c) => ["contactName", "contactEmail", "loanType"].includes(c.key)) || toAdd.length > 0 || toRemove.length > 0;
+    if (meaningful) {
+      const parts = [];
+      if ("loanType" in data) parts.push(`urgency is now ${data.loanType}`);
+      if ("contactName" in data || "contactEmail" in data) parts.push("contact details changed");
+      if (toAdd.length) parts.push(`${toAdd.length} record${toAdd.length === 1 ? "" : "s"} added`);
+      if (toRemove.length) parts.push(`${toRemove.length} record${toRemove.length === 1 ? "" : "s"} removed`);
+      const newEmail = "contactEmail" in data ? data.contactEmail : req.contactEmail;
+      if (newEmail) await notify({ audience: "client", clientId: req.clientId, contactEmail: newEmail, kind: "record_request_edited", title: `${num} was updated: ${parts.join(", ")}` }, tx);
+      if ("contactEmail" in data && req.contactEmail && req.contactEmail !== newEmail) {
+        await notify({ audience: "client", clientId: req.clientId, contactEmail: req.contactEmail, kind: "record_request_edited", title: `${num} is now handled for another contact` }, tx);
+      }
+    }
+  };
+  try {
+    await prisma.$transaction(work, { maxWait: 10_000, timeout: 60_000 });
+  } catch (e) {
+    if (isUniqueViolation(e)) throw httpError(409, ALREADY_OPEN);
+    throw e;
+  }
+  return getRequest(id);
+}
+
 // { items, total }, newest first. Filters: clientId, status (one or several), kind, source, q (request number, client name, or an internal code on it).
 async function listRequests(params = {}) {
   const where = {};
@@ -307,6 +458,7 @@ module.exports = {
   listRequests,
   listRequestEvents,
   changeStatus,
+  editRequest,
   // shared with the portal (portalRecordService.js)
   serializeRequest,
   summaryOf,
