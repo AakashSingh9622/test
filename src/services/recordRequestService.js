@@ -270,6 +270,119 @@ async function changeStatus(id, input, actor) {
   return getRequest(id);
 }
 
+// --- CORRECTING a request (Docbox "Modificar Peticiones") ---------------------------------------------------------------
+// The corrections the normal buttons can't do: the customer cancelled, wants a digital copy instead, or a loan / return was done by mistake.
+//   input { to?: requested | delivered | returned | cancelled,  kind?: original | digital,  reason }   -- exactly one of to / kind.
+// The record's physical status FOLLOWS the request (an original request only; a digital one never moves a record):
+//   open   (requested | delivered)  records on_loan, locked (lockKey = recordId)         [digital: only the lock, and only while "requested"]
+//   closed (returned | cancelled)   records archived, lock freed; returned lines carry returnedAt
+// So open -> closed gives the records back (they must still be on loan); closed -> open REOPENS (every record must be archived and free of any
+// other open request); requested <-> delivered only moves the date. All or nothing in one transaction; a request that changed meanwhile -> 409.
+const CORRECT_TARGETS = ["requested", "delivered", "returned", "cancelled"];
+const isOpenStatus = (st) => st === "requested" || st === "delivered";
+const loanOf = (kind, st) => kind === "original" && isOpenStatus(st); // records are on loan
+const lockOf = (kind, st) => st === "requested" || (st === "delivered" && kind === "original"); // records are locked in this request
+
+async function correctRequest(id, input, actor) {
+  const reason = text(input.reason);
+  if (!reason) throw httpError(400, "reason is required");
+  if (reason.length > MAX_NOTES) throw httpError(400, `The reason is too long (${MAX_NOTES} characters at most)`);
+  const hasTo = input.to != null && String(input.to) !== "";
+  const hasKind = input.kind != null && String(input.kind) !== "";
+  if (hasTo && hasKind) throw httpError(400, "Correct one thing at a time: the status or the kind");
+  if (!hasTo && !hasKind) throw httpError(400, "Say what to correct: to (the status) or kind (original / digital)");
+  if (hasTo && !CORRECT_TARGETS.includes(String(input.to))) throw httpError(400, `to must be one of ${CORRECT_TARGETS.join(", ")}`);
+  if (hasKind && !KINDS.includes(String(input.kind))) throw httpError(400, `kind must be one of ${KINDS.join(", ")}`);
+
+  const req = await prisma.recordRequest.findUnique({ where: { id }, include: { lines: true } });
+  if (!req) throw httpError(404, "Request not found");
+  const num = req.requestNumber;
+  if (req.status === "pending") throw httpError(409, `${num} is still waiting for acceptance — use Accept or Cancel`);
+  const toStatus = hasTo ? String(input.to) : req.status;
+  const toKind = hasKind ? String(input.kind) : req.kind;
+  if (hasTo && toStatus === req.status) throw httpError(400, `${num} is already ${req.status} — nothing to change`);
+  if (hasKind && toKind === req.kind) throw httpError(400, `${num} is already ${req.kind} — nothing to change`);
+  if (toKind === "digital" && toStatus === "returned") throw httpError(409, `${num} is a digital request — there is nothing to return`);
+  if (hasKind && !isOpenStatus(req.status)) throw httpError(409, `${num} is ${req.status} — the kind can only be changed while it is accepted or delivered`);
+
+  const hadLoan = loanOf(req.kind, req.status);
+  const wantLoan = loanOf(toKind, toStatus);
+  const hadLock = lockOf(req.kind, req.status);
+  const wantLock = lockOf(toKind, toStatus);
+  const now = new Date();
+  const lines = req.lines;
+  const openLines = lines.filter((l) => !l.returnedAt);
+  const what = hasKind ? `${req.kind} → ${toKind}` : `${req.status} → ${toStatus}`;
+
+  const work = async (tx) => {
+    // Only succeeds if the request is still as we read it (another correction / cancel racing us loses or wins cleanly).
+    const data = { status: toStatus, kind: toKind };
+    if (toStatus === "delivered") Object.assign(data, { deliveredAt: req.deliveredAt ?? now, deliveredBy: req.deliveredAt ? req.deliveredBy : actor, closedAt: null, closedBy: null });
+    else if (toStatus === "requested") Object.assign(data, { deliveredAt: null, deliveredBy: null, closedAt: null, closedBy: null });
+    else Object.assign(data, { closedAt: now, closedBy: actor });
+    const moved = await tx.recordRequest.updateMany({ where: { id, status: req.status, kind: req.kind }, data });
+    if (moved.count !== 1) throw httpError(409, `${num} was changed by someone else — reload`);
+
+    // ---- the records' physical status ----
+    const changedIds = new Set();
+    if (hadLoan && !wantLoan) {
+      const ids = openLines.map((l) => l.recordId);
+      const back = await tx.archiveRecord.updateMany({ where: { id: { in: ids }, status: "on_loan" }, data: { status: "archived" } });
+      if (back.count !== ids.length) throw httpError(409, `Some records of ${num} are no longer on loan — check them before correcting`);
+      await tx.archiveRecordEvent.createMany({ data: openLines.map((l) => ({ recordId: l.recordId, type: "status_changed", note: `on_loan → archived: ${num} corrected (${what}): ${reason}`, actor })) });
+      ids.forEach((x) => changedIds.add(x));
+    } else if (!hadLoan && wantLoan) {
+      const ids = lines.map((l) => l.recordId);
+      const recs = await tx.archiveRecord.findMany({ where: { id: { in: ids } }, select: { id: true, internalCode: true, status: true } });
+      const notFree = recs.filter((r) => r.status !== "archived");
+      if (notFree.length) throw httpError(409, `Can't put back on loan: ${notFree.slice(0, 5).map((r) => `${r.internalCode} (${r.status.replace("_", " ")})`).join(", ")} — only archived records can go on loan`);
+      const on = await tx.archiveRecord.updateMany({ where: { id: { in: ids }, status: "archived" }, data: { status: "on_loan" } });
+      if (on.count !== ids.length) throw httpError(409, "Some records changed meanwhile — try again");
+      await tx.archiveRecordEvent.createMany({ data: lines.map((l) => ({ recordId: l.recordId, type: "status_changed", note: `archived → on_loan: ${num} corrected (${what}): ${reason}`, actor })) });
+      ids.forEach((x) => changedIds.add(x));
+    }
+    const rest = lines.filter((l) => !changedIds.has(l.recordId));
+    if (rest.length) {
+      await tx.archiveRecordEvent.createMany({ data: rest.map((l) => ({ recordId: l.recordId, type: "requested", note: `${num} corrected (${what}): ${reason}`, actor })) });
+    }
+
+    // ---- the lines: returned marks ----
+    if (!(isOpenStatus(req.status) && isOpenStatus(toStatus))) {
+      if (toStatus === "returned") await tx.recordRequestLine.updateMany({ where: { requestId: id, returnedAt: null }, data: { returnedAt: now } });
+      else await tx.recordRequestLine.updateMany({ where: { requestId: id, returnedAt: { not: null } }, data: { returnedAt: null } });
+    }
+
+    // ---- the lock: one open request per record ----
+    if (!hadLock && wantLock) {
+      const ids = lines.map((l) => l.recordId);
+      const taken = await tx.recordRequestLine.findMany({ where: { lockKey: { in: ids }, requestId: { not: id } }, select: { internalCode: true } });
+      if (taken.length) throw httpError(409, `${ALREADY_OPEN}: ${taken.slice(0, 5).map((t) => t.internalCode).join(", ")}`);
+      for (const l of lines) await tx.recordRequestLine.update({ where: { id: l.id }, data: { lockKey: l.recordId } });
+    } else if (hadLock && !wantLock) {
+      await releaseLocks(tx, id);
+    }
+
+    await addRequestEvent(tx, id, hasKind ? "kind_changed" : "status_corrected", actor, `${what}: ${reason}`);
+
+    // ONE notification per correction, only for what the client cares about: a cancellation or a change of kind.
+    if (req.contactEmail) {
+      if (toStatus === "cancelled") {
+        await notifyClient(tx, { ...req, kind: toKind }, "cancelled");
+      } else if (hasKind) {
+        const title = toKind === "digital" ? `${num} was changed: you will get a digital copy instead of the paper` : `${num} was changed: you will get the original paper`;
+        await notify({ audience: "client", clientId: req.clientId, contactEmail: req.contactEmail, kind: "record_request_corrected", title }, tx);
+      }
+    }
+  };
+  try {
+    await prisma.$transaction(work, { maxWait: 10_000, timeout: 60_000 });
+  } catch (e) {
+    if (isUniqueViolation(e)) throw httpError(409, ALREADY_OPEN);
+    throw e;
+  }
+  return getRequest(id);
+}
+
 // --- editing an OPEN request (pending | requested) ------------------------------------------------------------------
 // input { contactName?, contactEmail?, loanType?, requestChannel?, notes?, addRecordIds?, removeRecordIds?, note? (the reason), clientId?/kind? (only if equal) }
 // ALL OR NOTHING in one transaction. The client and the kind never change. A PORTAL request keeps its contact (the client sees it through it).
@@ -459,6 +572,7 @@ module.exports = {
   listRequestEvents,
   changeStatus,
   editRequest,
+  correctRequest,
   // shared with the portal (portalRecordService.js)
   serializeRequest,
   summaryOf,
