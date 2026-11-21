@@ -1,7 +1,7 @@
 // Reports -- app.js mounts it at "/api/reports". Any logged-in staff may read them (no billing figures in here).
 //   GET /loans?from=&to=&clientId=     requests by type and urgency, per client
 //   GET /interfiling?clientId=&status=&page=&pageSize=   boxes holding recorded files, with how many (Docbox "Intercalado")
-//   GET /archive?clientId=&status=     boxes per client / size / status, and recorded contents per client
+//   GET /archive?clientId=&status=     boxes per client / size / status, and the number of records (archive records) per client
 const express = require("express");
 const { requireAuth } = require("../middleware/authMiddleware");
 const asyncHandler = require("../utils/asyncHandler");

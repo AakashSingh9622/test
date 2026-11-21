@@ -105,6 +105,14 @@ function archiveConditions(params) {
   const statuses = params.status ? [String(params.status)] : STATE_GROUPS[params.state];
   if (statuses) conds.push(Prisma.sql`b."status"::text IN (${Prisma.join(statuses)})`);
   else conds.push(Prisma.sql`b."status"::text <> 'destroyed'`);
+  conds.push(...placeAndDateConditions(params));
+  return Prisma.join(conds, " AND ");
+}
+
+// Site (Sede), warehouse (Almacen) and the box's entry date, on box "b" with its warehouse "w". A box with no slot has no warehouse, so
+// it only passes when neither site nor warehouse is asked for.
+function placeAndDateConditions(params) {
+  const conds = [];
   if (params.site) conds.push(Prisma.sql`lower(w."site") = lower(${String(params.site).trim()})`);
   if (params.warehouse) {
     const wanted = String(params.warehouse).trim();
@@ -113,17 +121,35 @@ function archiveConditions(params) {
   const at = period({ from: params.from, to: params.to });
   if (at?.gte) conds.push(Prisma.sql`COALESCE(b."entryDate", b."createdAt") >= ${at.gte}`);
   if (at?.lt) conds.push(Prisma.sql`COALESCE(b."entryDate", b."createdAt") < ${at.lt}`);
+  return conds;
+}
+
+// The same filters for counting RECORDS (archive_record "r" joined to its box "b" and the box's warehouse "w"): client, file and state are
+// the RECORD's own (its file, its status archived | on_loan | in_transit; destroyed records are always left out); the explicit box status is the status of the record's BOX; site, warehouse and dates are the box's, as above.
+const RECORD_STATE_GROUPS = { archived: ["archived"], loan: ["on_loan"], transit: ["in_transit"] };
+function recordConditions(params) {
+  const conds = [];
+  if (params.clientId) conds.push(Prisma.sql`r."clientId" = ${String(params.clientId)}`);
+  if (params.expedienteId) conds.push(Prisma.sql`r."expedienteId" = ${String(params.expedienteId)}`);
+  const states = Object.hasOwn(RECORD_STATE_GROUPS, params.state) ? RECORD_STATE_GROUPS[params.state] : undefined;
+  if (states) conds.push(Prisma.sql`r."status" IN (${Prisma.join(states)})`);
+  else conds.push(Prisma.sql`r."status" <> 'destroyed'`);
+  if (params.status) conds.push(Prisma.sql`b."status"::text = ${String(params.status)}`);
+  conds.push(...placeAndDateConditions(params));
   return Prisma.join(conds, " AND ");
 }
 
 // The archive (Docbox "Listado archivo"): boxes per client, box size and status (destroyed boxes excluded unless asked),
-// the recorded contents (files inside boxes) and the containers (NCE). `byExpediente` ("Cajas y contenedores por cliente y
+// the records (archive records, counted per client / file) and the containers (NCE). `byExpediente` ("Cajas y contenedores por cliente y
 // expediente") splits every row by the client's file too; the count maps are then keyed "clientId|expedienteCode".
 async function archiveReport(params) {
   const byExpediente = params.byExpediente === "true" || params.byExpediente === true;
   const conds = archiveConditions(params);
   const exp = byExpediente ? Prisma.sql`COALESCE(b."expedienteCode", '')` : Prisma.sql`''`;
   const groupExp = byExpediente ? Prisma.sql`, ${exp}` : Prisma.empty;
+  const recordConds = recordConditions(params);
+  const recordExp = byExpediente ? Prisma.sql`COALESCE(r."expedienteCode", '')` : Prisma.sql`''`;
+  const recordGroupExp = byExpediente ? Prisma.sql`, ${recordExp}` : Prisma.empty;
   const joins = Prisma.sql`LEFT JOIN "slot" s ON s."id" = b."slotId" LEFT JOIN "warehouse" w ON w."id" = s."warehouseId"`;
   const [groups, names, contents, containers] = await Promise.all([
     prisma.$queryRaw`
@@ -132,10 +158,11 @@ async function archiveReport(params) {
       FROM "box" b ${joins} WHERE ${conds}
       GROUP BY b."clientId", b."clientName", b."size", b."status"${groupExp}`,
     getBoxSizeNames(),
+    // Records are the real archive records (one row each, one box each: the joins can't multiply them), not the old box_content lines.
     prisma.$queryRaw`
-      SELECT b."clientId" AS "clientId", ${exp} AS "exp", COUNT(*)::int AS "records"
-      FROM "box_content" bc JOIN "box" b ON b."id" = bc."boxId" ${joins} WHERE ${conds}
-      GROUP BY b."clientId"${groupExp}`,
+      SELECT r."clientId" AS "clientId", ${recordExp} AS "exp", COUNT(*)::int AS "records"
+      FROM "archive_record" r JOIN "box" b ON b."id" = r."boxId" ${joins} WHERE ${recordConds}
+      GROUP BY r."clientId"${recordGroupExp}`,
     prisma.$queryRaw`
       SELECT b."clientId" AS "clientId", ${exp} AS "exp", COUNT(DISTINCT NULLIF(b."containerNo", ''))::int AS "containers"
       FROM "box" b ${joins} WHERE ${conds}
