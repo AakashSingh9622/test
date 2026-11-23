@@ -5,7 +5,7 @@ const prisma = require("../config/prisma");
 const { Prisma } = require("../config/prisma");
 const { serializeSimple } = require("../utils/serialize");
 const { pathFor } = require("../utils/locationPath");
-const { toCentimetres } = require("../utils/dimensions");
+const { toCentimetres, volumeCm3, formatVolume, DEFAULT_HEIGHT_CM, DEFAULT_DEPTH_CM } = require("../utils/dimensions");
 const httpError = require("../utils/httpError");
 const { appendAdminEvent } = require("./adminAuditService");
 
@@ -92,15 +92,20 @@ async function getWarehouseById(id) {
 // Har cell (row x column) khud ek storage location (slot) hai, uske andar koi sub-slot nahi. User har
 // cell ki length cm ya feet me deta hai (cellLength + lengthUnit); DB me whole centimetres store hote hain
 // aur wahi us cell ki capacity hai. Seed script (src/scripts/seed.js) jaisa hi slot code/barcode convention.
-async function createRack(warehouseId, { code, label, rows, columns, cellLength, lengthUnit, zoneId, aisleId }, actor) {
+async function createRack(warehouseId, { code, label, rows, columns, cellLength, cellHeight, cellDepth, lengthUnit, zoneId, aisleId }, actor) {
   const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId } });
   if (!warehouse) throw new Error(`Warehouse ${warehouseId} not found`);
 
   // Rack code ab SAARE warehouses me unique (Sprint 10) -- taaki "B04-3" akela hi shelf dhoondh le. DB sirf ek
   // warehouse ke andar enforce karta hai (purane racks me alag warehouses me same code ho sakta hai).
   const trimmedCode = code.trim();
-  if (/^\d+$/.test(trimmedCode)) {
-    throw httpError(400, "A rack code needs at least one letter (e.g. B04), so B04-3 can't be mistaken for a shelf");
+  // All-digit codes ("00603") are fine: "00603-3" still reads as module 00603, shelf 3. Only digits split by a separator
+  // ("006-03") are refused -- the finder would read that as module 006, shelf 3.
+  if (/^\d+([\s\-/.]+\d+)+$/.test(trimmedCode)) {
+    throw httpError(
+      400,
+      `A module code made only of numbers can't contain "-", "/", "." or spaces — "${trimmedCode}" would be read as a module and shelf. Use e.g. ${trimmedCode.replace(/[\s\-/.]+/g, "")}`
+    );
   }
   const existingRack = await prisma.rack.findFirst({
     where: { code: { equals: trimmedCode, mode: "insensitive" } },
@@ -115,10 +120,14 @@ async function createRack(warehouseId, { code, label, rows, columns, cellLength,
   const placement = await rackPlacement(warehouseId, { zoneId: zoneId || null, aisleId: aisleId || null });
   const where = await placementText(placement);
 
-  const cellLengthCm = toCentimetres(cellLength, lengthUnit); // galat unit/value par error (controller 400 deta hai)
+  // Wrong unit / value -> error (the controller answers 400). A cell is length x height x depth; its volume is the capacity.
+  const cellLengthCm = toCentimetres(cellLength, lengthUnit, "Length");
+  const cellHeightCm = cellHeight === undefined ? DEFAULT_HEIGHT_CM : toCentimetres(cellHeight, lengthUnit, "Height");
+  const cellDepthCm = cellDepth === undefined ? DEFAULT_DEPTH_CM : toCentimetres(cellDepth, lengthUnit, "Depth");
+  const cellVolume = volumeCm3(cellLengthCm, cellHeightCm, cellDepthCm);
   const rack = await prisma.$transaction(async (tx) => {
     const created = await tx.rack.create({
-      data: { warehouseId, code: trimmedCode, label, rows, columns, cellLengthCm, ...placement },
+      data: { warehouseId, code: trimmedCode, label, rows, columns, cellLengthCm, cellHeightCm, cellDepthCm, ...placement },
     });
     const slots = [];
     for (let row = 1; row <= rows; row++) {
@@ -130,7 +139,7 @@ async function createRack(warehouseId, { code, label, rows, columns, cellLength,
           barcode: `SL-${warehouse.code}-${trimmedCode}-${row}-${col}`,
           row,
           column: col,
-          capacity: cellLengthCm,
+          capacity: cellVolume,
           used: 0,
           status: "available",
         });
@@ -143,48 +152,60 @@ async function createRack(warehouseId, { code, label, rows, columns, cellLength,
       {
         entityType: "rack",
         entityId: created.id,
-        summary: `Added rack ${trimmedCode} to ${warehouse.code}${where}: ${rows} × ${columns} cells of ${cellLengthCm} cm`,
+        summary: `Added rack ${trimmedCode} to ${warehouse.code}${where}: ${rows} × ${columns} cells of ${cellLengthCm} × ${cellHeightCm} × ${cellDepthCm} cm (${formatVolume(cellVolume)})`,
       },
       tx
     );
     return created;
   });
 
-  return withCapacity(rack, { usedCapacity: 0, totalCapacity: cellLengthCm * rows * columns });
+  return withCapacity(rack, { usedCapacity: 0, totalCapacity: cellVolume * rows * columns });
 }
 
 // Rack ki cell length / label / zone / aisle badalta hai (jo bheja wahi). Cell length: rack.cellLengthCm aur uske SAARE
 // slots ki capacity ek saath update (har cell ek hi length ka hai). Agar kisi cell me already utna saaman hai jo nayi
 // length me nahi aayega to 409 -- pehle wo boxes hatao. Status (available/full) used/capacity se recompute hota hai,
 // blocked cells blocked hi rehte hain. Zone / aisle badle to rack ke boxes ki stored location bhi (updateRackDetails).
-async function updateRack(rackId, { cellLength, lengthUnit, label, zoneId, aisleId }, actor) {
+async function updateRack(rackId, { cellLength, cellHeight, cellDepth, lengthUnit, label, zoneId, aisleId }, actor) {
   const rack = await prisma.rack.findUnique({ where: { id: rackId } });
   if (!rack) return null;
   await updateRackDetails(rack, { label, zoneId, aisleId }, actor);
-  if (cellLength === undefined) return getRackById(rackId);
-  const cellLengthCm = toCentimetres(cellLength, lengthUnit);
+  if (cellLength === undefined && cellHeight === undefined && cellDepth === undefined) return getRackById(rackId);
+  // Whatever is not sent stays as it is.
+  const cellLengthCm = cellLength === undefined ? rack.cellLengthCm : toCentimetres(cellLength, lengthUnit, "Length");
+  const cellHeightCm = cellHeight === undefined ? rack.cellHeightCm : toCentimetres(cellHeight, lengthUnit, "Height");
+  const cellDepthCm = cellDepth === undefined ? rack.cellDepthCm : toCentimetres(cellDepth, lengthUnit, "Depth");
+  const cellVolume = volumeCm3(cellLengthCm, cellHeightCm, cellDepthCm);
+  const oldVolume = volumeCm3(rack.cellLengthCm, rack.cellHeightCm, rack.cellDepthCm);
 
   await prisma.$transaction(async (tx) => {
-    const overfull = await tx.slot.findFirst({ where: { rackId, used: { gt: cellLengthCm } }, orderBy: { used: "desc" } });
+    const overfull = await tx.slot.findFirst({ where: { rackId, used: { gt: cellVolume } }, orderBy: { used: "desc" } });
     if (overfull) {
-      const err = new Error(`Slot ${overfull.code} already holds ${overfull.used} cm, which is more than ${cellLengthCm} cm`);
+      const err = new Error(`Slot ${overfull.code} already holds ${formatVolume(overfull.used)}, which is more than the new cell volume of ${formatVolume(cellVolume)}`);
       err.status = 409;
       throw err;
     }
-    await tx.rack.update({ where: { id: rackId }, data: { cellLengthCm } });
-    await tx.slot.updateMany({ where: { rackId }, data: { capacity: cellLengthCm } });
+    await tx.rack.update({ where: { id: rackId }, data: { cellLengthCm, cellHeightCm, cellDepthCm } });
+    await tx.slot.updateMany({ where: { rackId }, data: { capacity: cellVolume } });
     // "full" sirf wahi jo ab poora bhar gaya hai; baaki (blocked chhodkar) available.
-    await tx.slot.updateMany({ where: { rackId, status: "full", used: { lt: cellLengthCm } }, data: { status: "available" } });
-    await tx.slot.updateMany({ where: { rackId, status: "available", used: cellLengthCm } , data: { status: "full" } });
-    if (rack.cellLengthCm !== cellLengthCm) {
+    await tx.slot.updateMany({ where: { rackId, status: "full", used: { lt: cellVolume } }, data: { status: "available" } });
+    await tx.slot.updateMany({ where: { rackId, status: "available", used: cellVolume } , data: { status: "full" } });
+    const changes = [
+      ["cellLengthCm", rack.cellLengthCm, cellLengthCm],
+      ["cellHeightCm", rack.cellHeightCm, cellHeightCm],
+      ["cellDepthCm", rack.cellDepthCm, cellDepthCm],
+    ]
+      .filter(([, from, to]) => from !== to)
+      .map(([field, from, to]) => ({ field, from, to }));
+    if (changes.length) {
       await appendAdminEvent(
         "rack_updated",
         actor,
         {
           entityType: "rack",
           entityId: rackId,
-          summary: `Changed cell length of rack ${rack.code} from ${rack.cellLengthCm} cm to ${cellLengthCm} cm`,
-          changes: [{ field: "cellLengthCm", from: rack.cellLengthCm, to: cellLengthCm }],
+          summary: `Changed cell size of rack ${rack.code} from ${rack.cellLengthCm} × ${rack.cellHeightCm} × ${rack.cellDepthCm} cm (${formatVolume(oldVolume)}) to ${cellLengthCm} × ${cellHeightCm} × ${cellDepthCm} cm (${formatVolume(cellVolume)})`,
+          changes,
         },
         tx
       );
@@ -249,7 +270,7 @@ async function updateSlot(slotId, patch, actor) {
     throw httpError(400, `status must be one of: ${SLOT_STATUS_INPUT.join(", ")}`);
   }
   if (patch.capacity !== undefined && !(Number.isInteger(patch.capacity) && patch.capacity > 0)) {
-    throw httpError(400, "capacity must be a positive whole number of centimetres");
+    throw httpError(400, "capacity must be a positive whole number of cubic centimetres (cm³)");
   }
 
   const capacity = patch.capacity ?? slot.capacity;
@@ -266,7 +287,7 @@ async function updateSlot(slotId, patch, actor) {
     WHERE "id" = ${slotId} AND "used" <= ${capacity}`;
   if (changed !== 1) {
     const current = await prisma.slot.findUnique({ where: { id: slotId } });
-    throw httpError(409, `Slot ${slot.code} already holds ${current?.used ?? slot.used} cm, which is more than ${capacity} cm -- move boxes out first`);
+    throw httpError(409, `Slot ${slot.code} already holds ${formatVolume(current?.used ?? slot.used)}, which is more than ${formatVolume(capacity)} -- move boxes out first`);
   }
   const updated = await prisma.slot.findUnique({ where: { id: slotId } });
 
@@ -279,7 +300,7 @@ async function updateSlot(slotId, patch, actor) {
   }
   if (slot.capacity !== updated.capacity) {
     changes.push({ field: "capacity", from: slot.capacity, to: updated.capacity });
-    said.push(`changed capacity from ${slot.capacity} cm to ${updated.capacity} cm`);
+    said.push(`changed capacity from ${formatVolume(slot.capacity)} to ${formatVolume(updated.capacity)}`);
   }
   if (changes.length) {
     await appendAdminEvent("slot_updated", actor, { entityType: "slot", entityId: slotId, summary: `Slot ${slot.barcode}: ${said.join(", ")}`, changes });
@@ -472,7 +493,7 @@ async function addShelf(rackId, actor) {
   await prisma.$transaction(async (tx) => {
     const slots = [];
     for (let col = 1; col <= rack.columns; col++) {
-      slots.push({ rackId, warehouseId: rack.warehouseId, code: `${row}-${col}`, barcode: `SL-${rack.warehouse.code}-${rack.code}-${row}-${col}`, row, column: col, capacity: rack.cellLengthCm, used: 0, status: "available" });
+      slots.push({ rackId, warehouseId: rack.warehouseId, code: `${row}-${col}`, barcode: `SL-${rack.warehouse.code}-${rack.code}-${row}-${col}`, row, column: col, capacity: volumeCm3(rack.cellLengthCm, rack.cellHeightCm, rack.cellDepthCm), used: 0, status: "available" });
     }
     await tx.slot.createMany({ data: slots });
     await tx.rack.update({ where: { id: rackId }, data: { rows: row } });

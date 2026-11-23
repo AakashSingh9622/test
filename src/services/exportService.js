@@ -230,15 +230,15 @@ const SPECS = {
     spec.init = async () => {
       if (clientId) {
         await loadDefs([clientId]);
-        spec.header = [...defsOf.get(clientId).map((d) => d.name), ...REGISTER, "Client"];
-      } else spec.header = ["Client", "Fields", ...REGISTER];
+        spec.header = [...defsOf.get(clientId).map((d) => d.name), ...REGISTER, "Client", "Order number"];
+      } else spec.header = ["Client", "Fields", ...REGISTER, "Order number"];
     };
     spec.fetch = async (skip, take) => {
       const byClient = clientId ? Prisma.sql` AND q."clientId" = ${clientId}` : Prisma.empty;
       const from = at && at.gte ? Prisma.sql` AND q."createdAt" >= ${at.gte}` : Prisma.empty;
       const to = at && at.lt ? Prisma.sql` AND q."createdAt" < ${at.lt}` : Prisma.empty;
       const rows = await prisma.$queryRaw(Prisma.sql`
-        SELECT l."internalCode", q."requestNumber", q."loanType", q."contactEmail", q."contactName", q."createdAt" AS "requestedAt", q."deliveredAt",
+        SELECT l."internalCode", q."requestNumber", q."loanType", q."contactEmail", q."contactName", q."createdAt" AS "requestedAt", q."deliveredAt", q."orderNumber",
                a."clientId", a."clientName", a."expedienteId", a."expedienteCode", a."boxNumber", a."fields"
         FROM "record_request_line" l
         JOIN "record_request" q ON q."id" = l."requestId"
@@ -253,12 +253,12 @@ const SPECS = {
     };
     spec.row = (r) => {
       const register = [dateOnly(r.requestedAt), r.contactEmail || r.contactName, r.internalCode, dateOnly(r.deliveredAt), r.requestNumber, r.loanType, r.expedienteCode, r.boxNumber];
-      if (clientId) return [...defsOf.get(clientId).map((d) => (applies(d, r) ? value(d, r) : "")), ...register, r.clientName];
+      if (clientId) return [...defsOf.get(clientId).map((d) => (applies(d, r) ? value(d, r) : "")), ...register, r.clientName, r.orderNumber];
       const fields = (defsOf.get(r.clientId) || [])
         .filter((d) => applies(d, r) && value(d, r) !== "")
         .map((d) => `${d.name}: ${value(d, r)}`)
         .join("; ");
-      return [r.clientName, fields, ...register];
+      return [r.clientName, fields, ...register, r.orderNumber];
     };
     return spec;
   },

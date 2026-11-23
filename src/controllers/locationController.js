@@ -51,7 +51,7 @@ async function listRacks(req, res) {
 }
 
 async function createRack(req, res) {
-  const { code, label, rows, columns, cellLength, lengthUnit, zoneId, aisleId } = req.body || {};
+  const { code, label, rows, columns, cellLength, cellHeight, cellDepth, lengthUnit, zoneId, aisleId } = req.body || {};
   if (!code || !label || !rows || !columns || !cellLength) {
     return res.status(400).json({ message: "code, label, rows, columns, and cellLength are required" });
   }
@@ -60,6 +60,10 @@ async function createRack(req, res) {
   }
   if (!(Number(cellLength) > 0)) {
     return res.status(400).json({ message: "cellLength must be a positive number" });
+  }
+  // Height and depth are optional only for older callers (then 50 cm, what every cell had before they existed).
+  for (const [name, v] of [["cellHeight", cellHeight], ["cellDepth", cellDepth]]) {
+    if (v !== undefined && !(Number(v) > 0)) return res.status(400).json({ message: `${name} must be a positive number` });
   }
   const warehouse = await locationService.getWarehouseById(req.params.warehouseId);
   if (!warehouse) return res.status(404).json({ message: "Warehouse not found" });
@@ -70,6 +74,8 @@ async function createRack(req, res) {
     rows: Number(rows),
     columns: Number(columns),
     cellLength: Number(cellLength),
+    cellHeight: cellHeight === undefined ? undefined : Number(cellHeight),
+    cellDepth: cellDepth === undefined ? undefined : Number(cellDepth),
     lengthUnit: lengthUnit || "cm",
     zoneId,
     aisleId,
@@ -83,20 +89,23 @@ async function getRack(req, res) {
   res.json(rack);
 }
 
-// Any of: cellLength (+ lengthUnit), label, zoneId, aisleId (null / "" = take it out of its zone / aisle).
+// Any of: cellLength / cellHeight / cellDepth (+ lengthUnit), label, zoneId, aisleId (null / "" = take it out of its zone / aisle).
 async function patchRack(req, res) {
-  const { cellLength, lengthUnit, label, zoneId, aisleId } = req.body || {};
-  if (cellLength === undefined && label === undefined && zoneId === undefined && aisleId === undefined) {
-    return res.status(400).json({ message: "Send cellLength, label, zoneId or aisleId" });
+  const { cellLength, cellHeight, cellDepth, lengthUnit, label, zoneId, aisleId } = req.body || {};
+  const sizeGiven = cellLength !== undefined || cellHeight !== undefined || cellDepth !== undefined;
+  if (!sizeGiven && label === undefined && zoneId === undefined && aisleId === undefined) {
+    return res.status(400).json({ message: "Send cellLength, cellHeight, cellDepth, label, zoneId or aisleId" });
   }
-  if (cellLength !== undefined && !(Number(cellLength) > 0)) {
-    return res.status(400).json({ message: "cellLength must be a positive number" });
+  for (const [name, v] of [["cellLength", cellLength], ["cellHeight", cellHeight], ["cellDepth", cellDepth]]) {
+    if (v !== undefined && !(Number(v) > 0)) return res.status(400).json({ message: `${name} must be a positive number` });
   }
   if (lengthUnit !== undefined && !["cm", "ft"].includes(lengthUnit)) {
     return res.status(400).json({ message: 'lengthUnit must be "cm" or "ft"' });
   }
   const rack = await locationService.updateRack(req.params.rackId, {
     cellLength: cellLength === undefined ? undefined : Number(cellLength),
+    cellHeight: cellHeight === undefined ? undefined : Number(cellHeight),
+    cellDepth: cellDepth === undefined ? undefined : Number(cellDepth),
     lengthUnit: lengthUnit || "cm",
     label,
     zoneId,

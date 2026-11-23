@@ -8,7 +8,7 @@ const { allocateBoxes, isActiveSlot } = require("./boxAllocationService");
 const { resolveLocation } = require("./locationService");
 const { resolveParts, hasLocationParts } = require("./locationParts");
 const { getBoxIneligibilityReason } = require("./boxEligibility");
-const { boxLengthCm } = require("../utils/dimensions");
+const { boxVolumeCm3, formatVolume } = require("../utils/dimensions");
 const { serializeBox } = require("../utils/serialize");
 const httpError = require("../utils/httpError");
 
@@ -105,7 +105,7 @@ async function bulkMove({ rows, dryRun, reason }, actor) {
       fail(`${box.boxNumber} is ${box.status.replace(/_/g, " ")} and can't be moved`);
       continue;
     }
-    const need = box.lengthCm ?? boxLengthCm(box);
+    const need = boxVolumeCm3(box);
 
     let found;
     try {
@@ -136,7 +136,7 @@ async function bulkMove({ rows, dryRun, reason }, actor) {
     const candidates = found.positions ?? [];
     const slot = candidates.find((s) => isActiveSlot(s) && (box.slotId === s.id || free(s) >= need));
     if (!slot) {
-      fail(candidates.length && candidates.every((s) => !isActiveSlot(s)) ? `${label} is not available` : `${label} has no room for ${box.boxNumber} (${need} cm)`);
+      fail(candidates.length && candidates.every((s) => !isActiveSlot(s)) ? `${label} is not available` : `${label} has no room for ${box.boxNumber} (${formatVolume(need)})`);
       continue;
     }
     if (box.slotId !== slot.id) {

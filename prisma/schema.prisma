@@ -298,6 +298,9 @@ model Rack {
   // Har cell (row x column) ek hi storage location hai; iski length centimetre me store hoti hai
   // (user feet de to convert hoke). Slot.capacity isi ka copy hai, cell ke hisaab se edit ho sakta hai.
   cellLengthCm Int       @default(400)
+  // A cell is a box-shaped space: length x height x depth (cm). Slot.capacity is their product in cm3.
+  cellHeightCm Int       @default(50)
+  cellDepthCm  Int       @default(50)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   slots       Slot[]
@@ -318,8 +321,8 @@ model Slot {
   barcode     String     @unique
   row         Int
   column      Int
-  capacity    Int        @default(400) // cell ki length, centimetre me
-  used        Int        @default(0) // boxes ki total length (cm) jo is cell me hain
+  capacity    Int        @default(1000000) // cell volume = length x height x depth, in cm3
+  used        Int        @default(0) // total volume (cm3) of the boxes inside this cell
   status      SlotStatus @default(available)
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
@@ -344,6 +347,9 @@ model Box {
   destroyAfter   DateTime? @db.Date
   size           String // box_size_config.size code ("standard", "large" or one an admin added) -- Sprint 11
   lengthCm       Int? // cm this box takes in a cell, copied from box_size_config when registered (so later setting changes don't corrupt slot.used)
+  heightCm       Int? // same, height (cm)
+  depthCm        Int? // same, depth (cm)
+  volumeCm3      Int? // lengthCm x heightCm x depthCm snapshot -- what the box counts for in Slot.used
   status         BoxStatus @default(unallocated)
   onHold         Boolean   @default(false)
   holdReason     String?
@@ -455,6 +461,8 @@ model BoxSizeConfig {
   size      String   @id // code, e.g. "standard", "archive-xl"
   name      String? // shown everywhere; null on the old built-in rows -> "Standard" / "Large"
   lengthCm  Int
+  heightCm  Int      @default(50)
+  depthCm   Int      @default(50)
   active    Boolean  @default(true) // false = retired: kept for existing boxes, not offered for new ones
   sortOrder Int      @default(0)
   createdAt DateTime @default(now())
@@ -1031,6 +1039,10 @@ model RecordRequest {
   // When staff accepted it (Item 6 report): at creation for a staff request, at "Accept" for a portal request, again when Item 5 reopens a
   // returned / cancelled request. NULL = never accepted (waiting / cancelled while waiting) or an old request with no reliable date.
   acceptedAt     DateTime?
+  // Item 4 (Peticiones): the client's own order number ("Nro. Pedido", free text, not unique) and the informational "Expurgo" flag
+  // ("these records are intended for destruction" -- it destroys nothing and is NOT the Expurgo-by-file flow).
+  orderNumber    String?  @db.VarChar(50)
+  expurgo        Boolean  @default(false)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 

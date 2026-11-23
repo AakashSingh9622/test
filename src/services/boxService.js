@@ -4,13 +4,13 @@ const { Prisma } = prisma;
 const { nextSequence } = require("./counterService");
 const { appendAuditEvent } = require("./auditService");
 const { appendMovement } = require("./movementService");
-const { getBoxSizes, assertUsableSize } = require("./boxSizeService");
+const { getBoxSizes, getBoxSizeDimensions, boxDimensionColumns, assertUsableSize } = require("./boxSizeService");
 const { TX_OPTIONS, releaseBoxSlot, RELEASED_BOX_FIELDS, allocateBoxes, isActiveSlot } = require("./boxAllocationService");
 const { recomputeLineSummary, goodsInPath, findBoxByCode } = require("./orderService");
 const { recordException, refuseAndRecord } = require("./exceptionService");
 const { resolveLocation } = require("./locationService");
 const { resolveParts, hasLocationParts } = require("./locationParts");
-const { boxLengthCm } = require("../utils/dimensions");
+const { boxVolumeCm3, formatVolume } = require("../utils/dimensions");
 const { cleanValuesOrThrow } = require("./customFieldService");
 const { resolveForBox } = require("./expedienteService");
 const { serializeBox, serializeOrder, serializeSimple, dateOnly, toDate } = require("../utils/serialize");
@@ -263,7 +263,7 @@ async function createBoxesBatch(input, actor) {
     plan = [];
     for (let i = 0; i < input.quantity; i++) {
       const slot = positions.find((s) => s.capacity - s.used - (used.get(s.id) ?? 0) >= needCm);
-      if (!slot) throw httpError(400, `That shelf has room for only ${i} of the ${input.quantity} boxes (${needCm} cm each) — nothing was registered`);
+      if (!slot) throw httpError(400, `That shelf has room for only ${i} of the ${input.quantity} boxes (${formatVolume(needCm)} each) — nothing was registered`);
       used.set(slot.id, (used.get(slot.id) ?? 0) + needCm);
       plan.push(slot.id);
     }
@@ -281,7 +281,7 @@ async function createBoxesBatch(input, actor) {
       }
     }
 
-    const sizes = await getBoxSizes();
+    const sizeDims = await getBoxSizeDimensions();
     const created = [];
     for (let i = 0; i < input.quantity; i++) {
       const seq = await nextSequence("boxSeq", tx);
@@ -309,7 +309,7 @@ async function createBoxesBatch(input, actor) {
           retentionCategory: retentionCategory ?? undefined,
           customFields: Object.keys(customFields).length ? customFields : undefined,
           size: sizeCode,
-          lengthCm: sizes[sizeCode] ?? sizes.standard,
+          ...boxDimensionColumns(sizeDims, sizeCode),
           status: "unallocated",
           onHold: false,
           labelPrinted: false,
@@ -398,7 +398,7 @@ async function correctRegisteredBoxes({ boxIds, patch }, actor) {
   if (patch.containerType !== undefined) patch = { ...patch, containerType: cleanContainer(patch.containerType, "container type") ?? "" };
   if (patch.entryDate !== undefined && !patch.entryDate) throw httpError(400, "entry date can't be empty");
   assertFilingPeriod(patch.filingDateFrom, patch.filingDateTo);
-  const sizes = patch.size !== undefined ? await getBoxSizes() : null;
+  const sizeDims = patch.size !== undefined ? await getBoxSizeDimensions() : null;
 
   return prisma.$transaction(async (tx) => {
     const boxes = await tx.box.findMany({ where: { id: { in: boxIds } }, include: { _count: { select: { orderLines: true } } } });
@@ -430,7 +430,7 @@ async function correctRegisteredBoxes({ boxIds, patch }, actor) {
       if (resizes) {
         changes.push({ field: "size", from: box.size, to: patch.size });
         data.size = patch.size;
-        data.lengthCm = sizes[patch.size] ?? sizes.standard;
+        Object.assign(data, boxDimensionColumns(sizeDims, patch.size));
       }
       if (!changes.length) {
         out.push(serializeBox(box));
@@ -597,7 +597,7 @@ async function putAwayByBarcode({ boxBarcode, slotBarcode, reason }, actor) {
   if (!boxCode || !slotCode) throw httpError(400, "Scan the box and then the slot");
   const box = await findBoxByCode(boxCode);
   if (!box) await refuseAndRecord(404, "box_not_found", actor, { boxBarcode: boxCode, slotBarcode: slotCode, message: `No box has the barcode ${boxCode}` });
-  const need = box.lengthCm ?? boxLengthCm(box);
+  const need = boxVolumeCm3(box);
   const ref = { boxId: box.id, boxBarcode: boxCode, slotBarcode: slotCode };
   let slot = await prisma.slot.findUnique({ where: { barcode: slotCode } });
   if (!slot) {
@@ -605,7 +605,7 @@ async function putAwayByBarcode({ boxBarcode, slotBarcode, reason }, actor) {
     if (found.kind === "position") slot = found.positions[0];
     else if (found.kind === "shelf") {
       if (!found.suggestedSlotId) {
-        await refuseAndRecord(409, "slot_full", actor, { ...ref, message: `No position on shelf ${slotCode} has ${need} cm free for ${box.boxNumber}` });
+        await refuseAndRecord(409, "slot_full", actor, { ...ref, message: `No position on shelf ${slotCode} has ${formatVolume(need)} free for ${box.boxNumber}` });
       }
       slot = found.positions.find((p) => p.id === found.suggestedSlotId);
     } else if (found.kind === "ambiguous") {
@@ -625,7 +625,7 @@ async function putAwayByBarcode({ boxBarcode, slotBarcode, reason }, actor) {
   }
   const free = slot.capacity - slot.used;
   if (box.slotId !== slot.id && free < need) {
-    await refuseAndRecord(409, "slot_full", actor, { ...ref, message: `Slot ${slot.barcode} has ${free} cm free, ${box.boxNumber} needs ${need} cm` });
+    await refuseAndRecord(409, "slot_full", actor, { ...ref, message: `Slot ${slot.barcode} has ${formatVolume(free)} free, ${box.boxNumber} needs ${formatVolume(need)}` });
   }
   try {
     const [updated] = await allocateBoxes({ allocations: [{ boxId: box.id, slotId: slot.id }], reason }, actor);

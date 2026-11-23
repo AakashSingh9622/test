@@ -10,7 +10,7 @@ const prisma = require("../config/prisma");
 const { appendAuditEvent } = require("./auditService");
 const { appendMovement } = require("./movementService");
 const { serializeBox } = require("../utils/serialize");
-const { boxLengthCm } = require("../utils/dimensions");
+const { boxVolumeCm3 } = require("../utils/dimensions");
 const { pathFor, RACK_PATH_INCLUDE } = require("../utils/locationPath");
 const httpError = require("../utils/httpError");
 
@@ -21,7 +21,7 @@ const TX_OPTIONS = { maxWait: 10000, timeout: 60000 };
 // The length stored on the box when it was registered (admin may change the sizes later; boxes already
 // in slots must keep the length they were counted with). Old rows without one use the default.
 function unitsFor(box) {
-  return box.lengthCm ?? boxLengthCm(box);
+  return boxVolumeCm3(box);
 }
 
 // Slot ka readable locationPath snapshot banata hai (Box.locationPath me store hota hai) -- warehouse, zone, aisle aur

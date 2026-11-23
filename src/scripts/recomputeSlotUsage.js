@@ -6,7 +6,7 @@
 require("dotenv").config();
 
 const prisma = require("../config/prisma");
-const { BOX_LENGTH_CM } = require("../utils/dimensions");
+const { BOX_LENGTH_CM, DEFAULT_HEIGHT_CM, DEFAULT_DEPTH_CM } = require("../utils/dimensions");
 
 const apply = process.argv.includes("--apply");
 
@@ -20,9 +20,10 @@ async function main() {
     FROM "slot" s
     LEFT JOIN (
       SELECT "slotId",
-             SUM(COALESCE("lengthCm",
-               (SELECT c."lengthCm" FROM "box_size_config" c WHERE c."size" = "box"."size"),
-               ${BOX_LENGTH_CM.standard}::int))::int AS "total"
+             SUM(COALESCE("volumeCm3",
+               "lengthCm" * COALESCE("heightCm", ${DEFAULT_HEIGHT_CM}::int) * COALESCE("depthCm", ${DEFAULT_DEPTH_CM}::int),
+               (SELECT c."lengthCm" * c."heightCm" * c."depthCm" FROM "box_size_config" c WHERE c."size" = "box"."size"),
+               ${BOX_LENGTH_CM.standard * DEFAULT_HEIGHT_CM * DEFAULT_DEPTH_CM}::int))::int AS "total"
       FROM "box" WHERE "slotId" IS NOT NULL GROUP BY "slotId"
     ) t ON t."slotId" = s."id"
     WHERE s."used" <> COALESCE(t."total", 0)

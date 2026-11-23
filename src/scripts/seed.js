@@ -4,6 +4,7 @@
 require("dotenv").config();
 
 const prisma = require("../config/prisma");
+const { volumeCm3, DEFAULT_HEIGHT_CM, DEFAULT_DEPTH_CM } = require("../utils/dimensions");
 
 const CELL_LENGTH_CM = 400; // har cell (row x column) ki length, centimetre me (~13 ft)
 const ROWS = 4;
@@ -40,6 +41,8 @@ async function seedWarehouse(spec) {
         rows: ROWS,
         columns: COLUMNS,
         cellLengthCm: CELL_LENGTH_CM,
+        cellHeightCm: DEFAULT_HEIGHT_CM,
+        cellDepthCm: DEFAULT_DEPTH_CM,
       },
     });
 
@@ -54,7 +57,7 @@ async function seedWarehouse(spec) {
           barcode: `SL-${spec.code}-${code}-${row}-${col}`,
           row,
           column: col,
-          capacity: CELL_LENGTH_CM,
+          capacity: volumeCm3(CELL_LENGTH_CM, DEFAULT_HEIGHT_CM, DEFAULT_DEPTH_CM),
           used: 0,
           status: isBlocked ? "blocked" : "available",
         });

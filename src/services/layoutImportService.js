@@ -27,8 +27,14 @@ async function importLayout(input, actor) {
   if (rows.length > MAX_ROWS) throw httpError(400, `At most ${MAX_ROWS} rows per file — split it`);
   const columns = Number(input.columns);
   const cellLength = Number(input.cellLengthCm);
+  // Height and depth of a cell (cm): optional so older files keep working -- then 50 cm, like every cell had before.
+  const cellHeight = input.cellHeightCm === undefined ? 50 : Number(input.cellHeightCm);
+  const cellDepth = input.cellDepthCm === undefined ? 50 : Number(input.cellDepthCm);
   if (!Number.isInteger(columns) || columns < 1 || columns > 50) throw httpError(400, "columns (positions per shelf) must be a whole number from 1 to 50");
   if (!Number.isInteger(cellLength) || cellLength < 1 || cellLength > 1000) throw httpError(400, "cellLengthCm must be a whole number of cm from 1 to 1000");
+  for (const [name, v] of [["cellHeightCm", cellHeight], ["cellDepthCm", cellDepth]]) {
+    if (!Number.isInteger(v) || v < 1 || v > 1000) throw httpError(400, `${name} must be a whole number of cm from 1 to 1000`);
+  }
 
   const errors = [];
   // warehouseName -> floor -> aisle -> module -> Set(shelf)
@@ -135,7 +141,7 @@ async function importLayout(input, actor) {
         for (const [mod, shelves] of modules) {
           await createRack(
             warehouse.id,
-            { code: `M${mod}`, label: `Module ${mod}`, rows: Math.max(...shelves), columns, cellLength: cellLength, lengthUnit: "cm", zoneId: zone.id, aisleId: aisle.id },
+            { code: `M${mod}`, label: `Module ${mod}`, rows: Math.max(...shelves), columns, cellLength: cellLength, cellHeight, cellDepth, lengthUnit: "cm", zoneId: zone.id, aisleId: aisle.id },
             actor
           );
         }

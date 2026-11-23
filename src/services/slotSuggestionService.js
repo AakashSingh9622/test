@@ -2,11 +2,12 @@
 // scoring/reasons, bas ab real Postgres data (Slot/Rack/Warehouse/Box) se chalta hai.
 const prisma = require("../config/prisma");
 const { getBoxSizes } = require("./boxSizeService");
+const { formatVolume } = require("../utils/dimensions");
 const { pathFor, RACK_PATH_INCLUDE } = require("../utils/locationPath");
 
-// Total length (cm) jo ye boxes cell me gherenge.
-function unitsFor(sizes, lengths) {
-  return sizes.reduce((sum, size) => sum + (lengths[size] ?? lengths.standard ?? 40), 0);
+// Total volume (cm3) these boxes take in a cell.
+function unitsFor(sizes, volumes) {
+  return sizes.reduce((sum, size) => sum + (volumes[size] ?? volumes.standard ?? 0), 0);
 }
 
 async function suggestSlotsForBoxes({ clientId, boxSizes, warehouseId, preferSlotIds }) {
@@ -68,8 +69,8 @@ async function suggestSlotsForBoxes({ clientId, boxSizes, warehouseId, preferSlo
       score += 30;
       reasons.push("Fills slot to 100%");
     } else {
-      score += Math.max(0, 15 - Math.floor(wasted / 40)); // 40 cm = pehle ki 1 unit
-      if (slot.used > 0) reasons.push(`Partially filled (${slot.used}/${slot.capacity} cm used) — reduces fragmentation`);
+      score += Math.max(0, 15 - Math.floor(wasted / 100000)); // 100 L = what one 40 cm standard box takes (the old "1 unit")
+      if (slot.used > 0) reasons.push(`Partially filled (${formatVolume(slot.used)} of ${formatVolume(slot.capacity)} used) — reduces fragmentation`);
     }
 
     if (reasons.length === 0) reasons.push("Has enough free space");

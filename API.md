@@ -87,9 +87,10 @@ GET    /api/warehouses                              -> Warehouse[]
 POST   /api/warehouses        {code,name,address?}   -> Warehouse            (staff_admin only, 201)
 GET    /api/warehouses/:id                           -> Warehouse
 GET    /api/warehouses/:id/racks                     -> Rack[]
-POST   /api/warehouses/:id/racks  { code, label, rows, columns, cellLength, lengthUnit?: "cm" | "ft", zoneId?, aisleId? }
-       # every row x column cell is ONE storage location (slot) of length `cellLength` (feet are converted
-       # to whole centimetres and stored); no sub-slots. Response Rack includes cellLengthCm.
+POST   /api/warehouses/:id/racks  { code, label, rows, columns, cellLength, cellHeight?, cellDepth?, lengthUnit?: "cm" | "ft", zoneId?, aisleId? }
+       # every row x column cell is ONE storage location (slot) of cellLength x cellHeight x cellDepth (one unit for
+       # all three; feet are converted to whole centimetres, 1-1000 cm each; height / depth default to 50 cm when
+       # omitted). The slot's capacity is that VOLUME in cm3. Response Rack includes cellLengthCm, cellHeightCm, cellDepthCm.
                                                       -> Rack                 (staff_admin only, 201)
                                                       — also creates rows×columns Slot documents
 GET    /api/warehouses/:id/layout                    -> { zones: Zone[], aisles: Aisle[], racks: Rack[] }
@@ -104,7 +105,7 @@ GET    /api/locations/resolve?code=&needCm=&warehouseId=        -> LocationLooku
        # read from the right, so rack codes with dashes work. kind: position | shelf | rack | ambiguous | not_found
 GET    /api/racks/:id                                -> Rack (with zone / aisle objects)
 GET    /api/racks/:id/slots                          -> Slot[]
-PATCH  /api/slots/:id         { status?, capacity? (cm) }  -> Slot   (staff_admin only)
+PATCH  /api/slots/:id         { status?, capacity? (cm3) }  -> Slot   (staff_admin only)
 POST   /api/slots/suggest     SuggestSlotsInput       -> SlotSuggestion[]
 ```
 
@@ -112,13 +113,13 @@ POST   /api/slots/suggest     SuggestSlotsInput       -> SlotSuggestion[]
 interface Warehouse { id: string; code: string; name: string; address?: string;
   rackCount: number; slotCount: number; usedCapacity: number; totalCapacity: number }
 interface Rack { id: string; warehouseId: string; zoneId?: string; aisleId?: string; code: string; label: string;
-  rows: number /* shelves */; columns: number /* positions per shelf */; cellLengthCm: number;
+  rows: number /* shelves */; columns: number /* positions per shelf */; cellLengthCm: number; cellHeightCm: number; cellDepthCm: number;
   usedCapacity: number; totalCapacity: number }
 interface Zone { id: string; warehouseId: string; code: string; name?: string; rackCount?: number;
   usedCapacity?: number; totalCapacity?: number }
 interface Aisle extends Zone { zoneId?: string }
 interface Slot { id: string; rackId: string; warehouseId: string; code: string; barcode: string;
-  row: number; column: number; capacity: number /* cm */; used: number /* cm of boxes inside */;
+  row: number; column: number; capacity: number /* cm3 */; used: number /* cm3 of boxes inside */;
   status: "available" | "full" | "blocked" }
 ```
 
@@ -130,7 +131,7 @@ them directly. `Slot.used` is never set through the API either: it is the total 
 - `status: "blocked"` stops new boxes going in. Boxes already in the cell **stay there and keep counting** in `used`.
 - `status: "available"` or `"full"` both mean *unblock*; the real status is then worked out from `used` and
   `capacity` (`used >= capacity` → `"full"`). Any other value → `400`.
-- `capacity` must be a positive whole number of cm and can't go below `used` → otherwise `409`
+- `capacity` must be a positive whole number of cm3 and can't go below `used` → otherwise `409`
   (`Slot 1-2 already holds 40 cm, which is more than 30 cm -- move boxes out first`).
 - Unknown slot → `404`.
 
@@ -496,9 +497,9 @@ POST   /api/invoices/:id/sending                             -> Invoice   409 if
 POST   /api/invoices/:id/issued { sageInvoiceId, sageInvoiceNumber?, sageLink?, sageContactId?, sageBusinessId? }
 POST   /api/invoices/:id/send-failed { message }
 GET    /api/settings/sage                                    -> SageSettings                         (billing.view)
-GET    /api/settings/box-sizes   -> { items: [{ code, name, lengthCm, active, builtIn, boxCount }], updatedAt, updatedBy }
-POST   /api/settings/box-sizes   { name, lengthCm }                  -> BoxSizeType (201)  (settings.manage)
-PATCH  /api/settings/box-sizes/:code { name?, lengthCm?, active? }   -> BoxSizeType  rename / new length / retire (false)
+GET    /api/settings/box-sizes   -> { items: [{ code, name, lengthCm, heightCm, depthCm, volumeCm3, active, builtIn, boxCount }], updatedAt, updatedBy }
+POST   /api/settings/box-sizes   { name, lengthCm, heightCm?, depthCm? } -> BoxSizeType (201)  (settings.manage)
+PATCH  /api/settings/box-sizes/:code { name?, lengthCm?, heightCm?, depthCm?, active? } -> BoxSizeType  rename / new size / retire (false)
 DELETE /api/settings/box-sizes/:code                                 -> 204 (409 if a box uses it or it's standard / large)
 GET    /api/boxes/lookup?code=   current barcode or box number, any case -> Box (404 if none) -- "scan to see a box"
        Rate cards: rates.storagePerBoxMonth is { <size code>: price }.
@@ -625,7 +626,7 @@ request — loop over pages (the frontend does this for CSV exports).
 
 Extra filters: `GET /api/boxes?rackId=&row=` (boxes stored in a rack / one row of it).
 `GET /api/racks/:id/rows` -> `[{ row, boxCount, onOrderCount }]` (one SQL aggregate for the rack page).
-`PATCH /api/racks/:id { cellLength?, lengthUnit?, label?, zoneId?, aisleId? }` (layout.manage) changes the cell length of
+`PATCH /api/racks/:id { cellLength?, cellHeight?, cellDepth?, lengthUnit?, label?, zoneId?, aisleId? }` (layout.manage) changes the cell size (volume) of
 every cell in the rack and / or its label and place (`null` = out of its zone / aisle; an aisle decides the zone). A new
 zone / aisle — or renaming one — rewrites the **current** `locationPath` of the boxes on those racks in the same
 transaction; history (audit, movements, order lines) is never rewritten. `npm run locations:refresh -- --apply` does

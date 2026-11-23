@@ -8,6 +8,7 @@
 // people -- or a client and staff -- can't request the same record at the same time.
 const { randomUUID } = require("crypto");
 const prisma = require("../config/prisma");
+const { Prisma } = prisma;
 const httpError = require("../utils/httpError");
 const { parsePagination } = require("../utils/pagination");
 const { nextSequence } = require("./counterService");
@@ -19,7 +20,32 @@ const STATUSES = ["pending", "requested", "delivered", "returned", "cancelled"];
 const KINDS = ["original", "digital"];
 const MAX_RECORDS = 100;
 const MAX_NOTES = 500;
+const MAX_ORDER_NUMBER = 50;
+const MIN_REQUEST_DATE = new Date("2000-01-01T00:00:00Z"); // a request date before this is a typo
+const CLOCK_TOLERANCE_MS = 60 * 1000; // the browser's clock may run a little ahead of the server's
 const text = (v) => (v == null ? "" : String(v).trim());
+
+// --- the form's extra fields (Item 4) --------------------------------------------------------------------------------------
+// A date-time from the form (an ISO string). Not given = null; a value that is not a date is a 400.
+function dateInput(v, label) {
+  if (v === undefined || v === null || v === "") return null;
+  const d = typeof v === "string" ? new Date(v) : new Date(NaN);
+  if (Number.isNaN(d.getTime())) throw httpError(400, `${label} is not a valid date`);
+  return d;
+}
+// "Nro. Pedido": optional free text, trimmed, 50 characters at most; blank = none.
+function orderNumberOf(v) {
+  const s = text(v);
+  if (s.length > MAX_ORDER_NUMBER) throw httpError(400, `The order number is too long (${MAX_ORDER_NUMBER} characters at most)`);
+  return s || null;
+}
+// "Expurgo": strictly true or false (undefined / null = not given).
+function flagOf(v, label) {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "boolean") throw httpError(400, `${label} must be true or false`);
+  return v;
+}
+const stamp = (d) => d.toISOString().slice(0, 16).replace("T", " ") + " UTC";
 
 const ALREADY_OPEN = "One or more of these records are already in another open request — only one request at a time per record";
 const isUniqueViolation = (e) => e && e.code === "P2002";
@@ -58,6 +84,8 @@ function serializeRequest(r, withLines, extras = new Map()) {
     contactName: r.contactName,
     contactEmail: r.contactEmail,
     notes: r.notes,
+    orderNumber: r.orderNumber,
+    expurgo: r.expurgo,
     recordCount: r.recordCount,
     requestedBy: r.requestedBy,
     createdAt: r.createdAt.toISOString(),
@@ -77,8 +105,8 @@ function summaryOf(record) {
 
 // --- the request's own history, the lock, and the client's notifications (always inside the caller's transaction) ---------
 
-function addRequestEvent(db, requestId, type, actor, note) {
-  return db.recordRequestEvent.create({ data: { requestId, type, note: note ? String(note).slice(0, 500) : null, actor } });
+function addRequestEvent(db, requestId, type, actor, note, at) {
+  return db.recordRequestEvent.create({ data: { requestId, type, note: note ? String(note).slice(0, 500) : null, actor, ...(at ? { at } : {}) } });
 }
 
 // The request is closed: its records may be requested again.
@@ -98,7 +126,12 @@ async function notifyClient(db, req, what) {
   await notify({ audience: "client", clientId: req.clientId, contactEmail: req.contactEmail, kind: `record_request_${what}`, title: CLIENT_TEXT[what](req) }, db);
 }
 
-//   input { clientId, recordIds: [..], loanType?, requestChannel?, contactName?, contactEmail?, notes?, kind?, notifyContact?, via? }
+//   input { clientId, recordIds: [..], loanType?, requestChannel?, contactName?, contactEmail?, notes?, kind?, notifyContact?, via?,
+//           requestDate?, status?, issueDate?, orderNumber?, expurgo? }   (Item 4, Docbox "Crear petición")
+//   requestDate  when the client asked (default now): not in the future, not before 2000. Stored as createdAt; when it is not "now" the history says so.
+//   status       requested (default) | delivered ("P-Prestado": born Delivered, with everything requested -> delivered does);  issueDate ("Fecha Salida",
+//                default now, not before the request date, not in the future) is the delivery date and only goes with delivered.
+//   orderNumber  the client's order number (optional, <= 50);  expurgo  information only, destroys nothing.
 //   kind  original (default): the records go on loan now.  digital: a scan -- the paper never leaves its box, so no record is put on loan.
 //   notifyContact: tell the contact (portal Updates) that the warehouse made this request for them;  via: where it came from (history note).
 // A staff request: `outerTx`: run inside the caller's transaction (the purge
@@ -124,6 +157,24 @@ async function createRequest(input, actor, outerTx) {
   const contactEmail = text(input.contactEmail).toLowerCase();
   if (contactEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contactEmail)) throw httpError(400, "contactEmail is not a valid email");
 
+  // Item 4: request date, status at creation, issue date, order number, expurgo (all validated before anything is written)
+  const nowMs = Date.now();
+  const requestDateIn = dateInput(input.requestDate, "requestDate");
+  if (requestDateIn && requestDateIn.getTime() > nowMs + CLOCK_TOLERANCE_MS) throw httpError(400, "The request date can't be in the future");
+  if (requestDateIn && requestDateIn < MIN_REQUEST_DATE) throw httpError(400, "The request date is too far in the past (2000-01-01 at the earliest)");
+  const toStatus = input.status == null || input.status === "" ? "requested" : String(input.status);
+  if (!["requested", "delivered"].includes(toStatus)) throw httpError(400, "status must be requested or delivered when a request is created");
+  const lent = toStatus === "delivered";
+  const issueDateIn = dateInput(input.issueDate, "issueDate");
+  if (issueDateIn && !lent) throw httpError(400, "An issue date only goes with status delivered");
+  const bornAt = requestDateIn ?? new Date(); // a staff request is accepted the moment it is made (on its request date)
+  const issuedAt = lent ? (issueDateIn ?? new Date(Math.max(nowMs, bornAt.getTime()))) : null;
+  if (lent && issuedAt.getTime() > nowMs + CLOCK_TOLERANCE_MS) throw httpError(400, "The issue date can't be in the future");
+  if (lent && issuedAt < bornAt) throw httpError(400, "The issue date can't be before the request date");
+  const orderNumber = orderNumberOf(input.orderNumber);
+  const expurgo = flagOf(input.expurgo, "expurgo");
+  const backdated = !!requestDateIn && nowMs - requestDateIn.getTime() > CLOCK_TOLERANCE_MS;
+
   const records = await db.archiveRecord.findMany({ where: { id: { in: ids } } });
   if (records.length !== ids.length) throw httpError(404, "One or more records were not found");
   const other = records.find((r) => r.clientId !== clientId);
@@ -138,7 +189,6 @@ async function createRequest(input, actor, outerTx) {
 
   const requestNumber = `REQ-${String(await nextSequence("recordRequestSeq", db)).padStart(6, "0")}`;
   const sorted = records.slice().sort((a, b) => a.internalCode - b.internalCode);
-  const bornAt = new Date(); // a staff request is accepted the moment it is made
   const work = async (tx) => {
     if (digital) {
       // a digital copy never moves the paper: the physical status is NOT touched, the record is only locked in this request
@@ -160,21 +210,37 @@ async function createRequest(input, actor, outerTx) {
         clientId,
         clientName: sorted[0].clientName,
         kind,
+        status: lent ? "delivered" : "requested",
         loanType,
         requestChannel,
         contactName: text(input.contactName) || null,
         contactEmail: contactEmail || null,
         notes: notes || null,
+        orderNumber,
+        ...(expurgo === undefined ? {} : { expurgo }),
         recordCount: sorted.length,
         requestedBy: actor,
+        ...(lent ? { deliveredAt: issuedAt, deliveredBy: actor } : {}),
         createdAt: bornAt,
         acceptedAt: bornAt,
-        lines: { create: sorted.map((r) => ({ recordId: r.id, internalCode: r.internalCode, boxNumber: r.boxNumber, summary: summaryOf(r), lockKey: r.id })) },
+        // a digital copy that is already delivered is finished: nothing to give back, so no lock
+        lines: { create: sorted.map((r) => ({ recordId: r.id, internalCode: r.internalCode, boxNumber: r.boxNumber, summary: summaryOf(r), lockKey: digital && lent ? null : r.id })) },
       },
       include: { lines: true },
     });
     const via = text(input.via) ? ` (${text(input.via)})` : "";
-    await addRequestEvent(tx, created.id, "created", actor, digital ? `Created by staff${via} — digital copy, nothing is lent` : `Created by staff${via} — the records are on loan`);
+    // the history entry carries the REAL time; a request date that is not "now" is written into it (and who did it is the entry's actor)
+    const t0 = new Date();
+    const dateNote = backdated ? ` — request date set to ${stamp(requestDateIn)}` : "";
+    await addRequestEvent(tx, created.id, "created", actor, (digital ? `Created by staff${via} — digital copy, nothing is lent` : `Created by staff${via} — the records are on loan`) + dateNote, t0);
+    if (lent) {
+      // born Delivered: the same entries as requested -> delivered (see changeStatus)
+      await tx.archiveRecordEvent.createMany({
+        data: sorted.map((r) => ({ recordId: r.id, type: digital ? "requested" : "status_changed", note: digital ? `${requestNumber}: digital copy delivered` : `${requestNumber} delivered to the client`, actor })),
+      });
+      await addRequestEvent(tx, created.id, "delivered", actor, `Lent at creation — issue date ${stamp(issuedAt)}`, new Date(t0.getTime() + 1));
+      await notifyClient(tx, created, "delivered");
+    }
     if (input.notifyContact && created.contactEmail) {
       await notify({ audience: "client", clientId, contactEmail: created.contactEmail, kind: "record_request_created", title: `The warehouse created record request ${requestNumber} for you — ${sorted.length} record${sorted.length === 1 ? "" : "s"}, ${digital ? "digital copy" : "original"}` }, tx);
     }
@@ -434,6 +500,11 @@ async function editRequest(id, input, actor) {
     if (notes.length > MAX_NOTES) throw httpError(400, `Notes are too long (${MAX_NOTES} characters at most)`);
     setField("notes", "notes", notes || null);
   }
+  if (input.orderNumber !== undefined) setField("orderNumber", "order number", orderNumberOf(input.orderNumber));
+  if (input.expurgo !== undefined) {
+    const flag = flagOf(input.expurgo, "expurgo");
+    if (flag !== undefined) setField("expurgo", "expurgo", flag);
+  }
   const portalLocked = "The contact of a request made in the portal can't be changed";
   if (input.contactName !== undefined) {
     const name = text(input.contactName) || null;
@@ -540,8 +611,25 @@ async function editRequest(id, input, actor) {
   return getRequest(id);
 }
 
-// { items, total }, newest first. Filters: clientId, status (one or several), kind, source, q (request number, client name, or an internal code on it).
+// { items, total }, newest request date first. Filters (all optional, all server-side; Docbox "Peticiones"):
+//   clientId, status (one or several), kind, source, q (request number, client name, or an internal code on it),
+//   dateType (request | issue | closed; default request) with from / to = inclusive whole days (YYYY-MM-DD, UTC; a request with no such date is left out),
+//   requestChannel, loanType, requester (part of the contact's email or name), notes (part), orderNumber (part), expurgo (true | false),
+//   code (an internal code on the request),
+//   expedienteId / site / warehouse: the request has at least ONE record that matches ALL of the record-level filters given (its file, and
+//   the site / warehouse of its box -- a box with no location never matches a site or warehouse); a request is listed once.
+// Each item also carries files (the codes of the files its records belong to) and codes (its first internal codes, ascending, at most 10;
+// recordCount says how many there are in all).
+const DATE_FIELD = { request: "createdAt", issue: "deliveredAt", closed: "closedAt" };
+function dayOf(v, label) {
+  const s = text(v);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(new Date(s + "T00:00:00Z").getTime())) throw httpError(400, `${label} must be a date (YYYY-MM-DD)`);
+  return new Date(s + "T00:00:00Z");
+}
+const one = (v) => (Array.isArray(v) ? v[v.length - 1] : v);
+
 async function listRequests(params = {}) {
+  const and = [];
   const where = {};
   if (params.clientId) where.clientId = String(params.clientId);
   if (params.status) {
@@ -561,14 +649,98 @@ async function listRequests(params = {}) {
   if (q) {
     const or = [{ requestNumber: { contains: q, mode: "insensitive" } }, { clientName: { contains: q, mode: "insensitive" } }];
     if (/^\d{1,9}$/.test(q)) or.push({ lines: { some: { internalCode: Number(q) } } });
-    where.OR = or;
+    and.push({ OR: or });
   }
+
+  // dates: which date, and the inclusive days
+  const dateType = text(one(params.dateType)) || "request";
+  if (!DATE_FIELD[dateType]) throw httpError(400, `dateType must be one of ${Object.keys(DATE_FIELD).join(", ")}`);
+  const range = {};
+  if (text(one(params.from))) range.gte = dayOf(one(params.from), "from");
+  if (text(one(params.to))) range.lt = new Date(dayOf(one(params.to), "to").getTime() + 24 * 60 * 60 * 1000);
+  if (Object.keys(range).length) where[DATE_FIELD[dateType]] = range;
+
+  const channel = text(one(params.requestChannel));
+  if (channel) {
+    if (!CHANNELS.includes(channel)) throw httpError(400, `requestChannel must be one of ${CHANNELS.join(", ")}`);
+    where.requestChannel = channel;
+  }
+  const loan = text(one(params.loanType));
+  if (loan) {
+    if (!LOAN_TYPES.includes(loan)) throw httpError(400, `loanType must be one of ${LOAN_TYPES.join(", ")}`);
+    where.loanType = loan;
+  }
+  const requester = text(one(params.requester));
+  if (requester) and.push({ OR: [{ contactEmail: { contains: requester, mode: "insensitive" } }, { contactName: { contains: requester, mode: "insensitive" } }] });
+  const notes = text(one(params.notes));
+  if (notes) where.notes = { contains: notes, mode: "insensitive" };
+  const orderNo = text(one(params.orderNumber));
+  if (orderNo) where.orderNumber = { contains: orderNo, mode: "insensitive" };
+  const flag = text(one(params.expurgo));
+  if (flag) {
+    if (flag !== "true" && flag !== "false") throw httpError(400, "expurgo must be true or false");
+    where.expurgo = flag === "true";
+  }
+  const code = text(one(params.code));
+  if (code) {
+    if (!/^\d{1,9}$/.test(code)) throw httpError(400, "code must be an internal code (digits)");
+    and.push({ lines: { some: { internalCode: Number(code) } } });
+  }
+
+  // the record-level filters: one query finds the requests that have a record matching all of them
+  const fileId = text(one(params.expedienteId));
+  const site = text(one(params.site));
+  const warehouse = text(one(params.warehouse));
+  if (fileId || site || warehouse) {
+    const conds = [];
+    if (fileId) conds.push(Prisma.sql`r."expedienteId" = ${fileId}`);
+    if (site) conds.push(Prisma.sql`lower(w."site") = lower(${site})`);
+    if (warehouse) conds.push(Prisma.sql`(lower(w."code") = lower(${warehouse}) OR lower(w."name") = lower(${warehouse}))`);
+    const hit = await prisma.$queryRaw(Prisma.sql`
+      SELECT DISTINCT l."requestId" AS id
+      FROM "record_request_line" l
+      JOIN "archive_record" r ON r."id" = l."recordId"
+      LEFT JOIN "box" b ON b."id" = r."boxId"
+      LEFT JOIN "slot" s ON s."id" = b."slotId"
+      LEFT JOIN "warehouse" w ON w."id" = s."warehouseId"
+      WHERE ${Prisma.join(conds, " AND ")}`);
+    and.push({ id: { in: hit.map((h) => h.id) } });
+  }
+  if (and.length) where.AND = and;
+
   const { skip, take } = parsePagination(params, 25);
   const [rows, total] = await Promise.all([
     prisma.recordRequest.findMany({ where, orderBy: [{ createdAt: "desc" }, { id: "asc" }], skip, take }),
     prisma.recordRequest.count({ where }),
   ]);
-  return { items: rows.map((r) => serializeRequest(r, false)), total };
+  // the files of the requests on this page
+  const filesOf = new Map();
+  const codesOf = new Map();
+  if (rows.length) {
+    const fr = await prisma.$queryRaw(Prisma.sql`
+      SELECT l."requestId" AS id, r."expedienteCode" AS code
+      FROM "record_request_line" l JOIN "archive_record" r ON r."id" = l."recordId"
+      WHERE l."requestId" IN (${Prisma.join(rows.map((r) => r.id))}) AND r."expedienteCode" IS NOT NULL AND r."expedienteCode" <> ''
+      GROUP BY l."requestId", r."expedienteCode"`);
+    for (const f of fr) filesOf.set(f.id, [...(filesOf.get(f.id) || []), f.code]);
+    const cr = await prisma.$queryRaw(Prisma.sql`
+      SELECT "requestId" AS id, "internalCode" AS code FROM "record_request_line"
+      WHERE "requestId" IN (${Prisma.join(rows.map((r) => r.id))}) ORDER BY "internalCode" ASC`);
+    for (const c of cr) {
+      const list = codesOf.get(c.id) || [];
+      if (list.length < 10) list.push(Number(c.code));
+      codesOf.set(c.id, list);
+    }
+  }
+  return {
+    items: rows.map((r) => {
+      const item = serializeRequest(r, false);
+      const files = (filesOf.get(r.id) || []).sort();
+      const codes = codesOf.get(r.id) || [];
+      return { ...item, ...(files.length ? { files } : {}), ...(codes.length ? { codes } : {}) };
+    }),
+    total,
+  };
 }
 
 module.exports = {

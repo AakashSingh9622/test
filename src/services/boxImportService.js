@@ -12,6 +12,7 @@ const { TX_OPTIONS, allocateBoxes, isActiveSlot } = require("./boxAllocationServ
 const { resolveParts, hasLocationParts } = require("./locationParts");
 const { serializeBox, toDate } = require("../utils/serialize");
 const httpError = require("../utils/httpError");
+const { formatVolume } = require("../utils/dimensions");
 
 const MAX_ROWS = 500;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -93,15 +94,15 @@ async function validateRows(rows, clientId, expedienteId) {
     // Optional location columns (Warehouse, Floor, Aisle, Module, Shelf): when present the box is put on that shelf.
     let slotId;
     if (hasLocationParts(r) && size) {
-      const placed = await resolveParts({ site: r.site, warehouse: r.warehouse, floor: r.floor, aisle: r.aisle, module: r.module, shelf: r.shelf }, { needCm: size.lengthCm });
+      const placed = await resolveParts({ site: r.site, warehouse: r.warehouse, floor: r.floor, aisle: r.aisle, module: r.module, shelf: r.shelf }, { needCm: size.volumeCm3 });
       if (placed.error) problems.push(placed.error);
       else {
         // The first position of the shelf with room, counting the boxes the earlier rows already claimed.
-        const slot = (placed.found.positions ?? []).find((s) => isActiveSlot(s) && s.capacity - s.used - (used.get(s.id) ?? 0) >= size.lengthCm);
-        if (!slot) problems.push(`shelf ${text(r.shelf)} of module ${text(r.module)} has no room for a ${size.name} box (${size.lengthCm} cm)`);
+        const slot = (placed.found.positions ?? []).find((s) => isActiveSlot(s) && s.capacity - s.used - (used.get(s.id) ?? 0) >= size.volumeCm3);
+        if (!slot) problems.push(`shelf ${text(r.shelf)} of module ${text(r.module)} has no room for a ${size.name} box (${formatVolume(size.volumeCm3)})`);
         else {
           slotId = slot.id;
-          used.set(slot.id, (used.get(slot.id) ?? 0) + size.lengthCm);
+          used.set(slot.id, (used.get(slot.id) ?? 0) + size.volumeCm3);
         }
       }
     }
@@ -127,6 +128,9 @@ async function validateRows(rows, clientId, expedienteId) {
       customFields: Object.keys(custom.clean).length ? custom.clean : undefined,
       size: size.code,
       lengthCm: size.lengthCm,
+      heightCm: size.heightCm,
+      depthCm: size.depthCm,
+      volumeCm3: size.volumeCm3,
     });
   }
   return { errors, clean };
@@ -186,6 +190,9 @@ async function importBoxes(input, actor) {
           customFields: row.customFields,
           size: row.size,
           lengthCm: row.lengthCm,
+          heightCm: row.heightCm,
+          depthCm: row.depthCm,
+          volumeCm3: row.volumeCm3,
           status: "unallocated",
           onHold: false,
           labelPrinted: false,

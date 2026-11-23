@@ -1,15 +1,15 @@
 // Box sizes (Sprint 11): the two built-in ones (standard, large) plus any an admin adds -- each a name and the length
-// (cm) one box takes along a rack cell. Stored in box_size_config, keyed by a stable code made from the first name, so
+// (cm), height and depth one box takes in a rack cell (a box counts for length x height x depth cm3 of the cell). Stored in box_size_config, keyed by a stable code made from the first name, so
 // renaming a size never touches the boxes that use it. A size in use can only be retired (no new boxes), not deleted.
 // Lengths are read on every registration / slot suggestion, so they are cached briefly and the cache is cleared on change.
 const prisma = require("../config/prisma");
-const { BOX_LENGTH_CM } = require("../utils/dimensions");
+const { BOX_LENGTH_CM, DEFAULT_HEIGHT_CM, DEFAULT_DEPTH_CM, volumeCm3 } = require("../utils/dimensions");
 const httpError = require("../utils/httpError");
 const { appendAdminEvent } = require("./adminAuditService");
 
 const BUILT_IN = { standard: "Standard", large: "Large" }; // can be renamed / resized / retired, never deleted
 const MIN_CM = 1;
-const MAX_CM = 1000;
+const MAX_CM = 1000; // per dimension; 1000^3 still fits a 32-bit Int
 const CACHE_MS = 30_000;
 
 let cache = null; // { at, rows }
@@ -26,19 +26,40 @@ async function allRows() {
     });
     rows = await prisma.boxSizeConfig.findMany();
   }
-  rows.sort((a, b) => a.sortOrder - b.sortOrder || a.lengthCm - b.lengthCm || a.size.localeCompare(b.size));
+  rows.sort((a, b) => a.sortOrder - b.sortOrder || volumeOf(a) - volumeOf(b) || a.size.localeCompare(b.size));
   cache = { at: Date.now(), rows };
   return rows;
 }
 
+const volumeOf = (row) => volumeCm3(row.lengthCm, row.heightCm ?? DEFAULT_HEIGHT_CM, row.depthCm ?? DEFAULT_DEPTH_CM);
+
 const nameOf = (row) => row.name || BUILT_IN[row.size] || row.size;
 
-// { code: lengthCm } for every size (retired too -- old boxes still need their length). Callers fall back to the
-// standard length for a code they don't know.
+// { code: volume in cm3 } for every size (retired too -- old boxes still need theirs). This is what a box takes in a
+// cell. Callers fall back to the standard volume for a code they don't know.
 async function getBoxSizes() {
-  const value = { ...BOX_LENGTH_CM };
-  for (const r of await allRows()) value[r.size] = r.lengthCm;
+  const value = {};
+  for (const [code, length] of Object.entries(BOX_LENGTH_CM)) value[code] = volumeCm3(length);
+  for (const r of await allRows()) value[r.size] = volumeOf(r);
   return value;
+}
+
+// { code: { lengthCm, heightCm, depthCm, volumeCm3 } } -- the dimensions a new box copies onto itself when registered.
+async function getBoxSizeDimensions() {
+  const value = {};
+  for (const [code, length] of Object.entries(BOX_LENGTH_CM)) {
+    value[code] = { lengthCm: length, heightCm: DEFAULT_HEIGHT_CM, depthCm: DEFAULT_DEPTH_CM, volumeCm3: volumeCm3(length) };
+  }
+  for (const r of await allRows()) {
+    value[r.size] = { lengthCm: r.lengthCm, heightCm: r.heightCm, depthCm: r.depthCm, volumeCm3: volumeOf(r) };
+  }
+  return value;
+}
+
+// The columns to store on a box row for its size code (length, height, depth and the volume it counts for).
+function boxDimensionColumns(dims, sizeCode) {
+  const d = dims[sizeCode] ?? dims.standard;
+  return { lengthCm: d.lengthCm, heightCm: d.heightCm, depthCm: d.depthCm, volumeCm3: d.volumeCm3 };
 }
 
 // { code: name } -- for CSV export, the portal, charge descriptions.
@@ -58,6 +79,9 @@ function serialize(row, counts) {
     code: row.size,
     name: nameOf(row),
     lengthCm: row.lengthCm,
+    heightCm: row.heightCm,
+    depthCm: row.depthCm,
+    volumeCm3: volumeOf(row),
     active: row.active,
     builtIn: row.size in BUILT_IN,
     boxCount: counts?.get(row.size) ?? 0,
@@ -108,20 +132,22 @@ async function codeFor(name) {
   return code;
 }
 
-async function createBoxSize({ name, lengthCm }, actor) {
+async function createBoxSize({ name, lengthCm, heightCm, depthCm }, actor) {
   const clean = cleanName(name);
   const length = cleanLength(lengthCm);
+  const height = heightCm === undefined ? DEFAULT_HEIGHT_CM : cleanLength(heightCm, "height");
+  const depth = depthCm === undefined ? DEFAULT_DEPTH_CM : cleanLength(depthCm, "depth");
   await assertNameFree(clean);
   const code = await codeFor(clean);
   const sortOrder = Math.max(0, ...(await allRows()).map((r) => r.sortOrder)) + 1;
   const row = await prisma.$transaction(async (tx) => {
     const created = await tx.boxSizeConfig.create({
-      data: { size: code, name: clean, lengthCm: length, sortOrder, updatedBy: actor },
+      data: { size: code, name: clean, lengthCm: length, heightCm: height, depthCm: depth, sortOrder, updatedBy: actor },
     });
     await appendAdminEvent(
       "box_size_created",
       actor,
-      { entityType: "settings", entityId: `box-size:${code}`, summary: `Added box size ${clean} (${length} cm)` },
+      { entityType: "settings", entityId: `box-size:${code}`, summary: `Added box size ${clean} (${length} × ${height} × ${depth} cm)` },
       tx
     );
     return created;
@@ -131,7 +157,7 @@ async function createBoxSize({ name, lengthCm }, actor) {
 }
 
 // Rename, change the length (boxes already registered keep theirs, so slot space stays right), retire / bring back.
-async function updateBoxSize(code, { name, lengthCm, active }, actor) {
+async function updateBoxSize(code, { name, lengthCm, heightCm, depthCm, active }, actor) {
   const row = (await allRows()).find((r) => r.size === code);
   if (!row) throw httpError(404, "Box size not found");
   const data = {};
@@ -149,6 +175,14 @@ async function updateBoxSize(code, { name, lengthCm, active }, actor) {
     if (length !== row.lengthCm) {
       data.lengthCm = length;
       changes.push({ field: "length (cm)", from: row.lengthCm, to: length });
+    }
+  }
+  for (const [field, value, label] of [["heightCm", heightCm, "height"], ["depthCm", depthCm, "depth"]]) {
+    if (value === undefined) continue;
+    const n = cleanLength(value, label);
+    if (n !== row[field]) {
+      data[field] = n;
+      changes.push({ field: `${label} (cm)`, from: row[field], to: n });
     }
   }
   if (active !== undefined && Boolean(active) !== row.active) {
@@ -217,6 +251,8 @@ async function updateBoxSizes(input, actor) {
 
 module.exports = {
   getBoxSizes,
+  getBoxSizeDimensions,
+  boxDimensionColumns,
   getBoxSizeNames,
   listBoxSizes,
   getBoxSizeSettings: listBoxSizes,
