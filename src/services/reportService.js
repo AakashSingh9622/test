@@ -7,6 +7,7 @@ const { getBoxSizeNames } = require("./boxSizeService");
 const { toDate, dateOnly } = require("../utils/serialize");
 const { parsePagination } = require("../utils/pagination");
 const { locationText } = require("../utils/locationPath");
+const { LOAN_TYPES, CHANNELS } = require("./recordRequestService");
 
 function period(params) {
   const where = {};
@@ -243,4 +244,78 @@ async function interfilingReport(params) {
   return { items, total };
 }
 
-module.exports = { requestersReport, loansReport, archiveReport, interfilingReport, interfilingWhere };
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Docbox "Listado peticiones" for RECORD requests (PDF pages 32-34). Four lists; a request is in AT MOST ONE of them, by its current
+// (possibly corrected) status:
+//   requested  status pending -- genuinely waiting for staff to accept it            date = createdAt
+//   lent       ORIGINAL requests accepted (requested) or delivered: the records are on loan. Only the records still out are counted.
+//              date = deliveredAt when delivered, acceptedAt when accepted (NULL acceptedAt = no reliable date: left out once a date is used)
+//   cancelled  status cancelled                                                      date = closedAt
+//   returned   status returned                                                       date = closedAt
+// (A DIGITAL request that is already accepted or delivered lends nothing and waits for nothing, so it is in none of them.)
+// Rows are per client (or per client and the RECORD's own file with byExpediente); a request with records in two files counts once in each.
+// ---------------------------------------------------------------------------------------------------------------------------------
+const RECORD_REQUEST_LISTS = ["lent", "cancelled", "requested", "returned"];
+
+async function recordRequestsReport(params) {
+  const list = String(params.list || "");
+  if (!RECORD_REQUEST_LISTS.includes(list)) throw httpError(400, `list must be one of ${RECORD_REQUEST_LISTS.join(", ")}`);
+  const byExpediente = params.byExpediente === "true" || params.byExpediente === true;
+  const at = period(params);
+  if (params.loanType && !LOAN_TYPES.includes(String(params.loanType))) throw httpError(400, `loanType must be one of ${LOAN_TYPES.join(", ")}`);
+  if (params.requestChannel && !CHANNELS.includes(String(params.requestChannel))) throw httpError(400, `requestChannel must be one of ${CHANNELS.join(", ")}`);
+
+  let dateCol = Prisma.sql`q."createdAt"`;
+  const conds = [];
+  if (list === "requested") conds.push(Prisma.sql`q."status" = 'pending'`);
+  else if (list === "cancelled") { conds.push(Prisma.sql`q."status" = 'cancelled'`); dateCol = Prisma.sql`q."closedAt"`; }
+  else if (list === "returned") { conds.push(Prisma.sql`q."status" = 'returned'`); dateCol = Prisma.sql`q."closedAt"`; }
+  else {
+    conds.push(Prisma.sql`q."kind" = 'original' AND q."status" IN ('requested', 'delivered')`);
+    conds.push(Prisma.sql`l."returnedAt" IS NULL`); // only what is still out
+    dateCol = Prisma.sql`(CASE WHEN q."status" = 'delivered' THEN q."deliveredAt" ELSE q."acceptedAt" END)`;
+  }
+  if (at?.gte) conds.push(Prisma.sql`${dateCol} >= ${at.gte}`);
+  if (at?.lt) conds.push(Prisma.sql`${dateCol} < ${at.lt}`);
+  if (params.clientId) conds.push(Prisma.sql`q."clientId" = ${String(params.clientId)}`);
+  if (params.expedienteId) conds.push(Prisma.sql`r."expedienteId" = ${String(params.expedienteId)}`);
+  if (params.loanType) conds.push(Prisma.sql`q."loanType" = ${String(params.loanType)}`);
+  if (params.requestChannel) conds.push(Prisma.sql`q."requestChannel" = ${String(params.requestChannel)}`);
+  if (params.requester) {
+    const like = `%${String(params.requester).trim().slice(0, 100).replace(/[\\%_]/g, (ch) => "\\" + ch)}%`;
+    conds.push(Prisma.sql`(q."contactEmail" ILIKE ${like} OR q."contactName" ILIKE ${like})`);
+  }
+  const exp = byExpediente ? Prisma.sql`COALESCE(r."expedienteCode", '')` : Prisma.sql`''`;
+  const groupExp = byExpediente ? Prisma.sql`, ${exp}` : Prisma.empty;
+  const req = (extra) => Prisma.sql`COUNT(DISTINCT q."id") FILTER (WHERE ${extra})::int`;
+  const rec = (extra) => Prisma.sql`COUNT(*) FILTER (WHERE ${extra})::int`;
+  const rows = await prisma.$queryRaw`
+    SELECT q."clientId" AS "clientId", q."clientName" AS "clientName", ${exp} AS "exp",
+           COUNT(DISTINCT q."id")::int AS "requests", COUNT(*)::int AS "records",
+           ${req(Prisma.sql`q."kind" = 'original'`)} AS "originalRequests", ${rec(Prisma.sql`q."kind" = 'original'`)} AS "originalRecords",
+           ${req(Prisma.sql`q."kind" = 'digital'`)} AS "digitalRequests", ${rec(Prisma.sql`q."kind" = 'digital'`)} AS "digitalRecords",
+           ${req(Prisma.sql`q."loanType" = 'normal'`)} AS "normalRequests", ${rec(Prisma.sql`q."loanType" = 'normal'`)} AS "normalRecords",
+           ${req(Prisma.sql`q."loanType" = 'urgent'`)} AS "urgentRequests", ${rec(Prisma.sql`q."loanType" = 'urgent'`)} AS "urgentRecords",
+           ${req(Prisma.sql`q."loanType" = 'superior'`)} AS "superiorRequests", ${rec(Prisma.sql`q."loanType" = 'superior'`)} AS "superiorRecords",
+           ${req(Prisma.sql`q."loanType" = 'fax'`)} AS "faxRequests", ${rec(Prisma.sql`q."loanType" = 'fax'`)} AS "faxRecords"
+    FROM "record_request" q
+    JOIN "record_request_line" l ON l."requestId" = q."id"
+    LEFT JOIN "archive_record" r ON r."id" = l."recordId"
+    WHERE ${Prisma.join(conds, " AND ")}
+    GROUP BY q."clientId", q."clientName"${groupExp}
+    ORDER BY q."clientName"${byExpediente ? Prisma.sql`, ${exp}` : Prisma.empty}`;
+  return {
+    list,
+    rows: rows.map(({ exp: code, ...row }) => (byExpediente && code ? { ...row, expedienteCode: code } : row)),
+  };
+}
+
+// Who asked ("Solicitado por") on RECORD requests, for the report's picker.
+async function recordRequestersReport(params) {
+  const where = { contactEmail: { not: null } };
+  if (params.clientId) where.clientId = String(params.clientId);
+  const rows = await prisma.recordRequest.groupBy({ by: ["contactEmail", "contactName"], where, _count: { _all: true }, orderBy: { contactEmail: "asc" }, take: 200 });
+  return rows.map((r) => ({ email: r.contactEmail, name: r.contactName ?? undefined, requests: r._count._all }));
+}
+
+module.exports = { requestersReport, loansReport, archiveReport, interfilingReport, interfilingWhere, recordRequestsReport, recordRequestersReport };

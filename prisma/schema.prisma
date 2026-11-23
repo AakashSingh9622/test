@@ -1028,6 +1028,9 @@ model RecordRequest {
   deliveredBy    Json?
   closedAt       DateTime? // cancelled or returned
   closedBy       Json?
+  // When staff accepted it (Item 6 report): at creation for a staff request, at "Accept" for a portal request, again when Item 5 reopens a
+  // returned / cancelled request. NULL = never accepted (waiting / cancelled while waiting) or an old request with no reliable date.
+  acceptedAt     DateTime?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 

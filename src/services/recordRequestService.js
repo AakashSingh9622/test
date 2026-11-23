@@ -138,6 +138,7 @@ async function createRequest(input, actor, outerTx) {
 
   const requestNumber = `REQ-${String(await nextSequence("recordRequestSeq", db)).padStart(6, "0")}`;
   const sorted = records.slice().sort((a, b) => a.internalCode - b.internalCode);
+  const bornAt = new Date(); // a staff request is accepted the moment it is made
   const work = async (tx) => {
     if (digital) {
       // a digital copy never moves the paper: the physical status is NOT touched, the record is only locked in this request
@@ -166,6 +167,8 @@ async function createRequest(input, actor, outerTx) {
         notes: notes || null,
         recordCount: sorted.length,
         requestedBy: actor,
+        createdAt: bornAt,
+        acceptedAt: bornAt,
         lines: { create: sorted.map((r) => ({ recordId: r.id, internalCode: r.internalCode, boxNumber: r.boxNumber, summary: summaryOf(r), lockKey: r.id })) },
       },
       include: { lines: true },
@@ -230,6 +233,7 @@ async function changeStatus(id, input, actor) {
       const data = { status: to };
       if (to === "delivered") Object.assign(data, { deliveredAt: now, deliveredBy: actor });
       else if (to !== "requested") Object.assign(data, { closedAt: now, closedBy: actor });
+      if (req.status === "pending" && to === "requested") data.acceptedAt = now; // staff accept a portal request
       // Only succeeds if the request is still in the status we read (a client cancelling and staff accepting can't both win).
       const moved = await tx.recordRequest.updateMany({ where: { id, status: req.status }, data });
       if (moved.count !== 1) throw httpError(409, `${req.requestNumber} was changed by someone else — reload`);
@@ -320,6 +324,8 @@ async function correctRequest(id, input, actor) {
     if (toStatus === "delivered") Object.assign(data, { deliveredAt: req.deliveredAt ?? now, deliveredBy: req.deliveredAt ? req.deliveredBy : actor, closedAt: null, closedBy: null });
     else if (toStatus === "requested") Object.assign(data, { deliveredAt: null, deliveredBy: null, closedAt: null, closedBy: null });
     else Object.assign(data, { closedAt: now, closedBy: actor });
+    // Taken out of returned / cancelled and put back to accepted or delivered (REOPEN): the loan starts again now. requested <-> delivered keeps it.
+    if (["returned", "cancelled"].includes(req.status) && ["requested", "delivered"].includes(toStatus)) data.acceptedAt = now;
     const moved = await tx.recordRequest.updateMany({ where: { id, status: req.status, kind: req.kind }, data });
     if (moved.count !== 1) throw httpError(409, `${num} was changed by someone else — reload`);
 
