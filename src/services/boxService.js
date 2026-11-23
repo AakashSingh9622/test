@@ -168,8 +168,12 @@ async function searchBoxes(params) {
   return { items: items.map(serializeBox), total };
 }
 
+// The box page also gets the module (rack) and warehouse its position belongs to, to draw where it stands.
 async function getBoxById(id) {
-  return serializeBox(await prisma.box.findUnique({ where: { id } }));
+  const box = await prisma.box.findUnique({ where: { id }, include: { slot: { select: { rackId: true, warehouseId: true } } } });
+  if (!box) return serializeBox(box);
+  const { slot, ...row } = box;
+  return { ...serializeBox(row), ...(slot && { rackId: slot.rackId, slotWarehouseId: slot.warehouseId }) };
 }
 
 // Scan to see a box (Sprint 11): its current barcode or its box number, any case. (The box number is also the code of

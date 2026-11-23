@@ -37,6 +37,40 @@ function withCapacity(row, capacity) {
   return { ...serializeSimple(row), ...capacity };
 }
 
+// --- Shelf sizes ------------------------------------------------------------------------------------------------------
+// A module's shelves are normally all the same size (rack.cellLengthCm / cellHeightCm / cellDepthCm). When "the size of
+// each shelf varies", rack.shelfSizes holds one { lengthCm, heightCm, depthCm } per shelf (index = row - 1, row 1 = the
+// bottom shelf) and every position of a shelf gets THAT shelf's volume as its capacity.
+
+const cellSizeOf = (rack) => ({ lengthCm: rack.cellLengthCm, heightCm: rack.cellHeightCm, depthCm: rack.cellDepthCm });
+
+// One entry per shelf, bottom first -- always filled in, also when every shelf is the same size.
+function shelvesOf(rack) {
+  const list = Array.isArray(rack.shelfSizes) ? rack.shelfSizes : null;
+  return Array.from({ length: rack.rows }, (_, i) => ({ row: i + 1, ...(list?.[i] ?? cellSizeOf(rack)) }));
+}
+
+const shelfVolume = (s) => volumeCm3(s.lengthCm, s.heightCm, s.depthCm);
+
+// [{ length, height, depth }] typed by the user (all in `unit`) -> whole cm per shelf; 400 on anything wrong.
+function cleanShelves(shelves, unit) {
+  if (!Array.isArray(shelves) || shelves.length < 1) throw httpError(400, "shelves must list the size of every shelf");
+  if (shelves.length > 100) throw httpError(400, "A module has at most 100 shelves");
+  return shelves.map((s, i) => ({
+    lengthCm: toCentimetres(s?.length, unit, `Shelf ${i + 1} length`),
+    heightCm: toCentimetres(s?.height, unit, `Shelf ${i + 1} height`),
+    depthCm: toCentimetres(s?.depth, unit, `Shelf ${i + 1} depth`),
+  }));
+}
+
+const sizeText = (s) => `${s.lengthCm} × ${s.depthCm} × ${s.heightCm} cm`;
+
+// What the API returns for a rack: the row plus capacity totals, whether its shelves differ, and every shelf's size.
+function serializeRack(row, capacity) {
+  const { shelfSizes, ...rest } = row;
+  return { ...withCapacity(rest, capacity), variesByShelf: Array.isArray(shelfSizes), shelves: shelvesOf(row) };
+}
+
 async function listWarehouses() {
   const warehouses = await prisma.warehouse.findMany({ orderBy: { code: "asc" } });
   return Promise.all(warehouses.map(async (w) => withCapacity(w, await capacityForWarehouse(w.id))));
@@ -92,7 +126,7 @@ async function getWarehouseById(id) {
 // Har cell (row x column) khud ek storage location (slot) hai, uske andar koi sub-slot nahi. User har
 // cell ki length cm ya feet me deta hai (cellLength + lengthUnit); DB me whole centimetres store hote hain
 // aur wahi us cell ki capacity hai. Seed script (src/scripts/seed.js) jaisa hi slot code/barcode convention.
-async function createRack(warehouseId, { code, label, rows, columns, cellLength, cellHeight, cellDepth, lengthUnit, zoneId, aisleId }, actor) {
+async function createRack(warehouseId, { code, label, rows, columns, cellLength, cellHeight, cellDepth, shelves, lengthUnit, zoneId, aisleId }, actor) {
   const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId } });
   if (!warehouse) throw new Error(`Warehouse ${warehouseId} not found`);
 
@@ -120,14 +154,29 @@ async function createRack(warehouseId, { code, label, rows, columns, cellLength,
   const placement = await rackPlacement(warehouseId, { zoneId: zoneId || null, aisleId: aisleId || null });
   const where = await placementText(placement);
 
-  // Wrong unit / value -> error (the controller answers 400). A cell is length x height x depth; its volume is the capacity.
-  const cellLengthCm = toCentimetres(cellLength, lengthUnit, "Length");
-  const cellHeightCm = cellHeight === undefined ? DEFAULT_HEIGHT_CM : toCentimetres(cellHeight, lengthUnit, "Height");
-  const cellDepthCm = cellDepth === undefined ? DEFAULT_DEPTH_CM : toCentimetres(cellDepth, lengthUnit, "Depth");
+  // Wrong unit / value -> 400. A cell is length x height x depth; its volume is the capacity. With `shelves` (the size
+  // of each shelf varies) the number of shelves is that list's length and the cell size is the bottom shelf's.
+  const shelfSizes = shelves === undefined ? null : cleanShelves(shelves, lengthUnit);
+  if (shelfSizes) rows = shelfSizes.length;
+  const cellLengthCm = shelfSizes ? shelfSizes[0].lengthCm : toCentimetres(cellLength, lengthUnit, "Length");
+  const cellHeightCm = shelfSizes ? shelfSizes[0].heightCm : cellHeight === undefined ? DEFAULT_HEIGHT_CM : toCentimetres(cellHeight, lengthUnit, "Height");
+  const cellDepthCm = shelfSizes ? shelfSizes[0].depthCm : cellDepth === undefined ? DEFAULT_DEPTH_CM : toCentimetres(cellDepth, lengthUnit, "Depth");
   const cellVolume = volumeCm3(cellLengthCm, cellHeightCm, cellDepthCm);
+  const volumeOfRow = (row) => (shelfSizes ? shelfVolume(shelfSizes[row - 1]) : cellVolume);
   const rack = await prisma.$transaction(async (tx) => {
     const created = await tx.rack.create({
-      data: { warehouseId, code: trimmedCode, label, rows, columns, cellLengthCm, cellHeightCm, cellDepthCm, ...placement },
+      data: {
+        warehouseId,
+        code: trimmedCode,
+        label,
+        rows,
+        columns,
+        cellLengthCm,
+        cellHeightCm,
+        cellDepthCm,
+        shelfSizes: shelfSizes ?? Prisma.DbNull,
+        ...placement,
+      },
     });
     const slots = [];
     for (let row = 1; row <= rows; row++) {
@@ -139,7 +188,7 @@ async function createRack(warehouseId, { code, label, rows, columns, cellLength,
           barcode: `SL-${warehouse.code}-${trimmedCode}-${row}-${col}`,
           row,
           column: col,
-          capacity: cellVolume,
+          capacity: volumeOfRow(row),
           used: 0,
           status: "available",
         });
@@ -152,60 +201,89 @@ async function createRack(warehouseId, { code, label, rows, columns, cellLength,
       {
         entityType: "rack",
         entityId: created.id,
-        summary: `Added rack ${trimmedCode} to ${warehouse.code}${where}: ${rows} × ${columns} cells of ${cellLengthCm} × ${cellHeightCm} × ${cellDepthCm} cm (${formatVolume(cellVolume)})`,
+        summary: shelfSizes
+          ? `Added rack ${trimmedCode} to ${warehouse.code}${where}: ${rows} shelves × ${columns} cells, shelf sizes ${shelfSizes.map((s, i) => `${i + 1}: ${sizeText(s)}`).join("; ")}`
+          : `Added rack ${trimmedCode} to ${warehouse.code}${where}: ${rows} × ${columns} cells of ${cellLengthCm} × ${cellHeightCm} × ${cellDepthCm} cm (${formatVolume(cellVolume)})`,
       },
       tx
     );
     return created;
   });
 
-  return withCapacity(rack, { usedCapacity: 0, totalCapacity: cellVolume * rows * columns });
+  let total = 0;
+  for (let row = 1; row <= rows; row++) total += volumeOfRow(row) * columns;
+  return serializeRack(rack, { usedCapacity: 0, totalCapacity: total });
 }
 
-// Rack ki cell length / label / zone / aisle badalta hai (jo bheja wahi). Cell length: rack.cellLengthCm aur uske SAARE
-// slots ki capacity ek saath update (har cell ek hi length ka hai). Agar kisi cell me already utna saaman hai jo nayi
-// length me nahi aayega to 409 -- pehle wo boxes hatao. Status (available/full) used/capacity se recompute hota hai,
-// blocked cells blocked hi rehte hain. Zone / aisle badle to rack ke boxes ki stored location bhi (updateRackDetails).
-async function updateRack(rackId, { cellLength, cellHeight, cellDepth, lengthUnit, label, zoneId, aisleId }, actor) {
+// Changes a rack's label / zone / aisle and / or its shelf sizes (only what is sent). Sizes: either one size for every
+// shelf (cellLength / cellHeight / cellDepth -- what is not sent stays) or `shelves`, one size per shelf ("the size of
+// each shelf varies", exactly one entry per shelf). Every position gets its shelf's volume as capacity; a position that
+// already holds more than its new volume -> 409, move boxes first. available / full is recomputed, locked cells stay
+// locked. A new zone / aisle also rewrites the stored location of the rack's boxes (updateRackDetails).
+async function updateRack(rackId, { cellLength, cellHeight, cellDepth, shelves, lengthUnit, label, zoneId, aisleId }, actor) {
   const rack = await prisma.rack.findUnique({ where: { id: rackId } });
   if (!rack) return null;
   await updateRackDetails(rack, { label, zoneId, aisleId }, actor);
-  if (cellLength === undefined && cellHeight === undefined && cellDepth === undefined) return getRackById(rackId);
-  // Whatever is not sent stays as it is.
-  const cellLengthCm = cellLength === undefined ? rack.cellLengthCm : toCentimetres(cellLength, lengthUnit, "Length");
-  const cellHeightCm = cellHeight === undefined ? rack.cellHeightCm : toCentimetres(cellHeight, lengthUnit, "Height");
-  const cellDepthCm = cellDepth === undefined ? rack.cellDepthCm : toCentimetres(cellDepth, lengthUnit, "Depth");
-  const cellVolume = volumeCm3(cellLengthCm, cellHeightCm, cellDepthCm);
-  const oldVolume = volumeCm3(rack.cellLengthCm, rack.cellHeightCm, rack.cellDepthCm);
+  const uniformGiven = cellLength !== undefined || cellHeight !== undefined || cellDepth !== undefined;
+  if (!uniformGiven && shelves === undefined) return getRackById(rackId);
+  if (uniformGiven && shelves !== undefined) throw httpError(400, "Send either one cell size or shelves, not both");
+
+  let shelfSizes = null;
+  let cell;
+  if (shelves !== undefined) {
+    shelfSizes = cleanShelves(shelves, lengthUnit);
+    if (shelfSizes.length !== rack.rows) {
+      throw httpError(400, `Module ${rack.code} has ${rack.rows} shelves — send one size for each (add or remove shelves separately)`);
+    }
+    cell = shelfSizes[0];
+  } else {
+    cell = {
+      lengthCm: cellLength === undefined ? rack.cellLengthCm : toCentimetres(cellLength, lengthUnit, "Length"),
+      heightCm: cellHeight === undefined ? rack.cellHeightCm : toCentimetres(cellHeight, lengthUnit, "Height"),
+      depthCm: cellDepth === undefined ? rack.cellDepthCm : toCentimetres(cellDepth, lengthUnit, "Depth"),
+    };
+  }
+  const before = shelvesOf(rack);
+  const after = shelvesOf({ ...rack, ...{ cellLengthCm: cell.lengthCm, cellHeightCm: cell.heightCm, cellDepthCm: cell.depthCm }, shelfSizes });
 
   await prisma.$transaction(async (tx) => {
-    const overfull = await tx.slot.findFirst({ where: { rackId, used: { gt: cellVolume } }, orderBy: { used: "desc" } });
-    if (overfull) {
-      const err = new Error(`Slot ${overfull.code} already holds ${formatVolume(overfull.used)}, which is more than the new cell volume of ${formatVolume(cellVolume)}`);
-      err.status = 409;
-      throw err;
+    for (const shelf of after) {
+      const volume = shelfVolume(shelf);
+      const overfull = await tx.slot.findFirst({ where: { rackId, row: shelf.row, used: { gt: volume } }, orderBy: { used: "desc" } });
+      if (overfull) {
+        throw httpError(
+          409,
+          `Position ${overfull.code} already holds ${formatVolume(overfull.used)}, more than the new size of shelf ${shelf.row} (${formatVolume(volume)}) — move boxes out first`
+        );
+      }
     }
-    await tx.rack.update({ where: { id: rackId }, data: { cellLengthCm, cellHeightCm, cellDepthCm } });
-    await tx.slot.updateMany({ where: { rackId }, data: { capacity: cellVolume } });
-    // "full" sirf wahi jo ab poora bhar gaya hai; baaki (blocked chhodkar) available.
-    await tx.slot.updateMany({ where: { rackId, status: "full", used: { lt: cellVolume } }, data: { status: "available" } });
-    await tx.slot.updateMany({ where: { rackId, status: "available", used: cellVolume } , data: { status: "full" } });
-    const changes = [
-      ["cellLengthCm", rack.cellLengthCm, cellLengthCm],
-      ["cellHeightCm", rack.cellHeightCm, cellHeightCm],
-      ["cellDepthCm", rack.cellDepthCm, cellDepthCm],
-    ]
-      .filter(([, from, to]) => from !== to)
-      .map(([field, from, to]) => ({ field, from, to }));
-    if (changes.length) {
+    await tx.rack.update({
+      where: { id: rackId },
+      data: { cellLengthCm: cell.lengthCm, cellHeightCm: cell.heightCm, cellDepthCm: cell.depthCm, shelfSizes: shelfSizes ?? Prisma.DbNull },
+    });
+    for (const shelf of after) {
+      const volume = shelfVolume(shelf);
+      if (volume === shelfVolume(before[shelf.row - 1])) continue;
+      const where = { rackId, row: shelf.row };
+      await tx.slot.updateMany({ where, data: { capacity: volume } });
+      // "full" only when it really is full now; the rest (locked ones aside) available.
+      await tx.slot.updateMany({ where: { ...where, status: "full", used: { lt: volume } }, data: { status: "available" } });
+      await tx.slot.updateMany({ where: { ...where, status: "available", used: { gte: volume } }, data: { status: "full" } });
+    }
+    const changed = after
+      .map((sh, i) => ({ row: sh.row, from: sizeText(before[i]), to: sizeText(sh) }))
+      .filter((c) => c.from !== c.to);
+    const modeChanged = Array.isArray(rack.shelfSizes) !== Boolean(shelfSizes);
+    if (changed.length || modeChanged) {
+      const mode = shelfSizes ? "each shelf has its own size" : "every shelf is the same size";
       await appendAdminEvent(
         "rack_updated",
         actor,
         {
           entityType: "rack",
           entityId: rackId,
-          summary: `Changed cell size of rack ${rack.code} from ${rack.cellLengthCm} × ${rack.cellHeightCm} × ${rack.cellDepthCm} cm (${formatVolume(oldVolume)}) to ${cellLengthCm} × ${cellHeightCm} × ${cellDepthCm} cm (${formatVolume(cellVolume)})`,
-          changes,
+          summary: `Changed shelf sizes of rack ${rack.code} (${mode})${changed.length ? ": " + changed.map((c) => `shelf ${c.row} ${c.from} → ${c.to}`).join("; ") : ""}`,
+          changes: changed.map((c) => ({ field: `shelf ${c.row} size`, from: c.from, to: c.to })),
         },
         tx
       );
@@ -223,7 +301,7 @@ async function listRacksForWarehouse(warehouseId) {
   ]);
   const byRack = new Map(totals.map((t) => [t.rackId, t._sum]));
   return racks.map((r) =>
-    withCapacity(r, { usedCapacity: byRack.get(r.id)?.used || 0, totalCapacity: byRack.get(r.id)?.capacity || 0 })
+    serializeRack(r, { usedCapacity: byRack.get(r.id)?.used || 0, totalCapacity: byRack.get(r.id)?.capacity || 0 })
   );
 }
 
@@ -244,7 +322,7 @@ async function getRackById(id) {
   if (!rack) return null;
   const { zone, aisle, ...row } = rack;
   return {
-    ...withCapacity(row, await capacityForRack(rack.id)),
+    ...serializeRack(row, await capacityForRack(rack.id)),
     ...(zone && { zone: serializeSimple(zone) }),
     ...(aisle && { aisle: serializeSimple(aisle) }),
   };
@@ -490,13 +568,21 @@ async function addShelf(rackId, actor) {
   if (!rack) throw httpError(404, "Module not found");
   if (rack.rows >= 100) throw httpError(400, "A module has at most 100 shelves");
   const row = rack.rows + 1;
+  // Sizes vary per shelf -> the new top shelf starts as a copy of the current top one (change it in Edit module).
+  const list = Array.isArray(rack.shelfSizes) ? rack.shelfSizes : null;
+  const newShelf = list ? shelvesOf(rack)[rack.rows - 1] : cellSizeOf(rack);
+  const capacity = shelfVolume(newShelf);
   await prisma.$transaction(async (tx) => {
     const slots = [];
     for (let col = 1; col <= rack.columns; col++) {
-      slots.push({ rackId, warehouseId: rack.warehouseId, code: `${row}-${col}`, barcode: `SL-${rack.warehouse.code}-${rack.code}-${row}-${col}`, row, column: col, capacity: volumeCm3(rack.cellLengthCm, rack.cellHeightCm, rack.cellDepthCm), used: 0, status: "available" });
+      slots.push({ rackId, warehouseId: rack.warehouseId, code: `${row}-${col}`, barcode: `SL-${rack.warehouse.code}-${rack.code}-${row}-${col}`, row, column: col, capacity, used: 0, status: "available" });
     }
     await tx.slot.createMany({ data: slots });
-    await tx.rack.update({ where: { id: rackId }, data: { rows: row } });
+    const { lengthCm, heightCm, depthCm } = newShelf;
+    await tx.rack.update({
+      where: { id: rackId },
+      data: { rows: row, ...(list && { shelfSizes: [...shelvesOf(rack).map(({ row: _r, ...size }) => size), { lengthCm, heightCm, depthCm }] }) },
+    });
     await appendAdminEvent("rack_updated", actor, { entityType: "rack", entityId: rackId, summary: `Added shelf ${row} to module ${rack.code}` }, tx);
   });
   return getRackById(rackId);
@@ -514,7 +600,8 @@ async function removeLastShelf(rackId, actor) {
   if (used > 0 || boxes > 0) throw httpError(409, `Shelf ${row} still has boxes on it — move them first`);
   await prisma.$transaction(async (tx) => {
     await tx.slot.deleteMany({ where: { rackId, row } });
-    await tx.rack.update({ where: { id: rackId }, data: { rows: row - 1 } });
+    const list = Array.isArray(rack.shelfSizes) ? rack.shelfSizes : null;
+    await tx.rack.update({ where: { id: rackId }, data: { rows: row - 1, ...(list && { shelfSizes: list.slice(0, row - 1) }) } });
     await appendAdminEvent("rack_updated", actor, { entityType: "rack", entityId: rackId, summary: `Removed shelf ${row} of module ${rack.code}` }, tx);
   });
   return getRackById(rackId);

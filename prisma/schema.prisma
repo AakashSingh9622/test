@@ -250,6 +250,7 @@ model Warehouse {
 // directly in the warehouse; a rack in an aisle always carries that aisle's zone (locationService keeps it in step).
 model Zone {
   id          String    @id @default(uuid())
+  number      Int       @unique @default(autoincrement()) // short global id shown as "Floor 01 (21)"; never reused (prisma/sql/zone-aisle-number.sql)
   warehouseId String
   warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
   code        String
@@ -265,6 +266,7 @@ model Zone {
 
 model Aisle {
   id          String    @id @default(uuid())
+  number      Int       @unique @default(autoincrement()) // short global id shown as "Aisle 01 (15)"; never reused
   warehouseId String
   warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
   zoneId      String?
@@ -301,6 +303,9 @@ model Rack {
   // A cell is a box-shaped space: length x height x depth (cm). Slot.capacity is their product in cm3.
   cellHeightCm Int       @default(50)
   cellDepthCm  Int       @default(50)
+  // "The size of each shelf varies": [{ lengthCm, heightCm, depthCm }] per shelf, index = row - 1 (row 1 = bottom).
+  // NULL = every shelf uses the cell size above. A shelf's positions get that shelf's volume as capacity.
+  shelfSizes   Json?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   slots       Slot[]

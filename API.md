@@ -87,7 +87,9 @@ GET    /api/warehouses                              -> Warehouse[]
 POST   /api/warehouses        {code,name,address?}   -> Warehouse            (staff_admin only, 201)
 GET    /api/warehouses/:id                           -> Warehouse
 GET    /api/warehouses/:id/racks                     -> Rack[]
-POST   /api/warehouses/:id/racks  { code, label, rows, columns, cellLength, cellHeight?, cellDepth?, lengthUnit?: "cm" | "ft", zoneId?, aisleId? }
+POST   /api/warehouses/:id/racks  { code, label, rows, columns, cellLength, cellHeight?, cellDepth?, shelves?, lengthUnit?: "cm" | "ft", zoneId?, aisleId? }
+       # shelves = "the size of each shelf varies": [{ length, height, depth }] one per shelf, bottom first (same unit);
+       # then rows = its length and cellLength isn't needed. Every position of a shelf gets that shelf's volume.
        # every row x column cell is ONE storage location (slot) of cellLength x cellHeight x cellDepth (one unit for
        # all three; feet are converted to whole centimetres, 1-1000 cm each; height / depth default to 50 cm when
        # omitted). The slot's capacity is that VOLUME in cm3. Response Rack includes cellLengthCm, cellHeightCm, cellDepthCm.
@@ -114,6 +116,7 @@ interface Warehouse { id: string; code: string; name: string; address?: string;
   rackCount: number; slotCount: number; usedCapacity: number; totalCapacity: number }
 interface Rack { id: string; warehouseId: string; zoneId?: string; aisleId?: string; code: string; label: string;
   rows: number /* shelves */; columns: number /* positions per shelf */; cellLengthCm: number; cellHeightCm: number; cellDepthCm: number;
+  variesByShelf: boolean; shelves: { row: number; lengthCm: number; heightCm: number; depthCm: number }[] /* row 1 = bottom */;
   usedCapacity: number; totalCapacity: number }
 interface Zone { id: string; warehouseId: string; code: string; name?: string; rackCount?: number;
   usedCapacity?: number; totalCapacity?: number }
@@ -626,7 +629,7 @@ request — loop over pages (the frontend does this for CSV exports).
 
 Extra filters: `GET /api/boxes?rackId=&row=` (boxes stored in a rack / one row of it).
 `GET /api/racks/:id/rows` -> `[{ row, boxCount, onOrderCount }]` (one SQL aggregate for the rack page).
-`PATCH /api/racks/:id { cellLength?, cellHeight?, cellDepth?, lengthUnit?, label?, zoneId?, aisleId? }` (layout.manage) changes the cell size (volume) of
+`PATCH /api/racks/:id { cellLength?, cellHeight?, cellDepth?, shelves?, lengthUnit?, label?, zoneId?, aisleId? }` (`shelves`: one size per shelf, exactly one per shelf — or one cell size, which makes every shelf the same again; a new shelf added later copies the top shelf's size) (layout.manage) changes the cell size (volume) of
 every cell in the rack and / or its label and place (`null` = out of its zone / aisle; an aisle decides the zone). A new
 zone / aisle — or renaming one — rewrites the **current** `locationPath` of the boxes on those racks in the same
 transaction; history (audit, movements, order lines) is never rewritten. `npm run locations:refresh -- --apply` does

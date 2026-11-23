@@ -51,14 +51,16 @@ async function listRacks(req, res) {
 }
 
 async function createRack(req, res) {
-  const { code, label, rows, columns, cellLength, cellHeight, cellDepth, lengthUnit, zoneId, aisleId } = req.body || {};
-  if (!code || !label || !rows || !columns || !cellLength) {
-    return res.status(400).json({ message: "code, label, rows, columns, and cellLength are required" });
+  const { code, label, rows, columns, cellLength, cellHeight, cellDepth, shelves, lengthUnit, zoneId, aisleId } = req.body || {};
+  // `shelves` = the size of each shelf varies: one { length, height, depth } per shelf (then rows / cellLength aren't needed)
+  const varies = Array.isArray(shelves);
+  if (!code || !label || !columns || (!varies && (!rows || !cellLength))) {
+    return res.status(400).json({ message: "code, label, columns and rows + cellLength (or shelves) are required" });
   }
   if (lengthUnit !== undefined && !["cm", "ft"].includes(lengthUnit)) {
     return res.status(400).json({ message: 'lengthUnit must be "cm" or "ft"' });
   }
-  if (!(Number(cellLength) > 0)) {
+  if (!varies && !(Number(cellLength) > 0)) {
     return res.status(400).json({ message: "cellLength must be a positive number" });
   }
   // Height and depth are optional only for older callers (then 50 cm, what every cell had before they existed).
@@ -73,7 +75,8 @@ async function createRack(req, res) {
     label,
     rows: Number(rows),
     columns: Number(columns),
-    cellLength: Number(cellLength),
+    cellLength: varies ? undefined : Number(cellLength),
+    shelves: varies ? shelves : undefined,
     cellHeight: cellHeight === undefined ? undefined : Number(cellHeight),
     cellDepth: cellDepth === undefined ? undefined : Number(cellDepth),
     lengthUnit: lengthUnit || "cm",
@@ -91,10 +94,10 @@ async function getRack(req, res) {
 
 // Any of: cellLength / cellHeight / cellDepth (+ lengthUnit), label, zoneId, aisleId (null / "" = take it out of its zone / aisle).
 async function patchRack(req, res) {
-  const { cellLength, cellHeight, cellDepth, lengthUnit, label, zoneId, aisleId } = req.body || {};
-  const sizeGiven = cellLength !== undefined || cellHeight !== undefined || cellDepth !== undefined;
+  const { cellLength, cellHeight, cellDepth, shelves, lengthUnit, label, zoneId, aisleId } = req.body || {};
+  const sizeGiven = cellLength !== undefined || cellHeight !== undefined || cellDepth !== undefined || shelves !== undefined;
   if (!sizeGiven && label === undefined && zoneId === undefined && aisleId === undefined) {
-    return res.status(400).json({ message: "Send cellLength, cellHeight, cellDepth, label, zoneId or aisleId" });
+    return res.status(400).json({ message: "Send cellLength, cellHeight, cellDepth, shelves, label, zoneId or aisleId" });
   }
   for (const [name, v] of [["cellLength", cellLength], ["cellHeight", cellHeight], ["cellDepth", cellDepth]]) {
     if (v !== undefined && !(Number(v) > 0)) return res.status(400).json({ message: `${name} must be a positive number` });
@@ -106,6 +109,7 @@ async function patchRack(req, res) {
     cellLength: cellLength === undefined ? undefined : Number(cellLength),
     cellHeight: cellHeight === undefined ? undefined : Number(cellHeight),
     cellDepth: cellDepth === undefined ? undefined : Number(cellDepth),
+    shelves,
     lengthUnit: lengthUnit || "cm",
     label,
     zoneId,
