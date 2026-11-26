@@ -105,6 +105,7 @@ async function searchBoxes(params) {
     ];
   }
   if (params.clientId) where.clientId = params.clientId;
+  else if (params.clientIds) where.clientId = { in: params.clientIds }; // given but empty = no boxes
   if (params.expedienteId) where.expedienteId = String(params.expedienteId);
   if (params.status?.length) where.status = { in: params.status };
   else where.status = { not: "destroyed" }; // default: destroyed boxes hide rahte hain (spec §7)
@@ -236,6 +237,25 @@ async function checkRetentionCategory(value) {
   return code;
 }
 
+// The client's DocuSoft Reference UDF values ({ name: value }). The fields themselves (which exist, which are mandatory)
+// live in DocuSoft, which this server can't read -- the register screen checks those; here only the shape and sizes.
+const MAX_REFERENCE_UDFS = 50;
+function cleanReferenceUdfs(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) throw httpError(400, "referenceUdfs must be an object of name: value");
+  const out = {};
+  for (const [rawName, rawValue] of Object.entries(value)) {
+    const name = String(rawName).trim();
+    const text = rawValue === null || rawValue === undefined ? "" : String(rawValue).trim();
+    if (!name || !text) continue;
+    if (name.length > 100) throw httpError(400, "A reference field name is at most 100 characters");
+    if (text.length > 500) throw httpError(400, `${name}: at most 500 characters`);
+    out[name] = text;
+  }
+  if (Object.keys(out).length > MAX_REFERENCE_UDFS) throw httpError(400, `At most ${MAX_REFERENCE_UDFS} reference fields`);
+  return Object.keys(out).length ? out : undefined;
+}
+
 // Naye boxes ek saath register karta hai (Register Boxes wizard, step 1) -- ek transaction me.
 async function createBoxesBatch(input, actor) {
   const retentionCategory = await checkRetentionCategory(input.retentionCategory);
@@ -251,6 +271,7 @@ async function createBoxesBatch(input, actor) {
   // The expediente (Docbox: the client's file): needed when the client has any; its own fields are the ones checked.
   const expediente = await resolveForBox(input.clientId, input.expedienteId);
   const customFields = await cleanValuesOrThrow(input.clientId, input.customFields, { expedienteId: expediente.id });
+  const referenceUdfs = cleanReferenceUdfs(input.referenceUdfs);
 
   // Docbox "New record" shows the location in the same form: when Module + Shelf (and optionally Site, Warehouse, Floor,
   // Aisle) are given, the boxes go onto that shelf right after they are registered -- one position at a time, the first
@@ -312,6 +333,7 @@ async function createBoxesBatch(input, actor) {
           destroyAfter: toDate(input.destroyAfter) || undefined,
           retentionCategory: retentionCategory ?? undefined,
           customFields: Object.keys(customFields).length ? customFields : undefined,
+          referenceUdfs,
           size: sizeCode,
           ...boxDimensionColumns(sizeDims, sizeCode),
           status: "unallocated",
@@ -485,6 +507,28 @@ async function updateBoxDetails(boxId, patch, reason, actor) {
       if (current[code] !== next) changes.push({ field: name, from: current[code], to: next });
     }
     data.customFields = Object.keys(merged).length ? merged : Prisma.DbNull;
+  }
+
+  // The client's DocuSoft Reference UDFs: only the names sent change ("" clears one); the rest of the box's values stay.
+  if (patch.referenceUdfs !== undefined) {
+    if (!patch.referenceUdfs || typeof patch.referenceUdfs !== "object" || Array.isArray(patch.referenceUdfs)) {
+      throw httpError(400, "referenceUdfs must be an object of name: value");
+    }
+    const current = box.referenceUdfs && typeof box.referenceUdfs === "object" ? box.referenceUdfs : {};
+    const merged = { ...current };
+    for (const [rawName, rawValue] of Object.entries(patch.referenceUdfs)) {
+      const name = String(rawName).trim();
+      if (!name) continue;
+      if (name.length > 100) throw httpError(400, "A reference field name is at most 100 characters");
+      const next = rawValue === null || rawValue === undefined ? "" : String(rawValue).trim();
+      if (next.length > 500) throw httpError(400, `${name}: at most 500 characters`);
+      if ((current[name] ?? "") === next) continue;
+      if (next) merged[name] = next;
+      else delete merged[name];
+      changes.push({ field: `Reference: ${name}`, from: current[name] || undefined, to: next || undefined });
+    }
+    if (Object.keys(merged).length > MAX_REFERENCE_UDFS) throw httpError(400, `At most ${MAX_REFERENCE_UDFS} reference fields`);
+    data.referenceUdfs = Object.keys(merged).length ? merged : Prisma.DbNull;
   }
 
   if (changes.length === 0) return serializeBox(box);

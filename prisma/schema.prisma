@@ -375,6 +375,7 @@ model Box {
   comments       String? // Docbox "Observaciones" / the template's Comments field; free text, optional
   entryDate      DateTime? @db.Date // Docbox "Fecha Entrada": the day the box came into the archive (null on older boxes: use createdAt)
   customFields   Json? // { [CustomFieldDef.code]: value } -- the client's own fields (Docbox "Expedientes - Campos")
+  referenceUdfs  Json? // { [DocuSoft Reference UDF name]: value } -- the client's DocuSoft "DMS Reference UDFs", filled in at registration (the fields live in DocuSoft, only the values here)
   labelPrinted   Boolean   @default(false)
   slotId         String?
   slot           Slot?     @relation(fields: [slotId], references: [id], onDelete: SetNull)

@@ -18,6 +18,8 @@ async function listBoxes(req, res) {
   const result = await boxService.searchBoxes({
     q: q.q,
     clientId: q.clientId,
+    // any of these clients (e.g. the clients of the staff user's default DocuSoft folder); repeated or comma-separated
+    clientIds: q.clientIds === undefined ? undefined : [].concat(q.clientIds).flatMap((v) => String(v).split(",")).map((v) => v.trim()).filter(Boolean),
     expedienteId: q.expedienteId,
     status: parseStatusArray(q),
     onHold: q.onHold === undefined ? undefined : q.onHold === "true",
