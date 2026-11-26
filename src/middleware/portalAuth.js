@@ -22,6 +22,8 @@ function requirePortalAuth(req, res, next) {
     name: claims.name || undefined,
     role: claims.role, // client_admin (main contact) | client_user
     isMainContact: claims.isMainContact === true,
+    // May borrow / May destroy as DocuSoft said at login ({ canLoan?, canPurge? }); missing = not read → our copy decides
+    perms: claims.perms && typeof claims.perms === "object" ? claims.perms : undefined,
   };
   next();
 }

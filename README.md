@@ -82,8 +82,10 @@ npm run dev              # nodemon, or `npm start` for a plain run
 ```env
 PORT=5000
 NODE_ENV=development
-# Supabase Dashboard > Connect > Session pooler. URL-encode special chars in the password.
-DATABASE_URL="postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres"
+# Supabase Dashboard > Connect. URL-encode special chars in the password.
+# DATABASE_URL = Transaction pooler (6543): session mode caps clients at 15 (EMAXCONNSESSION).
+# DIRECT_URL = Session pooler (5432), used by the Prisma CLI.
+DATABASE_URL="postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres?pgbouncer=true"
 DIRECT_URL="postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres"
 CORS_ORIGIN=http://localhost:3000
 ```

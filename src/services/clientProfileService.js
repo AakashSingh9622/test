@@ -118,13 +118,21 @@ async function setContactPermission(clientId, email, body, actor) {
   return serializePermission(row);
 }
 
-// The portal asks before creating an order: a contact switched off for loans / destruction can't request them.
-// (No row, or the flag still on = allowed, so existing contacts keep working.)
-async function assertContactMay(clientId, email, orderType) {
-  const kind = orderType === "destruction" ? "canPurge" : orderType === "dispatch" || orderType === "digitize" ? "canLoan" : null;
-  if (!kind) return;
+// What the contact may do: DocuSoft's answer read at portal login (`fromLogin` = the token's perms — the contact's
+// "Loan Documents" / "Destroy Documents" UDFs), else our copy of them (kept in step whenever staff read or change them).
+// (Neither known = allowed, so existing contacts keep working.)
+async function contactMay(clientId, email, kind, fromLogin) {
+  if (fromLogin && typeof fromLogin[kind] === "boolean") return fromLogin[kind];
   const row = await prisma.contactPermission.findUnique({ where: { clientId_email: { clientId: text(clientId), email: normEmail(email) } } });
-  if (row && row[kind] === false) {
+  return row ? row[kind] !== false : true;
+}
+
+// The portal asks before creating an order: a contact switched off for loans / destruction can't request them.
+async function assertContactMay(clientId, email, orderType, fromLogin) {
+  // destruction = "Destroy Documents"; asking for documents (dispatch, collection, scans) = "Loan Documents"
+  const kind = orderType === "destruction" ? "canPurge" : ["dispatch", "collection", "digitize"].includes(orderType) ? "canLoan" : null;
+  if (!kind) return;
+  if (!(await contactMay(clientId, email, kind, fromLogin))) {
     throw httpError(403, kind === "canPurge" ? "You are not allowed to request destruction. Ask your main contact." : "You are not allowed to request boxes or scans. Ask your main contact.");
   }
 }
@@ -139,4 +147,4 @@ async function allowedExpedienteIds(clientId, email) {
   return alive.map((e) => e.id);
 }
 
-module.exports = { allowedExpedienteIds, cleanDeliveryColumns, getProfile, saveProfile, listContactPermissions, setContactPermission, assertContactMay };
+module.exports = { contactMay, allowedExpedienteIds, cleanDeliveryColumns, getProfile, saveProfile, listContactPermissions, setContactPermission, assertContactMay };

@@ -14,6 +14,7 @@ const { PORTAL_JWT_SECRET, PORTAL_TOKEN_TTL_MINUTES } = require("../config/env")
 const { signJwt } = require("../utils/jwt");
 const httpError = require("../utils/httpError");
 const { getDefaultDatabase, sameAgreement } = require("./appSettingService");
+const { readContactPermissions } = require("./docusoftContactPermissions");
 
 const MAX = { agrno: 100, clientId: 100, email: 254, name: 200 };
 
@@ -47,10 +48,14 @@ async function login(input = {}) {
   // Ek hi generic jawab -- bahar se pata na chale ki kaunsa agrno valid hai.
   if (!allowedAgrno || !sameAgreement(agrno, allowedAgrno)) throw httpError(401, "Invalid credentials");
 
+  // May borrow / May destroy: read from the contact's DocuSoft UDFs with its own portal login (input.password, used for
+  // this one call — never stored). Not readable → left out, and our own copy of the switches decides.
+  const perms = await readContactPermissions({ agrno: allowedAgrno, clientId, email, password: input.password ? String(input.password) : "" });
+
   const role = isMainContact ? "client_admin" : "client_user";
   const ttlSeconds = PORTAL_TOKEN_TTL_MINUTES * 60;
   const token = signJwt(
-    { typ: "portal", agrno: allowedAgrno, clientId, clientName: clientName || undefined, email, name: name || undefined, role, isMainContact },
+    { typ: "portal", agrno: allowedAgrno, clientId, clientName: clientName || undefined, email, name: name || undefined, role, isMainContact, perms: perms || undefined },
     PORTAL_JWT_SECRET,
     ttlSeconds
   );
@@ -60,7 +65,7 @@ async function login(input = {}) {
     tokenType: "Bearer",
     expiresIn: ttlSeconds,
     expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
-    user: { clientId, clientName: clientName || undefined, email, name: name || undefined, role, isMainContact },
+    user: { clientId, clientName: clientName || undefined, email, name: name || undefined, role, isMainContact, perms: perms || undefined },
   };
 }
 

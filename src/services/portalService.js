@@ -200,8 +200,8 @@ async function myDetails(ctx) {
     isMainContact: ctx.isMainContact,
     client: { id: ctx.clientId, name: ctx.clientName || known?.clientName || ctx.clientId },
     files: expedientes,
-    canLoan: perm ? perm.canLoan : true,
-    canPurge: perm ? perm.canPurge : true,
+    canLoan: typeof ctx.perms?.canLoan === "boolean" ? ctx.perms.canLoan : perm ? perm.canLoan : true,
+    canPurge: typeof ctx.perms?.canPurge === "boolean" ? ctx.perms.canPurge : perm ? perm.canPurge : true,
   };
 }
 
@@ -303,7 +303,7 @@ async function createOrder(ctx, body = {}) {
   const type = body.type;
   if (!ORDER_TYPES.includes(type)) throw httpError(400, "type must be collection, dispatch, destruction or digitize");
 
-  await assertContactMay(ctx.clientId, ctx.email, type); // the contact may have been switched off for loans / destruction
+  await assertContactMay(ctx.clientId, ctx.email, type, ctx.perms); // the contact may have been switched off for loans / destruction
 
   const boxIds = [...new Set(asArray(body.boxIds).map(String))];
   if (boxIds.length) {

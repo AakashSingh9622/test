@@ -662,6 +662,12 @@ token never works on the staff API.
 `agrno` must match the agreement of the warehouse staff (`wh_user.agreementNo`), otherwise `401 Invalid credentials`.
 `isMainContact: true` => role `client_admin`, `false` => `client_user`. Response:
 `{ token, tokenType: "Bearer", expiresIn, expiresAt, user: { clientId, email, name, role, isMainContact } }`.
+Optional `password` = the contact's own portal password (the parent portal's `LCode`): used for one call to DocuSoft's
+`portaluserservices.asmx/GetCRMContactUDFValues2_Json` to read the contact's **Permissions** UDFs — "Loan Documents"
+(may borrow / scans) and "Destroy Documents" (may destroy) — which go into the token as `perms: { canLoan?, canPurge? }`
+and decide what orders the contact may place. Never stored or logged. Not sent / not readable → the warehouse's own copy
+(contact-permissions, kept in step by the staff screens) decides. Address: `DOCUSOFT_PORTAL_USER_URL`
+(default `https://portal.mydocusoft.com/portaluserservices.asmx`).
 Token lifetime: `PORTAL_TOKEN_TTL_MINUTES` (default 60) — call login again when a request returns `401 token_invalid`.
 
 > **Trust:** these four values are *claims* made by the caller (the parent portal) — DocuSoft is not asked again.

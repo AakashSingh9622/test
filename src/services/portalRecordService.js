@@ -160,7 +160,7 @@ async function createRequest(ctx, body = {}) {
   const kind = text(body.kind);
   if (!KINDS.includes(kind)) throw httpError(400, `kind must be one of ${KINDS.join(", ")}`);
   // The same switch as for boxes and scans ("canLoan"): a contact the main contact has switched off can't ask for records either.
-  await assertContactMay(ctx.clientId, ctx.email, kind === "digital" ? "digitize" : "dispatch");
+  await assertContactMay(ctx.clientId, ctx.email, kind === "digital" ? "digitize" : "dispatch", ctx.perms);
   if (!Array.isArray(body.recordIds)) throw httpError(400, "recordIds (non-empty array) is required");
   const ids = [...new Set(body.recordIds.map(text).filter(Boolean))];
   if (ids.length === 0) throw httpError(400, "recordIds (non-empty array) is required");
